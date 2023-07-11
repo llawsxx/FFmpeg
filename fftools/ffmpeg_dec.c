@@ -23,6 +23,7 @@
 #include "libavutil/pixdesc.h"
 #include "libavutil/pixfmt.h"
 #include "libavutil/timestamp.h"
+#include "libavutil/internal.h"
 
 #include "libavcodec/avcodec.h"
 #include "libavcodec/codec.h"
@@ -325,9 +326,18 @@ static int video_frame_process(InputStream *ist, AVFrame *frame)
             ist->dec_ctx->pix_fmt);
     }
 
-    if(ist->top_field_first>=0)
-        frame->flags |= AV_FRAME_FLAG_TOP_FIELD_FIRST;
-
+    if(ist->top_field_first>=0){
+#if FF_API_INTERLACED_FRAME
+FF_DISABLE_DEPRECATION_WARNINGS
+        frame->top_field_first = ist->top_field_first;
+FF_ENABLE_DEPRECATION_WARNINGS
+#endif
+        if (ist->top_field_first)
+            frame->flags |= AV_FRAME_FLAG_TOP_FIELD_FIRST;
+        else
+            frame->flags &= ~AV_FRAME_FLAG_TOP_FIELD_FIRST;
+    }
+    
     if (frame->format == d->hwaccel_pix_fmt) {
         int err = hwaccel_retrieve_data(ist->dec_ctx, frame);
         if (err < 0)

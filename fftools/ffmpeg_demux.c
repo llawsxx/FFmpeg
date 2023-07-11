@@ -82,6 +82,8 @@ typedef struct DemuxStream {
     uint64_t data_size;
 } DemuxStream;
 
+#define SUB_QUEUE_SIZE 50
+
 typedef struct Demuxer {
     InputFile f;
 
@@ -110,7 +112,11 @@ typedef struct Demuxer {
     double readrate_initial_burst;
 
     AVThreadMessageQueue *in_thread_queue;
+    //one for video/audio, one for subtitle
+    AVFifo *in_pre_queue[2];
+    int is_eof;
     int                   thread_queue_size;
+    int                   pre_buffer_queue_size; 
     pthread_t             thread;
     int                   non_blocking;
 
@@ -564,6 +570,69 @@ static void thread_set_name(InputFile *f)
     ff_thread_setname(name);
 }
 
+static int read_packet_resync_subtitle(Demuxer *d, AVPacket* pkt){
+    AVPacket *tmp;
+    int ret;
+    if((ret = av_fifo_read(d->in_pre_queue[1], &tmp, 1)) >= 0 || 
+        (ret = av_fifo_read(d->in_pre_queue[0], &tmp, 1)) >= 0){
+        av_packet_move_ref(pkt, tmp); av_packet_free(&tmp);
+    }
+    return ret;
+}
+
+
+static int read_from_pre_queue(Demuxer *d,AVPacket *pkt){
+    InputFile *f = &d->f;
+    AVPacket *pkt2 = NULL;
+    AVStream *st; 
+    int ret;
+
+    if(!d->is_eof && av_fifo_can_read(d->in_pre_queue[0]) < d->pre_buffer_queue_size &&
+        av_fifo_can_read(d->in_pre_queue[1]) < SUB_QUEUE_SIZE){
+        pkt2 = av_packet_alloc();
+        if (!pkt2) {
+            return AVERROR(ENOMEM);
+        }
+        ret = av_read_frame(f->ctx, pkt2);
+        if(ret < 0){
+            av_packet_free(&pkt2);
+            if(ret == AVERROR(EAGAIN)) {
+                return ret;
+            }
+            else
+            {
+                if(ret == AVERROR_EOF)
+                    d->is_eof = 1;
+                if(read_packet_resync_subtitle(d,pkt) < 0) return ret;
+                return 0;
+            }
+        }else{
+            if(pkt2->stream_index >= f->nb_streams){
+                av_fifo_write(d->in_pre_queue[0],&pkt2,1);
+            }else{
+                st = f->streams[pkt2->stream_index]->st;
+                if(st->codecpar->codec_type == AVMEDIA_TYPE_SUBTITLE)
+                    av_fifo_write(d->in_pre_queue[1],&pkt2,1);
+                else
+                    av_fifo_write(d->in_pre_queue[0],&pkt2,1);
+            }
+            
+            if(av_fifo_can_read(d->in_pre_queue[0]) >= d->pre_buffer_queue_size ||
+                av_fifo_can_read(d->in_pre_queue[1]) >= SUB_QUEUE_SIZE )
+            {
+                if(read_packet_resync_subtitle(d,pkt) < 0) return AVERROR(EAGAIN);
+                return 0;
+            }
+            return AVERROR(EAGAIN);
+        }
+
+    }
+    else{
+        if(read_packet_resync_subtitle(d,pkt) < 0) return AVERROR_EOF;
+        return 0;
+    }
+}
+
 static void *input_thread(void *arg)
 {
     Demuxer   *d = arg;
@@ -587,7 +656,10 @@ static void *input_thread(void *arg)
     while (1) {
         DemuxMsg msg = { NULL };
 
-        ret = av_read_frame(f->ctx, pkt);
+        if(d->pre_buffer_queue_size == 0)
+            ret = av_read_frame(f->ctx, pkt);
+        else
+            ret = read_from_pre_queue(d, pkt);
 
         if (ret == AVERROR(EAGAIN)) {
             av_usleep(10000);
@@ -601,8 +673,10 @@ static void *input_thread(void *arg)
                 if (ret >= 0)
                     ret = seek_to_start(d);
                 if (ret >= 0)
+                {
+                    d->is_eof = 0;
                     continue;
-
+                }
                 /* fallthrough to the error path */
             }
 
@@ -681,6 +755,7 @@ static void thread_stop(Demuxer *d)
 {
     InputFile *f = &d->f;
     DemuxMsg msg;
+    AVPacket *pkt;
 
     if (!d->in_thread_queue)
         return;
@@ -689,6 +764,20 @@ static void thread_stop(Demuxer *d)
         av_packet_free(&msg.pkt);
 
     pthread_join(d->thread, NULL);
+    
+    if(d->in_pre_queue[0]){
+        while (av_fifo_read(d->in_pre_queue[0], &pkt, 1) >= 0){
+            av_packet_free(&pkt);
+        }
+        d->in_pre_queue[0] = NULL;
+    }
+    
+    if(d->in_pre_queue[1]){
+        while (av_fifo_read(d->in_pre_queue[1], &pkt, 1) >= 0)
+            av_packet_free(&pkt);
+        d->in_pre_queue[1] = NULL;
+    }
+    
     av_thread_message_queue_free(&d->in_thread_queue);
     av_thread_message_queue_free(&f->audio_duration_queue);
 }
@@ -707,8 +796,20 @@ static int thread_start(Demuxer *d)
         d->non_blocking = 1;
     ret = av_thread_message_queue_alloc(&d->in_thread_queue,
                                         d->thread_queue_size, sizeof(DemuxMsg));
-    if (ret < 0)
+    if (ret < 0){
         return ret;
+    }    
+    if(d->pre_buffer_queue_size > 0){
+        //video/audio queue
+        d->in_pre_queue[0] = av_fifo_alloc2(d->pre_buffer_queue_size,  sizeof(AVPacket*), 0);
+        if (d->in_pre_queue[0] == NULL)
+            return AVERROR(ENOMEM);
+        
+        //subtitle queue
+        d->in_pre_queue[1] = av_fifo_alloc2(SUB_QUEUE_SIZE,  sizeof(AVPacket*), 0);
+        if (d->in_pre_queue[1] == NULL)
+            return AVERROR(ENOMEM);
+    }
 
     if (d->loop) {
         int nb_audio_dec = 0;
@@ -1570,6 +1671,9 @@ int ifile_open(const OptionsContext *o, const char *filename)
     }
 
     d->thread_queue_size = o->thread_queue_size;
+    d->pre_buffer_queue_size = o->pre_buffer_queue_size < 0 ? 0 : o->pre_buffer_queue_size;
+    if(d->pre_buffer_queue_size)
+        av_log(d, AV_LOG_INFO, "pre_buffer_queue_size is set: %d\n", d->pre_buffer_queue_size);
 
     /* Add all the streams from the given input file to the demuxer */
     for (int i = 0; i < ic->nb_streams; i++)
