@@ -24,6 +24,7 @@
 #include "libavutil/frame.h"
 #include "libavutil/imgutils.h"
 #include "libavutil/internal.h"
+#include "libavutil/pixdesc.h"
 #include "libavutil/samplefmt.h"
 
 #include "avcodec.h"
@@ -573,25 +574,38 @@ int attribute_align_arg avcodec_receive_packet(AVCodecContext *avctx, AVPacket *
 
 static int encode_preinit_video(AVCodecContext *avctx)
 {
+    const AVCodec *c = avctx->codec;
     const AVPixFmtDescriptor *pixdesc = av_pix_fmt_desc_get(avctx->pix_fmt);
     int i;
 
-    if (avctx->codec->pix_fmts) {
-        for (i = 0; avctx->codec->pix_fmts[i] != AV_PIX_FMT_NONE; i++)
-            if (avctx->pix_fmt == avctx->codec->pix_fmts[i])
+    if (!av_get_pix_fmt_name(avctx->pix_fmt)) {
+        av_log(avctx, AV_LOG_ERROR, "Invalid video pixel format: %d\n",
+               avctx->pix_fmt);
+        return AVERROR(EINVAL);
+    }
+
+    if (c->pix_fmts) {
+        for (i = 0; c->pix_fmts[i] != AV_PIX_FMT_NONE; i++)
+            if (avctx->pix_fmt == c->pix_fmts[i])
                 break;
-        if (avctx->codec->pix_fmts[i] == AV_PIX_FMT_NONE) {
-            char buf[128];
-            snprintf(buf, sizeof(buf), "%d", avctx->pix_fmt);
-            av_log(avctx, AV_LOG_ERROR, "Specified pixel format %s is invalid or not supported\n",
-                   (char *)av_x_if_null(av_get_pix_fmt_name(avctx->pix_fmt), buf));
+        if (c->pix_fmts[i] == AV_PIX_FMT_NONE) {
+            av_log(avctx, AV_LOG_ERROR,
+                   "Specified pixel format %s is not supported by the %s encoder.\n",
+                   av_get_pix_fmt_name(avctx->pix_fmt), c->name);
+
+            av_log(avctx, AV_LOG_ERROR, "Supported pixel formats:\n");
+            for (int p = 0; c->pix_fmts[p] != AV_PIX_FMT_NONE; p++) {
+                av_log(avctx, AV_LOG_ERROR, "  %s\n",
+                       av_get_pix_fmt_name(c->pix_fmts[p]));
+            }
+
             return AVERROR(EINVAL);
         }
-        if (avctx->codec->pix_fmts[i] == AV_PIX_FMT_YUVJ420P ||
-            avctx->codec->pix_fmts[i] == AV_PIX_FMT_YUVJ411P ||
-            avctx->codec->pix_fmts[i] == AV_PIX_FMT_YUVJ422P ||
-            avctx->codec->pix_fmts[i] == AV_PIX_FMT_YUVJ440P ||
-            avctx->codec->pix_fmts[i] == AV_PIX_FMT_YUVJ444P)
+        if (c->pix_fmts[i] == AV_PIX_FMT_YUVJ420P ||
+            c->pix_fmts[i] == AV_PIX_FMT_YUVJ411P ||
+            c->pix_fmts[i] == AV_PIX_FMT_YUVJ422P ||
+            c->pix_fmts[i] == AV_PIX_FMT_YUVJ440P ||
+            c->pix_fmts[i] == AV_PIX_FMT_YUVJ444P)
             avctx->color_range = AVCOL_RANGE_JPEG;
     }
 
@@ -644,52 +658,78 @@ FF_ENABLE_DEPRECATION_WARNINGS
 
 static int encode_preinit_audio(AVCodecContext *avctx)
 {
+    const AVCodec *c = avctx->codec;
     int i;
 
-    if (avctx->codec->sample_fmts) {
-        for (i = 0; avctx->codec->sample_fmts[i] != AV_SAMPLE_FMT_NONE; i++) {
-            if (avctx->sample_fmt == avctx->codec->sample_fmts[i])
+    if (!av_get_sample_fmt_name(avctx->sample_fmt)) {
+        av_log(avctx, AV_LOG_ERROR, "Invalid audio sample format: %d\n",
+               avctx->sample_fmt);
+        return AVERROR(EINVAL);
+    }
+    if (avctx->sample_rate <= 0) {
+        av_log(avctx, AV_LOG_ERROR, "Invalid audio sample rate: %d\n",
+               avctx->sample_rate);
+        return AVERROR(EINVAL);
+    }
+
+    if (c->sample_fmts) {
+        for (i = 0; c->sample_fmts[i] != AV_SAMPLE_FMT_NONE; i++) {
+            if (avctx->sample_fmt == c->sample_fmts[i])
                 break;
             if (avctx->ch_layout.nb_channels == 1 &&
                 av_get_planar_sample_fmt(avctx->sample_fmt) ==
-                av_get_planar_sample_fmt(avctx->codec->sample_fmts[i])) {
-                avctx->sample_fmt = avctx->codec->sample_fmts[i];
+                av_get_planar_sample_fmt(c->sample_fmts[i])) {
+                avctx->sample_fmt = c->sample_fmts[i];
                 break;
             }
         }
-        if (avctx->codec->sample_fmts[i] == AV_SAMPLE_FMT_NONE) {
-            char buf[128];
-            snprintf(buf, sizeof(buf), "%d", avctx->sample_fmt);
-            av_log(avctx, AV_LOG_ERROR, "Specified sample format %s is invalid or not supported\n",
-                   (char *)av_x_if_null(av_get_sample_fmt_name(avctx->sample_fmt), buf));
+        if (c->sample_fmts[i] == AV_SAMPLE_FMT_NONE) {
+            av_log(avctx, AV_LOG_ERROR,
+                   "Specified sample format %s is not supported by the %s encoder\n",
+                   av_get_sample_fmt_name(avctx->sample_fmt), c->name);
+
+            av_log(avctx, AV_LOG_ERROR, "Supported sample formats:\n");
+            for (int p = 0; c->sample_fmts[p] != AV_SAMPLE_FMT_NONE; p++) {
+                av_log(avctx, AV_LOG_ERROR, "  %s\n",
+                       av_get_sample_fmt_name(c->sample_fmts[p]));
+            }
+
             return AVERROR(EINVAL);
         }
     }
-    if (avctx->codec->supported_samplerates) {
-        for (i = 0; avctx->codec->supported_samplerates[i] != 0; i++)
-            if (avctx->sample_rate == avctx->codec->supported_samplerates[i])
+    if (c->supported_samplerates) {
+        for (i = 0; c->supported_samplerates[i] != 0; i++)
+            if (avctx->sample_rate == c->supported_samplerates[i])
                 break;
-        if (avctx->codec->supported_samplerates[i] == 0) {
-            av_log(avctx, AV_LOG_ERROR, "Specified sample rate %d is not supported\n",
-                   avctx->sample_rate);
+        if (c->supported_samplerates[i] == 0) {
+            av_log(avctx, AV_LOG_ERROR,
+                   "Specified sample rate %d is not supported by the %s encoder\n",
+                   avctx->sample_rate, c->name);
+
+            av_log(avctx, AV_LOG_ERROR, "Supported sample rates:\n");
+            for (int p = 0; c->supported_samplerates[p]; p++)
+                av_log(avctx, AV_LOG_ERROR, "  %d\n", c->supported_samplerates[p]);
+
             return AVERROR(EINVAL);
         }
     }
-    if (avctx->sample_rate < 0) {
-        av_log(avctx, AV_LOG_ERROR, "Specified sample rate %d is not supported\n",
-                avctx->sample_rate);
-        return AVERROR(EINVAL);
-    }
-    if (avctx->codec->ch_layouts) {
-        for (i = 0; avctx->codec->ch_layouts[i].nb_channels; i++) {
-            if (!av_channel_layout_compare(&avctx->ch_layout, &avctx->codec->ch_layouts[i]))
+    if (c->ch_layouts) {
+        for (i = 0; c->ch_layouts[i].nb_channels; i++) {
+            if (!av_channel_layout_compare(&avctx->ch_layout, &c->ch_layouts[i]))
                 break;
         }
-        if (!avctx->codec->ch_layouts[i].nb_channels) {
+        if (!c->ch_layouts[i].nb_channels) {
             char buf[512];
             int ret = av_channel_layout_describe(&avctx->ch_layout, buf, sizeof(buf));
-            if (ret > 0)
-                av_log(avctx, AV_LOG_ERROR, "Specified channel layout '%s' is not supported\n", buf);
+            av_log(avctx, AV_LOG_ERROR,
+                   "Specified channel layout '%s' is not supported by the %s encoder\n",
+                   ret > 0 ? buf : "?", c->name);
+
+            av_log(avctx, AV_LOG_ERROR, "Supported channel layouts:\n");
+            for (int p = 0; c->ch_layouts[p].nb_channels; p++) {
+                ret = av_channel_layout_describe(&c->ch_layouts[p], buf, sizeof(buf));
+                av_log(avctx, AV_LOG_ERROR, "  %s\n", ret > 0 ? buf : "?");
+            }
             return AVERROR(EINVAL);
         }
     }
