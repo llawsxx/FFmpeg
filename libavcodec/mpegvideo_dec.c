@@ -154,21 +154,16 @@ do {\
     s->divx_packed  = s1->divx_packed;
 
     if (s1->bitstream_buffer) {
-        if (s1->bitstream_buffer_size +
-            AV_INPUT_BUFFER_PADDING_SIZE > s->allocated_bitstream_buffer_size) {
-            av_fast_malloc(&s->bitstream_buffer,
-                           &s->allocated_bitstream_buffer_size,
-                           s1->allocated_bitstream_buffer_size);
-            if (!s->bitstream_buffer) {
-                s->bitstream_buffer_size = 0;
-                return AVERROR(ENOMEM);
-            }
+        av_fast_padded_malloc(&s->bitstream_buffer,
+                              &s->allocated_bitstream_buffer_size,
+                              s1->bitstream_buffer_size);
+        if (!s->bitstream_buffer) {
+            s->bitstream_buffer_size = 0;
+            return AVERROR(ENOMEM);
         }
         s->bitstream_buffer_size = s1->bitstream_buffer_size;
         memcpy(s->bitstream_buffer, s1->bitstream_buffer,
                s1->bitstream_buffer_size);
-        memset(s->bitstream_buffer + s->bitstream_buffer_size, 0,
-               AV_INPUT_BUFFER_PADDING_SIZE);
     }
 
     // linesize-dependent scratch buffer allocation
@@ -344,9 +339,9 @@ FF_ENABLE_DEPRECATION_WARNINGS
 
     s->current_picture_ptr->f->pict_type = s->pict_type;
     if (s->pict_type == AV_PICTURE_TYPE_I)
-        s->current_picture.f->flags |= AV_FRAME_FLAG_KEY;
+        s->current_picture_ptr->f->flags |= AV_FRAME_FLAG_KEY;
     else
-        s->current_picture.f->flags &= ~AV_FRAME_FLAG_KEY;
+        s->current_picture_ptr->f->flags &= ~AV_FRAME_FLAG_KEY;
 
     if ((ret = ff_mpeg_ref_picture(s->avctx, &s->current_picture,
                                    s->current_picture_ptr)) < 0)

@@ -330,7 +330,7 @@ static int submit_packet(Muxer *mux, AVPacket *pkt, OutputStream *ost)
     return 0;
 }
 
-void of_output_packet(OutputFile *of, OutputStream *ost, AVPacket *pkt)
+int of_output_packet(OutputFile *of, OutputStream *ost, AVPacket *pkt)
 {
     Muxer *mux = mux_from_of(of);
     MuxStream *ms = ms_from_ost(ost);
@@ -359,7 +359,7 @@ void of_output_packet(OutputFile *of, OutputStream *ost, AVPacket *pkt)
         while (!bsf_eof) {
             ret = av_bsf_receive_packet(ms->bsf_ctx, ms->bsf_pkt);
             if (ret == AVERROR(EAGAIN))
-                return;
+                return 0;
             else if (ret == AVERROR_EOF)
                 bsf_eof = 1;
             else if (ret < 0) {
@@ -377,25 +377,24 @@ void of_output_packet(OutputFile *of, OutputStream *ost, AVPacket *pkt)
             goto mux_fail;
     }
 
-    return;
+    return 0;
 
 mux_fail:
     err_msg = "submitting a packet to the muxer";
 
 fail:
     av_log(ost, AV_LOG_ERROR, "Error %s\n", err_msg);
-    if (exit_on_error)
-        exit_program(1);
-
+    return exit_on_error ? ret : 0;
 }
 
-void of_streamcopy(OutputStream *ost, const AVPacket *pkt, int64_t dts)
+int of_streamcopy(OutputStream *ost, const AVPacket *pkt, int64_t dts)
 {
     OutputFile *of = output_files[ost->file_index];
     MuxStream  *ms = ms_from_ost(ost);
     int64_t start_time = (of->start_time == AV_NOPTS_VALUE) ? 0 : of->start_time;
     int64_t ost_tb_start_time = av_rescale_q(start_time, AV_TIME_BASE_Q, ost->mux_timebase);
     AVPacket *opkt = ms->pkt;
+    int ret;
 
     av_packet_unref(opkt);
 
@@ -404,28 +403,27 @@ void of_streamcopy(OutputStream *ost, const AVPacket *pkt, int64_t dts)
         pkt = NULL;
 
     // EOF: flush output bitstream filters.
-    if (!pkt) {
-        of_output_packet(of, ost, NULL);
-        return;
-    }
+    if (!pkt)
+        return of_output_packet(of, ost, NULL);
 
     if (!ms->streamcopy_started && !(pkt->flags & AV_PKT_FLAG_KEY) &&
         !ms->copy_initial_nonkeyframes)
-        return;
+        return 0;
 
     if (!ms->streamcopy_started) {
         if (!ms->copy_prior_start &&
             (pkt->pts == AV_NOPTS_VALUE ?
              dts < ms->ts_copy_start :
              pkt->pts < av_rescale_q(ms->ts_copy_start, AV_TIME_BASE_Q, pkt->time_base)))
-            return;
+            return 0;
 
         if (of->start_time != AV_NOPTS_VALUE && dts < of->start_time)
-            return;
+            return 0;
     }
 
-    if (av_packet_ref(opkt, pkt) < 0)
-        exit_program(1);
+    ret = av_packet_ref(opkt, pkt);
+    if (ret < 0)
+        return ret;
 
     opkt->time_base = ost->mux_timebase;
 
@@ -455,13 +453,17 @@ void of_streamcopy(OutputStream *ost, const AVPacket *pkt, int64_t dts)
             av_log(NULL, AV_LOG_ERROR,
                    "Subtitle heartbeat logic failed in %s! (%s)\n",
                    __func__, av_err2str(ret));
-            exit_program(1);
+            return ret;
         }
     }
 
-    of_output_packet(of, ost, opkt);
+    ret = of_output_packet(of, ost, opkt);
+    if (ret < 0)
+        return ret;
 
     ms->streamcopy_started = 1;
+
+    return 0;
 }
 
 static int thread_stop(Muxer *mux)

@@ -981,7 +981,10 @@ int ist_output_add(InputStream *ist, OutputStream *ost)
     if (ret < 0)
         return ret;
 
-    GROW_ARRAY(ist->outputs, ist->nb_outputs);
+    ret = GROW_ARRAY(ist->outputs, ist->nb_outputs);
+    if (ret < 0)
+        return ret;
+
     ist->outputs[ist->nb_outputs - 1] = ost;
 
     return 0;
@@ -995,7 +998,10 @@ int ist_filter_add(InputStream *ist, InputFilter *ifilter, int is_simple)
     if (ret < 0)
         return ret;
 
-    GROW_ARRAY(ist->filters, ist->nb_filters);
+    ret = GROW_ARRAY(ist->filters, ist->nb_filters);
+    if (ret < 0)
+        return ret;
+
     ist->filters[ist->nb_filters - 1] = ifilter;
 
     // initialize fallback parameters for filtering
@@ -1006,19 +1012,22 @@ int ist_filter_add(InputStream *ist, InputFilter *ifilter, int is_simple)
     return 0;
 }
 
-static const AVCodec *choose_decoder(const OptionsContext *o, AVFormatContext *s, AVStream *st,
-                                     enum HWAccelID hwaccel_id, enum AVHWDeviceType hwaccel_device_type)
+static int choose_decoder(const OptionsContext *o, AVFormatContext *s, AVStream *st,
+                          enum HWAccelID hwaccel_id, enum AVHWDeviceType hwaccel_device_type,
+                          const AVCodec **pcodec)
 
 {
     char *codec_name = NULL;
 
     MATCH_PER_STREAM_OPT(codec_names, str, codec_name, s, st);
     if (codec_name) {
-        const AVCodec *codec = find_codec_or_die(NULL, codec_name, st->codecpar->codec_type, 0);
-        st->codecpar->codec_id = codec->id;
-        if (recast_media && st->codecpar->codec_type != codec->type)
-            st->codecpar->codec_type = codec->type;
-        return codec;
+        int ret = find_codec(NULL, codec_name, st->codecpar->codec_type, 0, pcodec);
+        if (ret < 0)
+            return ret;
+        st->codecpar->codec_id = (*pcodec)->id;
+        if (recast_media && st->codecpar->codec_type != (*pcodec)->type)
+            st->codecpar->codec_type = (*pcodec)->type;
+        return 0;
     } else {
         if (st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO &&
             hwaccel_id == HWACCEL_GENERIC &&
@@ -1037,13 +1046,15 @@ static const AVCodec *choose_decoder(const OptionsContext *o, AVFormatContext *s
                     if (config->device_type == hwaccel_device_type) {
                         av_log(NULL, AV_LOG_VERBOSE, "Selecting decoder '%s' because of requested hwaccel method %s\n",
                                c->name, av_hwdevice_get_type_name(hwaccel_device_type));
-                        return c;
+                        *pcodec = c;
+                        return 0;
                     }
                 }
             }
         }
 
-        return avcodec_find_decoder(st->codecpar->codec_id);
+        *pcodec = avcodec_find_decoder(st->codecpar->codec_id);
+        return 0;
     }
 }
 
@@ -1065,8 +1076,8 @@ static int guess_input_channel_layout(InputStream *ist, int guess_layout_max)
     return 1;
 }
 
-static void add_display_matrix_to_stream(const OptionsContext *o,
-                                         AVFormatContext *ctx, InputStream *ist)
+static int add_display_matrix_to_stream(const OptionsContext *o,
+                                        AVFormatContext *ctx, InputStream *ist)
 {
     AVStream *st = ist->st;
     double rotation = DBL_MAX;
@@ -1083,12 +1094,12 @@ static void add_display_matrix_to_stream(const OptionsContext *o,
     vflip_set    = vflip != -1;
 
     if (!rotation_set && !hflip_set && !vflip_set)
-        return;
+        return 0;
 
     buf = (int32_t *)av_stream_new_side_data(st, AV_PKT_DATA_DISPLAYMATRIX, sizeof(int32_t) * 9);
     if (!buf) {
         av_log(ist, AV_LOG_FATAL, "Failed to generate a display matrix!\n");
-        exit_program(1);
+        return AVERROR(ENOMEM);
     }
 
     av_display_rotation_set(buf,
@@ -1097,6 +1108,8 @@ static void add_display_matrix_to_stream(const OptionsContext *o,
     av_display_matrix_flip(buf,
                            hflip_set ? hflip : 0,
                            vflip_set ? vflip : 0);
+
+    return 0;
 }
 
 static const char *input_stream_item_name(void *obj)
@@ -1117,8 +1130,11 @@ static DemuxStream *demux_stream_alloc(Demuxer *d, AVStream *st)
 {
     const char *type_str = av_get_media_type_string(st->codecpar->codec_type);
     InputFile    *f = &d->f;
-    DemuxStream *ds = allocate_array_elem(&f->streams, sizeof(*ds),
-                                          &f->nb_streams);
+    DemuxStream *ds;
+
+    ds = allocate_array_elem(&f->streams, sizeof(*ds), &f->nb_streams);
+    if (!ds)
+        return NULL;
 
     ds->ist.st         = st;
     ds->ist.file_index = f->index;
@@ -1132,7 +1148,7 @@ static DemuxStream *demux_stream_alloc(Demuxer *d, AVStream *st)
     return ds;
 }
 
-static void ist_add(const OptionsContext *o, Demuxer *d, AVStream *st)
+static int ist_add(const OptionsContext *o, Demuxer *d, AVStream *st)
 {
     AVFormatContext *ic = d->f.ctx;
     AVCodecParameters *par = st->codecpar;
@@ -1150,6 +1166,9 @@ static void ist_add(const OptionsContext *o, Demuxer *d, AVStream *st)
     int ret;
 
     ds  = demux_stream_alloc(d, st);
+    if (!ds)
+        return AVERROR(ENOMEM);
+
     ist = &ds->ist;
 
     ist->discard = 1;
@@ -1180,7 +1199,9 @@ static void ist_add(const OptionsContext *o, Demuxer *d, AVStream *st)
     }
 
     if (st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
-        add_display_matrix_to_stream(o, ic, ist);
+        ret = add_display_matrix_to_stream(o, ic, ist);
+        if (ret < 0)
+            return ret;
 
         MATCH_PER_STREAM_OPT(hwaccels, str, hwaccel, ic, st);
         MATCH_PER_STREAM_OPT(hwaccel_output_formats, str,
@@ -1238,7 +1259,7 @@ static void ist_add(const OptionsContext *o, Demuxer *d, AVStream *st)
                         av_log(ist, AV_LOG_FATAL, "%s ",
                                av_hwdevice_get_type_name(type));
                     av_log(ist, AV_LOG_FATAL, "\n");
-                    exit_program(1);
+                    return AVERROR(EINVAL);
                 }
             }
         }
@@ -1247,12 +1268,19 @@ static void ist_add(const OptionsContext *o, Demuxer *d, AVStream *st)
         if (hwaccel_device) {
             ist->hwaccel_device = av_strdup(hwaccel_device);
             if (!ist->hwaccel_device)
-                report_and_exit(AVERROR(ENOMEM));
+                return AVERROR(ENOMEM);
         }
     }
 
-    ist->dec = choose_decoder(o, ic, st, ist->hwaccel_id, ist->hwaccel_device_type);
-    ist->decoder_opts = filter_codec_opts(o->g->codec_opts, ist->st->codecpar->codec_id, ic, st, ist->dec);
+    ret = choose_decoder(o, ic, st, ist->hwaccel_id, ist->hwaccel_device_type,
+                         &ist->dec);
+    if (ret < 0)
+        return ret;
+
+    ret = filter_codec_opts(o->g->codec_opts, ist->st->codecpar->codec_id,
+                            ic, st, ist->dec, &ist->decoder_opts);
+    if (ret < 0)
+        return ret;
 
     ist->reinit_filters = -1;
     MATCH_PER_STREAM_OPT(reinit_filters, i, ist->reinit_filters, ic, st);
@@ -1266,20 +1294,22 @@ static void ist_add(const OptionsContext *o, Demuxer *d, AVStream *st)
         (o->data_disable && ist->st->codecpar->codec_type == AVMEDIA_TYPE_DATA))
             ist->user_set_discard = AVDISCARD_ALL;
 
-    if (discard_str && av_opt_eval_int(&cc, discard_opt, discard_str, &ist->user_set_discard) < 0) {
-        av_log(ist, AV_LOG_ERROR, "Error parsing discard %s.\n",
-                discard_str);
-        exit_program(1);
+    if (discard_str) {
+        ret = av_opt_eval_int(&cc, discard_opt, discard_str, &ist->user_set_discard);
+        if (ret  < 0) {
+            av_log(ist, AV_LOG_ERROR, "Error parsing discard %s.\n", discard_str);
+            return ret;
+        }
     }
 
     ist->dec_ctx = avcodec_alloc_context3(ist->dec);
     if (!ist->dec_ctx)
-        report_and_exit(AVERROR(ENOMEM));
+        return AVERROR(ENOMEM);
 
     ret = avcodec_parameters_to_context(ist->dec_ctx, par);
     if (ret < 0) {
         av_log(ist, AV_LOG_ERROR, "Error initializing the decoder context.\n");
-        exit_program(1);
+        return ret;
     }
 
     if (o->bitexact)
@@ -1288,11 +1318,13 @@ static void ist_add(const OptionsContext *o, Demuxer *d, AVStream *st)
     switch (par->codec_type) {
     case AVMEDIA_TYPE_VIDEO:
         MATCH_PER_STREAM_OPT(frame_rates, str, framerate, ic, st);
-        if (framerate && av_parse_video_rate(&ist->framerate,
-                                             framerate) < 0) {
-            av_log(ist, AV_LOG_ERROR, "Error parsing framerate %s.\n",
-                   framerate);
-            exit_program(1);
+        if (framerate) {
+            ret = av_parse_video_rate(&ist->framerate, framerate);
+            if (ret < 0) {
+                av_log(ist, AV_LOG_ERROR, "Error parsing framerate %s.\n",
+                       framerate);
+                return ret;
+            }
         }
 
         ist->top_field_first = -1;
@@ -1312,10 +1344,13 @@ static void ist_add(const OptionsContext *o, Demuxer *d, AVStream *st)
         char *canvas_size = NULL;
         MATCH_PER_STREAM_OPT(fix_sub_duration, i, ist->fix_sub_duration, ic, st);
         MATCH_PER_STREAM_OPT(canvas_sizes, str, canvas_size, ic, st);
-        if (canvas_size &&
-            av_parse_video_size(&ist->dec_ctx->width, &ist->dec_ctx->height, canvas_size) < 0) {
-            av_log(ist, AV_LOG_FATAL, "Invalid canvas size: %s.\n", canvas_size);
-            exit_program(1);
+        if (canvas_size) {
+            ret = av_parse_video_size(&ist->dec_ctx->width, &ist->dec_ctx->height,
+                                      canvas_size);
+            if (ret < 0) {
+                av_log(ist, AV_LOG_FATAL, "Invalid canvas size: %s.\n", canvas_size);
+                return ret;
+            }
         }
 
         /* Compute the size of the canvas for the subtitles stream.
@@ -1349,18 +1384,20 @@ static void ist_add(const OptionsContext *o, Demuxer *d, AVStream *st)
 
     ist->par = avcodec_parameters_alloc();
     if (!ist->par)
-        report_and_exit(AVERROR(ENOMEM));
+        return AVERROR(ENOMEM);
 
     ret = avcodec_parameters_from_context(ist->par, ist->dec_ctx);
     if (ret < 0) {
         av_log(ist, AV_LOG_ERROR, "Error initializing the decoder context.\n");
-        exit_program(1);
+        return ret;
     }
 
     ist->codec_desc = avcodec_descriptor_get(ist->par->codec_id);
+
+    return 0;
 }
 
-static void dump_attachment(InputStream *ist, const char *filename)
+static int dump_attachment(InputStream *ist, const char *filename)
 {
     AVStream *st = ist->st;
     int ret;
@@ -1369,26 +1406,33 @@ static void dump_attachment(InputStream *ist, const char *filename)
 
     if (!st->codecpar->extradata_size) {
         av_log(ist, AV_LOG_WARNING, "No extradata to dump.\n");
-        return;
+        return 0;
     }
     if (!*filename && (e = av_dict_get(st->metadata, "filename", NULL, 0)))
         filename = e->value;
     if (!*filename) {
         av_log(ist, AV_LOG_FATAL, "No filename specified and no 'filename' tag");
-        exit_program(1);
+        return AVERROR(EINVAL);
     }
 
-    assert_file_overwrite(filename);
+    ret = assert_file_overwrite(filename);
+    if (ret < 0)
+        return ret;
 
     if ((ret = avio_open2(&out, filename, AVIO_FLAG_WRITE, &int_cb, NULL)) < 0) {
         av_log(ist, AV_LOG_FATAL, "Could not open file %s for writing.\n",
                filename);
-        exit_program(1);
+        return ret;
     }
 
     avio_write(out, st->codecpar->extradata, st->codecpar->extradata_size);
-    avio_flush(out);
-    avio_close(out);
+    ret = avio_close(out);
+
+    if (ret >= 0)
+        av_log(ist, AV_LOG_INFO, "Wrote attachment (%d bytes) to '%s'\n",
+               st->codecpar->extradata_size, filename);
+
+    return ret;
 }
 
 static const char *input_file_item_name(void *obj)
@@ -1409,6 +1453,9 @@ static Demuxer *demux_alloc(void)
 {
     Demuxer *d = allocate_array_elem(&input_files, sizeof(*d), &nb_input_files);
 
+    if (!d)
+        return NULL;
+
     d->f.class = &input_file_class;
     d->f.index = nb_input_files - 1;
 
@@ -1423,7 +1470,7 @@ int ifile_open(const OptionsContext *o, const char *filename)
     InputFile *f;
     AVFormatContext *ic;
     const AVInputFormat *file_iformat = NULL;
-    int err, i, ret;
+    int err, i, ret = 0;
     int64_t timestamp;
     AVDictionary *unused_opts = NULL;
     const AVDictionaryEntry *e = NULL;
@@ -1439,6 +1486,9 @@ int ifile_open(const OptionsContext *o, const char *filename)
     int64_t recording_time = o->recording_time;
 
     d = demux_alloc();
+    if (!d)
+        return AVERROR(ENOMEM);
+
     f = &d->f;
 
     if (stop_time != INT64_MAX && recording_time != INT64_MAX) {
@@ -1450,7 +1500,7 @@ int ifile_open(const OptionsContext *o, const char *filename)
         int64_t start = start_time == AV_NOPTS_VALUE ? 0 : start_time;
         if (stop_time <= start) {
             av_log(d, AV_LOG_ERROR, "-to value smaller than -ss; aborting.\n");
-            exit_program(1);
+            return AVERROR(EINVAL);
         } else {
             recording_time = stop_time - start;
         }
@@ -1459,7 +1509,7 @@ int ifile_open(const OptionsContext *o, const char *filename)
     if (o->format) {
         if (!(file_iformat = av_find_input_format(o->format))) {
             av_log(d, AV_LOG_FATAL, "Unknown input format: '%s'\n", o->format);
-            exit_program(1);
+            return AVERROR(EINVAL);
         }
     }
 
@@ -1473,7 +1523,7 @@ int ifile_open(const OptionsContext *o, const char *filename)
     /* get default parameters from command line */
     ic = avformat_alloc_context();
     if (!ic)
-        report_and_exit(AVERROR(ENOMEM));
+        return AVERROR(ENOMEM);
     if (o->nb_audio_sample_rate) {
         av_dict_set_int(&o->g->format_opts, "sample_rate", o->audio_sample_rate[o->nb_audio_sample_rate - 1].u.i, 0);
     }
@@ -1518,13 +1568,19 @@ int ifile_open(const OptionsContext *o, const char *filename)
     MATCH_PER_TYPE_OPT(codec_names, str,     data_codec_name, ic, "d");
 
     if (video_codec_name)
-        ic->video_codec    = find_codec_or_die(NULL, video_codec_name   , AVMEDIA_TYPE_VIDEO   , 0);
+        ret = err_merge(ret, find_codec(NULL, video_codec_name   , AVMEDIA_TYPE_VIDEO   , 0,
+                                        &ic->video_codec));
     if (audio_codec_name)
-        ic->audio_codec    = find_codec_or_die(NULL, audio_codec_name   , AVMEDIA_TYPE_AUDIO   , 0);
+        ret = err_merge(ret, find_codec(NULL, audio_codec_name   , AVMEDIA_TYPE_AUDIO   , 0,
+                                        &ic->audio_codec));
     if (subtitle_codec_name)
-        ic->subtitle_codec = find_codec_or_die(NULL, subtitle_codec_name, AVMEDIA_TYPE_SUBTITLE, 0);
+        ret = err_merge(ret, find_codec(NULL, subtitle_codec_name, AVMEDIA_TYPE_SUBTITLE, 0,
+                                        &ic->subtitle_codec));
     if (data_codec_name)
-        ic->data_codec     = find_codec_or_die(NULL, data_codec_name    , AVMEDIA_TYPE_DATA    , 0);
+        ret = err_merge(ret, find_codec(NULL, data_codec_name    , AVMEDIA_TYPE_DATA,     0,
+                                        &ic->data_codec));
+    if (ret < 0)
+        return ret;
 
     ic->video_codec_id     = video_codec_name    ? ic->video_codec->id    : AV_CODEC_ID_NONE;
     ic->audio_codec_id     = audio_codec_name    ? ic->audio_codec->id    : AV_CODEC_ID_NONE;
@@ -1547,7 +1603,7 @@ int ifile_open(const OptionsContext *o, const char *filename)
                "Error opening input: %s\n", av_err2str(err));
         if (err == AVERROR_PROTOCOL_NOT_FOUND)
             av_log(d, AV_LOG_ERROR, "Did you mean file:%s?\n", filename);
-        exit_program(1);
+        return err;
     }
 
     av_strlcat(d->log_name, "/",               sizeof(d->log_name));
@@ -1556,15 +1612,27 @@ int ifile_open(const OptionsContext *o, const char *filename)
     if (scan_all_pmts_set)
         av_dict_set(&o->g->format_opts, "scan_all_pmts", NULL, AV_DICT_MATCH_CASE);
     remove_avoptions(&o->g->format_opts, o->g->codec_opts);
-    assert_avoptions(o->g->format_opts);
+
+    ret = check_avoptions(o->g->format_opts);
+    if (ret < 0)
+        return ret;
 
     /* apply forced codec ids */
-    for (i = 0; i < ic->nb_streams; i++)
-        choose_decoder(o, ic, ic->streams[i], HWACCEL_NONE, AV_HWDEVICE_TYPE_NONE);
+    for (i = 0; i < ic->nb_streams; i++) {
+        const AVCodec *dummy;
+        ret = choose_decoder(o, ic, ic->streams[i], HWACCEL_NONE, AV_HWDEVICE_TYPE_NONE,
+                             &dummy);
+        if (ret < 0)
+            return ret;
+    }
 
     if (o->find_stream_info) {
-        AVDictionary **opts = setup_find_stream_info_opts(ic, o->g->codec_opts);
+        AVDictionary **opts;
         int orig_nb_streams = ic->nb_streams;
+
+        ret = setup_find_stream_info_opts(ic, o->g->codec_opts, &opts);
+        if (ret < 0)
+            return ret;
 
         /* If not enough info to get the stream parameters, we decode the
            first frames to get it. (used in mpeg case for example) */
@@ -1578,7 +1646,7 @@ int ifile_open(const OptionsContext *o, const char *filename)
             av_log(d, AV_LOG_FATAL, "could not find codec parameters\n");
             if (ic->nb_streams == 0) {
                 avformat_close_input(&ic);
-                exit_program(1);
+                return ret;
             }
         }
     }
@@ -1591,7 +1659,7 @@ int ifile_open(const OptionsContext *o, const char *filename)
     if (start_time_eof != AV_NOPTS_VALUE) {
         if (start_time_eof >= 0) {
             av_log(d, AV_LOG_ERROR, "-sseof value must be negative; aborting\n");
-            exit_program(1);
+            return AVERROR(EINVAL);
         }
         if (ic->duration > 0) {
             start_time = start_time_eof + ic->duration;
@@ -1648,7 +1716,7 @@ int ifile_open(const OptionsContext *o, const char *filename)
     f->readrate = o->readrate ? o->readrate : 0.0;
     if (f->readrate < 0.0f) {
         av_log(d, AV_LOG_ERROR, "Option -readrate is %0.3f; it must be non-negative.\n", f->readrate);
-        exit_program(1);
+        return AVERROR(EINVAL);
     }
     if (o->rate_emu) {
         if (f->readrate) {
@@ -1663,7 +1731,7 @@ int ifile_open(const OptionsContext *o, const char *filename)
             av_log(d, AV_LOG_ERROR,
                    "Option -readrate_initial_burst is %0.3f; it must be non-negative.\n",
                    d->readrate_initial_burst);
-            exit_program(1);
+            return AVERROR(EINVAL);
         }
     } else if (o->readrate_initial_burst) {
         av_log(d, AV_LOG_WARNING, "Option -readrate_initial_burst ignored "
@@ -1676,8 +1744,11 @@ int ifile_open(const OptionsContext *o, const char *filename)
         av_log(d, AV_LOG_INFO, "pre_buffer_queue_size is set: %d\n", d->pre_buffer_queue_size);
 
     /* Add all the streams from the given input file to the demuxer */
-    for (int i = 0; i < ic->nb_streams; i++)
-        ist_add(o, d, ic->streams[i]);
+    for (int i = 0; i < ic->nb_streams; i++) {
+        ret = ist_add(o, d, ic->streams[i]);
+        if (ret < 0)
+            return ret;
+    }
 
     /* dump the file content */
     av_dump_format(ic, f->index, filename, 0);
@@ -1705,7 +1776,7 @@ int ifile_open(const OptionsContext *o, const char *filename)
         if (!(option->flags & AV_OPT_FLAG_DECODING_PARAM)) {
             av_log(d, AV_LOG_ERROR, "Codec AVOption %s (%s) is not a decoding "
                    "option.\n", e->key, option->help ? option->help : "");
-            exit_program(1);
+            return AVERROR(EINVAL);
         }
 
         av_log(d, AV_LOG_WARNING, "Codec AVOption %s (%s) has not been used "
@@ -1722,8 +1793,11 @@ int ifile_open(const OptionsContext *o, const char *filename)
         for (j = 0; j < f->nb_streams; j++) {
             InputStream *ist = f->streams[j];
 
-            if (check_stream_specifier(ic, ist->st, o->dump_attachment[i].specifier) == 1)
-                dump_attachment(ist, o->dump_attachment[i].u.str);
+            if (check_stream_specifier(ic, ist->st, o->dump_attachment[i].specifier) == 1) {
+                ret = dump_attachment(ist, o->dump_attachment[i].u.str);
+                if (ret < 0)
+                    return ret;
+            }
         }
     }
 

@@ -31,14 +31,19 @@
 #include "encode.h"
 
 typedef struct MSRLEContext {
-    const AVClass *class;
     int curframe;
     AVFrame *last_frame;
 } MSRLEContext;
 
 static av_cold int msrle_encode_init(AVCodecContext *avctx)
 {
+    MSRLEContext *s = avctx->priv_data;
+
     avctx->bits_per_coded_sample = 8;
+    s->last_frame = av_frame_alloc();
+    if (!s->last_frame)
+        return AVERROR(ENOMEM);
+
     return 0;
 }
 
@@ -59,7 +64,8 @@ static void write_run(AVCodecContext *avctx, uint8_t **data, int len, int value)
     }
 }
 
-static void write_absolute(AVCodecContext *avctx, uint8_t **data, uint8_t *line, int len)
+static void write_absolute(AVCodecContext *avctx, uint8_t **data,
+                           const uint8_t *line, int len)
 {
     // writing 255 would be wasteful here due to the padding requirement
     while (len >= 254) {
@@ -131,7 +137,8 @@ static void write_yskip(AVCodecContext *avctx, uint8_t **data, int yskip)
 }
 
 // used both to encode lines in keyframes and to encode lines between deltas
-static void encode_line(AVCodecContext *avctx, uint8_t **data, uint8_t *line, int length)
+static void encode_line(AVCodecContext *avctx, uint8_t **data,
+                        const uint8_t *line, int length)
 {
     int run = 0, last = -1, absstart = 0;
     if (length == 0)
@@ -187,8 +194,8 @@ static int encode(AVCodecContext *avctx, AVPacket *pkt,
         // compare to previous frame
         int yskip = 0; // we can encode large skips using deltas
         for (int y = avctx->height-1; y >= 0; y--) {
-            uint8_t *line = &pict->data[0][y*pict->linesize[0]];
-            uint8_t *prev = &s->last_frame->data[0][y*s->last_frame->linesize[0]];
+            const uint8_t *line = &pict->data[0][y*pict->linesize[0]];
+            const uint8_t *prev = &s->last_frame->data[0][y*s->last_frame->linesize[0]];
             // we need at least 5 pixels in a row for a delta to be worthwhile
             int delta = 0, linestart = 0, encoded = 0;
             for (int x = 0; x < avctx->width; x++) {
@@ -234,7 +241,8 @@ static int encode(AVCodecContext *avctx, AVPacket *pkt,
     }
     bytestream_put_be16(&data, 0x0001); // end of bitmap
     pkt->size = data - pkt->data;
-    return 0;}
+    return 0;
+}
 
 static int msrle_encode_frame(AVCodecContext *avctx, AVPacket *pkt,
                               const AVFrame *pict, int *got_packet)
@@ -249,6 +257,8 @@ static int msrle_encode_frame(AVCodecContext *avctx, AVPacket *pkt,
 
     if (pict->data[1]) {
         uint8_t *side_data = av_packet_new_side_data(pkt, AV_PKT_DATA_PALETTE, AVPALETTE_SIZE);
+        if (!side_data)
+            return AVERROR(ENOMEM);
         memcpy(side_data, pict->data[1], AVPALETTE_SIZE);
     }
 
@@ -263,13 +273,7 @@ static int msrle_encode_frame(AVCodecContext *avctx, AVPacket *pkt,
         s->curframe = 0;
     *got_packet = 1;
 
-    if (!s->last_frame)
-        s->last_frame = av_frame_alloc();
-    else
-        av_frame_unref(s->last_frame);
-
-    av_frame_ref(s->last_frame, pict);
-    return 0;
+    return av_frame_replace(s->last_frame, pict);
 }
 
 static int msrle_encode_close(AVCodecContext *avctx)
@@ -278,12 +282,6 @@ static int msrle_encode_close(AVCodecContext *avctx)
     av_frame_free(&s->last_frame);
     return 0;
 }
-
-static const AVClass msrle_class = {
-    .class_name = "Microsoft RLE encoder",
-    .item_name  = av_default_item_name,
-    .version    = LIBAVUTIL_VERSION_INT,
-};
 
 const FFCodec ff_msrle_encoder = {
     .p.name         = "msrle",
@@ -298,6 +296,5 @@ const FFCodec ff_msrle_encoder = {
     .p.pix_fmts     = (const enum AVPixelFormat[]){
         AV_PIX_FMT_PAL8, AV_PIX_FMT_NONE
     },
-    .p.priv_class   = &msrle_class,
     .caps_internal  = FF_CODEC_CAP_INIT_CLEANUP,
 };

@@ -406,34 +406,6 @@ int avcodec_fill_audio_frame(AVFrame *frame, int nb_channels,
     return ret;
 }
 
-void ff_color_frame(AVFrame *frame, const int c[4])
-{
-    const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(frame->format);
-    int p, y;
-
-    av_assert0(desc->flags & AV_PIX_FMT_FLAG_PLANAR);
-
-    for (p = 0; p<desc->nb_components; p++) {
-        uint8_t *dst = frame->data[p];
-        int is_chroma = p == 1 || p == 2;
-        int bytes  = is_chroma ? AV_CEIL_RSHIFT(frame->width,  desc->log2_chroma_w) : frame->width;
-        int height = is_chroma ? AV_CEIL_RSHIFT(frame->height, desc->log2_chroma_h) : frame->height;
-        if (desc->comp[0].depth >= 9) {
-            ((uint16_t*)dst)[0] = c[p];
-            av_memcpy_backptr(dst + 2, 2, bytes - 2);
-            dst += frame->linesize[p];
-            for (y = 1; y < height; y++) {
-                memcpy(dst, frame->data[p], 2*bytes);
-                dst += frame->linesize[p];
-            }
-        } else {
-            for (y = 0; y < height; y++) {
-                memset(dst, c[p], bytes);
-                dst += frame->linesize[p];
-            }
-        }
-    }
-}
 
 int avpriv_codec_get_cap_skip_frame_fill_param(const AVCodec *codec){
     return !!(ffcodec(codec)->caps_internal & FF_CODEC_CAP_SKIP_FRAME_FILL_PARAM);
@@ -1169,23 +1141,4 @@ int64_t ff_guess_coded_bitrate(AVCodecContext *avctx)
               framerate.num / framerate.den;
 
     return bitrate;
-}
-
-int ff_int_from_list_or_default(void *ctx, const char * val_name, int val,
-                                const int * array_valid_values, int default_value)
-{
-    int i = 0, ref_val;
-
-    while (1) {
-        ref_val = array_valid_values[i];
-        if (ref_val == INT_MAX)
-            break;
-        if (val == ref_val)
-            return val;
-        i++;
-    }
-    /* val is not a valid value */
-    av_log(ctx, AV_LOG_DEBUG,
-           "%s %d are not supported. Set to default value : %d\n", val_name, val, default_value);
-    return default_value;
 }
