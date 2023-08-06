@@ -132,7 +132,6 @@ for (int x = 0; x < width; x++) {\
 
 
 static int adaptive_deint_plane(AVFrame* prev, AVFrame* cur, AVFrame* next, AVFrame* out,int plane,int width,int height, int jobnr, int nb_jobs, int is_second, int field_order, int thres1, int thres2,int enable_ela) {
-    int is_first_in;
     int32_t m1, m2, m3, m4, diff1, diff2, diff3, max_diff;
     int32_t inter_deint_value, intra_deint_value;
 
@@ -268,7 +267,6 @@ static int adaptive_deint_plane(AVFrame* prev, AVFrame* cur, AVFrame* next, AVFr
 
 
 static int adaptive_deint_plane_16bit(AVFrame* prev, AVFrame* cur, AVFrame* next, AVFrame* out, int plane, int width, int height, int jobnr, int nb_jobs, int is_second, int field_order, int thres1, int thres2, int enable_ela) {
-    int is_first_in;
     int32_t m1, m2, m3, m4, diff1, diff2, diff3, max_diff;
     int32_t inter_deint_value, intra_deint_value;
     uint8_t* cur_line, * prev_line, * next_line, * adj_line, * out_line;
