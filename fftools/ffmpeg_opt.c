@@ -1850,6 +1850,8 @@ const OptionDef options[] = {
         "initialise hardware device", "args" },
     { "filter_hw_device", HAS_ARG | OPT_EXPERT, { .func_arg = opt_filter_hw_device },
         "set hardware device used when filtering", "device" },
-
+    { "pre_buffer_queue_size",   HAS_ARG | OPT_INT | OPT_EXPERT | OPT_OFFSET |
+                        OPT_INPUT, { .off = OFFSET(pre_buffer_queue_size) },
+        "cache a certain amount of packets so that the subtitle packets can be read before the audio and video packets to solve the subtitle delay problem of the overlay filter", "packets" },
     { NULL, },
 };

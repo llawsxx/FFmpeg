@@ -248,7 +248,7 @@ void ff_avfilter_link_set_in_status(AVFilterLink *link, int status, int64_t pts)
  * Set the status field of a link from the destination filter.
  * The pts should probably be left unset (AV_NOPTS_VALUE).
  */
-static void link_set_out_status(AVFilterLink *link, int status, int64_t pts)
+void ff_avfilter_link_set_out_status(AVFilterLink *link, int status, int64_t pts)
 {
     av_assert0(!link->frame_wanted_out);
     av_assert0(!link->status_out);
@@ -444,7 +444,7 @@ int ff_request_frame(AVFilterLink *link)
             /* Acknowledge status change. Filters using ff_request_frame() will
                handle the change automatically. Filters can also check the
                status directly but none do yet. */
-            link_set_out_status(link, link->status_in, link->status_in_pts);
+            ff_avfilter_link_set_out_status(link, link->status_in, link->status_in_pts);
             return link->status_out;
         }
     }
@@ -1122,7 +1122,7 @@ static int ff_filter_frame_to_filter(AVFilterLink *link)
     link->frame_count_out--;
     ret = ff_filter_frame_framed(link, frame);
     if (ret < 0 && ret != link->status_out) {
-        link_set_out_status(link, ret, AV_NOPTS_VALUE);
+        ff_avfilter_link_set_out_status(link, ret, AV_NOPTS_VALUE);
     } else {
         /* Run once again, to see if several frames were available, or if
            the input status has also changed, or any other reason. */
@@ -1152,7 +1152,7 @@ static int forward_status_change(AVFilterContext *filter, AVFilterLink *in)
             if (!progress) {
                 /* Every output already closed: input no longer interesting
                    (example: overlay in shortest mode, other input closed). */
-                link_set_out_status(in, in->status_in, in->status_in_pts);
+                ff_avfilter_link_set_out_status(in, in->status_in, in->status_in_pts);
                 return 0;
             }
             progress = 0;
@@ -1254,7 +1254,7 @@ static int ff_filter_activate_default(AVFilterContext *filter)
      change is considered having already happened.
 
      It is set by the destination filter using
-     link_set_out_status().
+     ff_avfilter_link_set_out_status().
 
    Filters are activated according to the ready field, set using the
    ff_filter_set_ready(). Eventually, a priority queue will be used.
@@ -1517,7 +1517,7 @@ void ff_inlink_set_status(AVFilterLink *link, int status)
         return;
     link->frame_wanted_out = 0;
     link->frame_blocked_in = 0;
-    link_set_out_status(link, status, AV_NOPTS_VALUE);
+    ff_avfilter_link_set_out_status(link, status, AV_NOPTS_VALUE);
     while (ff_framequeue_queued_frames(&link->fifo)) {
            AVFrame *frame = ff_framequeue_take(&link->fifo);
            av_frame_free(&frame);

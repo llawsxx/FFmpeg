@@ -23,6 +23,7 @@
 #include "libavutil/pixdesc.h"
 #include "libavutil/pixfmt.h"
 #include "libavutil/timestamp.h"
+#include "libavutil/internal.h"
 
 #include "libavcodec/avcodec.h"
 #include "libavcodec/codec.h"
@@ -326,9 +327,17 @@ static int video_frame_process(InputStream *ist, AVFrame *frame)
     }
 
 #if FFMPEG_OPT_TOP
-    if(ist->top_field_first>=0) {
-        av_log(ist, AV_LOG_WARNING, "-top is deprecated, use the setfield filter instead\n");
-        frame->flags |= AV_FRAME_FLAG_TOP_FIELD_FIRST;
+    if(ist->top_field_first>=0){
+	av_log(ist, AV_LOG_WARNING, "-top is deprecated, use the setfield filter instead\n");
+#if FF_API_INTERLACED_FRAME
+FF_DISABLE_DEPRECATION_WARNINGS
+        frame->top_field_first = ist->top_field_first;
+FF_ENABLE_DEPRECATION_WARNINGS
+#endif
+        if (ist->top_field_first)
+            frame->flags |= AV_FRAME_FLAG_TOP_FIELD_FIRST;
+        else
+            frame->flags &= ~AV_FRAME_FLAG_TOP_FIELD_FIRST;
     }
 #endif
 

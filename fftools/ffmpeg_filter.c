@@ -165,16 +165,15 @@ static OutputFilterPriv *ofp_from_ofilter(OutputFilter *ofilter)
 
 static int configure_filtergraph(FilterGraph *fg);
 
-static int sub2video_get_blank_frame(InputFilterPriv *ifp)
+static int sub2video_get_blank_frame(AVFrame *frame,int width,int height,int format)
 {
-    AVFrame *frame = ifp->sub2video.frame;
     int ret;
 
     av_frame_unref(frame);
 
-    frame->width  = ifp->width;
-    frame->height = ifp->height;
-    frame->format = ifp->format;
+    frame->width  = width;
+    frame->height = height;
+    frame->format = format;
 
     ret = av_frame_get_buffer(frame, 0);
     if (ret < 0)
@@ -219,21 +218,17 @@ static void sub2video_copy_rect(uint8_t *dst, int dst_linesize, int w, int h,
 static void sub2video_push_ref(InputFilterPriv *ifp, int64_t pts)
 {
     AVFrame *frame = ifp->sub2video.frame;
-    int ret;
 
     av_assert1(frame->data[0]);
     ifp->sub2video.last_pts = frame->pts = pts;
-    ret = av_buffersrc_add_frame_flags(ifp->filter, frame,
-                                       AV_BUFFERSRC_FLAG_KEEP_REF |
-                                       AV_BUFFERSRC_FLAG_PUSH);
-    if (ret != AVERROR_EOF && ret < 0)
-        av_log(NULL, AV_LOG_WARNING, "Error while add the frame to buffer source(%s).\n",
-               av_err2str(ret));
+	frame->time_base = ifp->time_base;
+	ifilter_send_frame(&ifp->ifilter, frame, 1);
 }
 
 static void sub2video_update(InputFilterPriv *ifp, int64_t heartbeat_pts,
-                             const AVSubtitle *sub)
+                             const AVFrame *warp_frame)
 {
+	const AVSubtitle *sub = warp_frame ? (const AVSubtitle*)warp_frame->buf[0]->data : NULL;
     AVFrame *frame = ifp->sub2video.frame;
     int8_t *dst;
     int     dst_linesize;
@@ -256,7 +251,10 @@ static void sub2video_update(InputFilterPriv *ifp, int64_t heartbeat_pts,
         end_pts   = INT64_MAX;
         num_rects = 0;
     }
-    if (sub2video_get_blank_frame(ifp) < 0) {
+    if (sub2video_get_blank_frame(frame, 
+		(warp_frame && warp_frame->width > 0) ? warp_frame->width : ifp->width, 
+		(warp_frame && warp_frame->height > 0) ? warp_frame->height : ifp->height, ifp->format) < 0) {
+			
         av_log(NULL, AV_LOG_ERROR,
                "Impossible to get a blank canvas.\n");
         return;
@@ -1645,7 +1643,7 @@ static int configure_filtergraph(FilterGraph *fg)
         AVFrame *tmp;
         while (av_fifo_read(ifp->frame_queue, &tmp, 1) >= 0) {
             if (ifp->type_src == AVMEDIA_TYPE_SUBTITLE) {
-                sub2video_update(ifp, INT64_MIN, (const AVSubtitle*)tmp->buf[0]->data);
+                sub2video_update(ifp, INT64_MIN, tmp);
             } else {
                 ret = av_buffersrc_add_frame(ifp->filter, tmp);
             }
@@ -1890,10 +1888,8 @@ int ifilter_sub2video(InputFilter *ifilter, const AVFrame *frame)
             return av_buffersrc_add_frame(ifp->filter, NULL);
         }
 
-        ifp->width  = frame->width  ? frame->width  : ifp->width;
-        ifp->height = frame->height ? frame->height : ifp->height;
 
-        sub2video_update(ifp, INT64_MIN, (const AVSubtitle*)frame->buf[0]->data);
+        sub2video_update(ifp, INT64_MIN, frame);
     } else if (frame) {
         AVFrame *tmp = av_frame_clone(frame);
 
@@ -1978,6 +1974,7 @@ int ifilter_send_frame(InputFilter *ifilter, AVFrame *frame, int keep_reference)
                        ifp->height != frame->height;
         break;
     }
+
 
     if (!ifp->ist->reinit_filters && fg->graph)
         need_reinit = 0;
