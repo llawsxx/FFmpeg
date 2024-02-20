@@ -82,6 +82,175 @@ typedef struct DemuxStream {
     uint64_t data_size;
 } DemuxStream;
 
+typedef struct PreQueue
+{
+    AVFifo** pre_queue;
+    int pre_queue_length;//有多少个fifo
+    AVFormatContext* ic;
+}PreQueue;
+
+
+static PreQueue* pre_queue_alloc(int pre_buffer_size, AVFormatContext* ic) {
+    PreQueue* q = av_mallocz(sizeof(PreQueue));
+    if (!q) goto failed;
+    q->pre_queue_length = ic->nb_streams + 1;//最后一个queue用来存放stream_index >= ic->nb_streams的packet
+    q->ic = ic;
+    q->pre_queue = av_mallocz(sizeof(*(q->pre_queue)) * q->pre_queue_length);
+
+    if (!q->pre_queue) goto failed;
+
+    for (int i = 0; i < q->pre_queue_length; i++) {
+        q->pre_queue[i] = av_fifo_alloc2(pre_buffer_size, sizeof(AVPacket*), 0);
+        if (!q->pre_queue[i]) goto failed;
+    }
+    return q;
+failed:
+    if (q) {
+        if (q->pre_queue) {
+            for (int i = 0; i < q->pre_queue_length; i++) {
+                av_fifo_freep2(&q->pre_queue[i]);
+            }
+            av_freep(&q->pre_queue);
+        }
+        av_freep(&q);
+    }
+    return NULL;
+}
+
+static int pre_queue_can_write(PreQueue* q) {
+    for (int i = 0; i < q->pre_queue_length; i++) {
+        if (av_fifo_can_write(q->pre_queue[i]) == 0)
+            return 0;
+    }
+    return 1;
+}
+
+static int pre_queue_write(PreQueue *q,AVPacket *pkt) {
+    int ret;
+    int fifo_index = pkt->stream_index >= q->pre_queue_length - 1 ? q->pre_queue_length - 1 : pkt->stream_index;
+    AVPacket *pkt2 = av_packet_alloc();
+    if (!pkt2) return AVERROR(ENOMEM);
+    av_packet_move_ref(pkt2, pkt);
+    ret = av_fifo_write(q->pre_queue[fifo_index], &pkt2, 1);
+    if (ret < 0) av_packet_free(&pkt2);
+    return ret;
+}
+
+static int pre_queue_trim_start(PreQueue* q) {
+    uint64_t video_key_frame_pts = AV_NOPTS_VALUE;
+    uint64_t max_audio_pts = AV_NOPTS_VALUE;
+    AVStream* st;
+    AVPacket* peek_pkt;
+    int ret;
+    int trim_count = 0;
+    uint64_t cur_pts;
+    for (int i = 0; i < q->pre_queue_length - 1; i++) {
+        st = q->ic->streams[i];
+        if (st->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
+            if (av_fifo_peek(q->pre_queue[i], &peek_pkt, 1, 0) < 0) continue;
+            cur_pts = av_rescale_q(peek_pkt->pts, st->time_base, AV_TIME_BASE_Q);
+            if (cur_pts == AV_NOPTS_VALUE) continue;
+            if (max_audio_pts == AV_NOPTS_VALUE || cur_pts > max_audio_pts) {
+                max_audio_pts = cur_pts;
+            }
+        }
+    }
+
+    for (int i = 0; i < q->pre_queue_length - 1; i++) {
+        st = q->ic->streams[i];
+        if (st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+            size_t can_read = av_fifo_can_read(q->pre_queue[i]);
+            if (can_read == 0) continue;
+            for (size_t j = 0; j < can_read; j++) {
+                if (av_fifo_peek(q->pre_queue[i], &peek_pkt, 1, j) < 0) continue;
+                if (!(peek_pkt->flags & AV_PKT_FLAG_KEY)) continue;
+                cur_pts = av_rescale_q(peek_pkt->pts, st->time_base, AV_TIME_BASE_Q);
+                if (max_audio_pts == AV_NOPTS_VALUE || max_audio_pts <= cur_pts) {
+                    video_key_frame_pts = cur_pts;
+                    break;
+                }
+            }
+            break;
+        }
+    }
+
+    if (video_key_frame_pts == AV_NOPTS_VALUE) return 0;
+
+    for (int i = 0; i < q->pre_queue_length; i++) {
+        st = q->ic->streams[i];
+        while (av_fifo_peek(q->pre_queue[i], &peek_pkt, 1, 0) >= 0) {
+            cur_pts = av_rescale_q(peek_pkt->pts, st->time_base, AV_TIME_BASE_Q);
+            if (cur_pts == AV_NOPTS_VALUE) break;
+            if (cur_pts < video_key_frame_pts) {
+                ret = av_fifo_read(q->pre_queue[i], &peek_pkt, 1);
+                if (ret >= 0) {
+                    trim_count++;
+                    av_packet_free(&peek_pkt);
+                }
+            }
+            else 
+                break;
+        }
+    }
+    return trim_count;
+}
+
+
+static int pre_queue_read(PreQueue* q, AVPacket* pkt) {
+    AVPacket* pkt2;
+    int ret = -1;
+    int read_stream_index = -1;
+    if (av_fifo_can_read(q->pre_queue[q->pre_queue_length - 1])) {
+        read_stream_index = q->pre_queue_length - 1;
+    }
+    else {
+        uint64_t pts = AV_NOPTS_VALUE;
+        uint64_t cur_pts;
+        for (int i = 0; i < q->pre_queue_length - 1; i++) {
+            AVStream* st = q->ic->streams[i];
+            AVPacket* peek_pkt;
+            if (av_fifo_peek(q->pre_queue[i], &peek_pkt, 1, 0) < 0) continue;
+
+            cur_pts = av_rescale_q(peek_pkt->pts, st->time_base, AV_TIME_BASE_Q);
+
+            if (cur_pts == AV_NOPTS_VALUE) {
+                read_stream_index = i;
+                break;
+            }
+
+            if (pts == AV_NOPTS_VALUE || cur_pts < pts) {
+                pts = cur_pts;
+                read_stream_index = i;
+            }
+        }
+    }
+
+    if (read_stream_index != -1) {
+        ret = av_fifo_read(q->pre_queue[read_stream_index], &pkt2, 1);
+        if (ret >= 0) {
+            av_packet_move_ref(pkt, pkt2); av_packet_free(&pkt2);
+        }
+    }
+    return ret;
+}
+
+static void pre_queue_free(PreQueue* q) {
+    if (q) {
+        if (q->pre_queue) {
+            for (int i = 0; i < q->pre_queue_length; i++) {
+                AVPacket* tmp;
+                if (!q->pre_queue[i]) continue;
+                while (av_fifo_read(q->pre_queue[i], &tmp, 1) >= 0) {
+                    av_packet_free(&tmp);
+                }
+                av_fifo_freep2(&q->pre_queue[i]);
+            }
+            av_freep(&q->pre_queue);
+        }
+        av_freep(&q);
+    }
+}
+
 typedef struct Demuxer {
     InputFile f;
 
@@ -115,6 +284,9 @@ typedef struct Demuxer {
     int                   non_blocking;
 
     int                   read_started;
+
+    PreQueue              *pre_queue;
+    int                   sync_start_time;
 } Demuxer;
 
 typedef struct DemuxMsg {
@@ -549,6 +721,8 @@ static void *input_thread(void *arg)
     AVPacket *pkt;
     unsigned flags = d->non_blocking ? AV_THREAD_MESSAGE_NONBLOCK : 0;
     int ret = 0;
+    int last_ret = 0;
+    int is_start_sync = 0;
 
     pkt = av_packet_alloc();
     if (!pkt) {
@@ -565,7 +739,31 @@ static void *input_thread(void *arg)
     while (1) {
         DemuxMsg msg = { NULL };
 
-        ret = av_read_frame(f->ctx, pkt);
+        if(!d->pre_queue)
+            ret = av_read_frame(f->ctx, pkt);
+        else{
+            if(last_ret == 0 && pre_queue_can_write(d->pre_queue)){
+                ret = av_read_frame(f->ctx, pkt);
+                if(ret >= 0){
+                    ret = pre_queue_write(d->pre_queue, pkt);
+                    if(ret >= 0) continue;
+                }else if(ret == AVERROR_EOF || ret == AVERROR_EXIT)
+                    last_ret = ret;
+            }
+
+            if(d->sync_start_time && !is_start_sync){
+                ret = pre_queue_trim_start(d->pre_queue);
+                is_start_sync = 1;
+                av_log(d, AV_LOG_INFO, "trim %d packets\n", ret);
+            }
+
+            ret = pre_queue_read(d->pre_queue, pkt);
+
+            if(ret < 0){
+                if(last_ret != 0) ret = last_ret;
+                else ret = AVERROR(EAGAIN);
+            }else ret = 0;
+        }
 
         if (ret == AVERROR(EAGAIN)) {
             av_usleep(10000);
@@ -578,8 +776,10 @@ static void *input_thread(void *arg)
                 ret = av_thread_message_queue_send(d->in_thread_queue, &msg, 0);
                 if (ret >= 0)
                     ret = seek_to_start(d);
-                if (ret >= 0)
+                if (ret >= 0){
+                    last_ret = 0;
                     continue;
+                }
 
                 /* fallthrough to the error path */
             }
@@ -822,6 +1022,10 @@ void ifile_close(InputFile **pf)
     av_freep(&f->streams);
 
     avformat_close_input(&f->ctx);
+
+    if(d->pre_queue){
+        pre_queue_free(d->pre_queue);
+    }
 
     av_freep(pf);
 }
@@ -1367,6 +1571,7 @@ int ifile_open(const OptionsContext *o, const char *filename)
     int64_t start_time_eof = o->start_time_eof;
     int64_t stop_time      = o->stop_time;
     int64_t recording_time = o->recording_time;
+    int pre_buffer_queue_size;
 
     d = demux_alloc();
     if (!d)
@@ -1622,6 +1827,17 @@ int ifile_open(const OptionsContext *o, const char *filename)
     }
 
     d->thread_queue_size = o->thread_queue_size;
+    pre_buffer_queue_size = o->pre_buffer_queue_size < 0 ? 0 : o->pre_buffer_queue_size;
+    if(pre_buffer_queue_size > 0){
+        av_log(d, AV_LOG_INFO, "pre_buffer_queue_size is set: %d\n", pre_buffer_queue_size);
+        d->pre_queue = pre_queue_alloc(pre_buffer_queue_size, ic);
+        if (d->pre_queue == NULL)
+            return AVERROR(ENOMEM);
+    }
+
+    d->sync_start_time = o->sync_start_time;
+    if(d->sync_start_time)
+        av_log(d, AV_LOG_INFO, "sync_start_time is set: %d\n", d->sync_start_time);
 
     /* Add all the streams from the given input file to the demuxer */
     for (int i = 0; i < ic->nb_streams; i++) {

@@ -317,11 +317,7 @@ long WINAPI ff_dshow_meminputpin_Receive(DShowMemInputPin *this, IMediaSample *s
 
     hr = IMediaSample_GetTime(sample, &sampletime, &dummy);
     IReferenceClock_GetTime(clock, &graphtime);
-    if (devtype == VideoDevice && !ctx->use_video_device_timestamps) {
-        /* PTS from video devices is unreliable. */
-        chosentime = graphtime;
-        use_sample_time = 0;
-    } else {
+    if(ctx->use_device_timestamps){
         if (hr == VFW_E_SAMPLE_TIME_NOT_SET || sampletime == 0) {
             chosentime = graphtime;
             use_sample_time = 0;
@@ -330,13 +326,16 @@ long WINAPI ff_dshow_meminputpin_Receive(DShowMemInputPin *this, IMediaSample *s
         }
         else if (sampletime > 400000000000000000LL) {
             /* initial frames sometimes start < 0 (shown as a very large number here,
-               like 437650244077016960 which FFmpeg doesn't like).
-               TODO figure out math. For now just drop them. */
+            like 437650244077016960 which FFmpeg doesn't like).
+            TODO figure out math. For now just drop them. */
             av_log(s, AV_LOG_DEBUG,
                 "dropping initial (or ending) sample with odd PTS too high %"PRId64"\n", sampletime);
             return S_OK;
         } else
             chosentime = sampletime;
+    }else{
+        chosentime = graphtime;
+        use_sample_time = 0;
     }
     // media sample time is relative to graph start time
     sampletime += pin->filter->start_time;
