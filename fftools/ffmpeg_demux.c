@@ -156,6 +156,10 @@ static int pre_queue_trim_start(PreQueue* q) {
         }
     }
 
+    if(max_audio_pts != AV_NOPTS_VALUE){
+        av_log(NULL, AV_LOG_DEBUG, "max_audio_pts: %"PRId64"\n", max_audio_pts);
+    }
+
     for (int i = 0; i < q->pre_queue_length - 1; i++) {
         st = q->ic->streams[i];
         if (st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
@@ -176,6 +180,8 @@ static int pre_queue_trim_start(PreQueue* q) {
 
     if (video_key_frame_pts == AV_NOPTS_VALUE) return 0;
 
+    av_log(NULL, AV_LOG_DEBUG, "video_key_frame_pts: %"PRId64"\n", video_key_frame_pts);
+
     for (int i = 0; i < q->pre_queue_length; i++) {
         st = q->ic->streams[i];
         while (av_fifo_peek(q->pre_queue[i], &peek_pkt, 1, 0) >= 0) {
@@ -188,8 +194,10 @@ static int pre_queue_trim_start(PreQueue* q) {
                     av_packet_free(&peek_pkt);
                 }
             }
-            else 
+            else{
+                av_log(NULL, AV_LOG_DEBUG, "stream_index %d start_pts: %"PRId64"\n", i, cur_pts);
                 break;
+            }
         }
     }
     return trim_count;
@@ -778,6 +786,7 @@ static void *input_thread(void *arg)
                     ret = seek_to_start(d);
                 if (ret >= 0){
                     last_ret = 0;
+                    is_start_sync = 0;
                     continue;
                 }
 
