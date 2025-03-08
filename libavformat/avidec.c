@@ -631,6 +631,8 @@ static int avi_read_header(AVFormatContext *s)
 
                 if (handler != MKTAG('d', 'v', 's', 'd') &&
                     handler != MKTAG('d', 'v', 'h', 'd') &&
+                    handler != MKTAG('d', 'v', '2', '5') &&
+                    handler != MKTAG('d', 'v', '5', '0') &&
                     handler != MKTAG('d', 'v', 's', 'l'))
                     return AVERROR_INVALIDDATA;
 

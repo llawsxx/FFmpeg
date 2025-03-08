@@ -166,6 +166,8 @@ typedef struct OptionsContext {
     double readrate_initial_burst;
     int accurate_seek;
     int thread_queue_size;
+    int pre_buffer_queue_size;
+    int sync_start_time;
     int input_sync_ref;
     int find_stream_info;
 
