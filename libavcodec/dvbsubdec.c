@@ -992,6 +992,9 @@ static int dvbsub_parse_object_segment(AVCodecContext *avctx,
 
     int coding_method, non_modifying_color;
 
+    if(buf_size < 3)
+        return AVERROR_INVALIDDATA;
+
     object_id = AV_RB16(buf);
     buf += 2;
 
@@ -1004,6 +1007,9 @@ static int dvbsub_parse_object_segment(AVCodecContext *avctx,
     non_modifying_color = ((*buf++) >> 1) & 1;
 
     if (coding_method == 0) {
+        if(buf + 4 > buf_end)
+            return AVERROR_INVALIDDATA;
+
         top_field_len = AV_RB16(buf);
         buf += 2;
         bottom_field_len = AV_RB16(buf);
@@ -1056,6 +1062,9 @@ static int dvbsub_parse_clut_segment(AVCodecContext *avctx,
     int y, cr, cb, alpha;
     int r, g, b, r_add, g_add, b_add;
 
+    if(buf_size < 2)
+        return AVERROR_INVALIDDATA;
+
     ff_dlog(avctx, "DVB clut packet:\n");
 
     for (i=0; i < buf_size; i++) {
@@ -1089,7 +1098,7 @@ static int dvbsub_parse_clut_segment(AVCodecContext *avctx,
 
         clut->version = version;
 
-        while (buf + 4 < buf_end) {
+        while (buf + 4 <= buf_end) {
             entry_id = *buf++;
 
             depth = (*buf) & 0xe0;
@@ -1101,6 +1110,8 @@ static int dvbsub_parse_clut_segment(AVCodecContext *avctx,
             full_range = (*buf++) & 1;
 
             if (full_range) {
+                if(buf + 4 > buf_end)
+                    return AVERROR_INVALIDDATA;
                 y     = *buf++;
                 cr    = *buf++;
                 cb    = *buf++;
@@ -1301,7 +1312,7 @@ static int dvbsub_parse_page_segment(AVCodecContext *avctx,
     int timeout;
     int version;
 
-    if (buf_size < 1)
+    if (buf_size < 2)
         return AVERROR_INVALIDDATA;
 
     timeout = *buf++;
@@ -1465,7 +1476,7 @@ static int dvbsub_decode(AVCodecContext *avctx, AVSubtitle *sub,
     if (i % 16)
         ff_dlog(avctx, "\n");
 
-    if (buf_size <= 6 || *buf != 0x0f) {
+    if (buf_size < 6 || *buf != 0x0f) {
         ff_dlog(avctx, "incomplete or broken packet");
         return AVERROR_INVALIDDATA;
     }
