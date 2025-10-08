@@ -2046,7 +2046,10 @@ const OptionDef options[] = {
     { "muxing_queue_data_threshold", OPT_TYPE_INT, OPT_PERSTREAM | OPT_EXPERT | OPT_OUTPUT,
         { .off = OFFSET(muxing_queue_data_threshold) },
         "set the threshold after which max_muxing_queue_size is taken into account", "bytes" },
-
+    { "pre_buffer_queue_size", OPT_TYPE_INT , OPT_OFFSET | OPT_EXPERT | OPT_INPUT, { .off = OFFSET(pre_buffer_queue_size) },
+        "cache a certain amount of packets so that the subtitle packets can be read before the audio and video packets to solve the subtitle delay problem of the overlay filter", "packets" },
+    { "sync_start_time", OPT_TYPE_BOOL, OPT_OFFSET | OPT_EXPERT | OPT_INPUT, { .off = OFFSET(sync_start_time) },
+        "sync packets start time to video key frame time, should use with -pre_buffer_queue_size", "packets" },
     /* data codec support */
     { "dcodec", OPT_TYPE_FUNC, OPT_FUNC_ARG | OPT_DATA | OPT_PERFILE | OPT_EXPERT | OPT_INPUT | OPT_OUTPUT | OPT_HAS_CANON,
         { .func_arg = opt_data_codec },

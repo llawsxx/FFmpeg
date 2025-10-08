@@ -168,6 +168,8 @@ typedef struct OptionsContext {
     double readrate_initial_burst;
     int accurate_seek;
     int thread_queue_size;
+    int pre_buffer_queue_size;
+    int sync_start_time;
     int input_sync_ref;
     int find_stream_info;
 
@@ -399,7 +401,7 @@ typedef struct FilterGraph {
     int          nb_inputs;
     OutputFilter **outputs;
     int         nb_outputs;
-
+    
     const char      *graph_desc;
     struct AVBPrint graph_print_buf;
 } FilterGraph;
