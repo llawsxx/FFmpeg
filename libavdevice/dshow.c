@@ -391,10 +391,7 @@ dshow_get_device_media_types(AVFormatContext *avctx, enum dshowDeviceType devtyp
         return;
 
     while (IEnumPins_Next(pins, 1, &pin, NULL) == S_OK) {
-        IKsPropertySet *p = NULL;
         PIN_INFO info = { 0 };
-        GUID category;
-        DWORD r2;
         IEnumMediaTypes *types = NULL;
         AM_MEDIA_TYPE *type;
 
@@ -403,13 +400,6 @@ dshow_get_device_media_types(AVFormatContext *avctx, enum dshowDeviceType devtyp
         IBaseFilter_Release(info.pFilter);
 
         if (info.dir != PINDIR_OUTPUT)
-            goto next;
-        if (IPin_QueryInterface(pin, &IID_IKsPropertySet, (void **) &p) != S_OK)
-            goto next;
-        if (IKsPropertySet_Get(p, &AMPROPSETID_Pin, AMPROPERTY_PIN_CATEGORY,
-                               NULL, 0, &category, sizeof(GUID), &r2) != S_OK)
-            goto next;
-        if (!IsEqualGUID(&category, &PIN_CATEGORY_CAPTURE))
             goto next;
 
         if (IPin_EnumMediaTypes(pin, &types) != S_OK)
@@ -430,8 +420,6 @@ dshow_get_device_media_types(AVFormatContext *avctx, enum dshowDeviceType devtyp
     next:
         if (types)
             IEnumMediaTypes_Release(types);
-        if (p)
-            IKsPropertySet_Release(p);
 
         IPin_Release(pin);
     }
@@ -1201,10 +1189,7 @@ dshow_cycle_pins(AVFormatContext *avctx, enum dshowDeviceType devtype,
     }
 
     while (!device_pin && IEnumPins_Next(pins, 1, &pin, NULL) == S_OK) {
-        IKsPropertySet *p = NULL;
         PIN_INFO info = {0};
-        GUID category;
-        DWORD r2;
         char *name_buf = NULL;
         wchar_t *pin_id = NULL;
         char *pin_buf = NULL;
@@ -1214,13 +1199,6 @@ dshow_cycle_pins(AVFormatContext *avctx, enum dshowDeviceType devtype,
         IBaseFilter_Release(info.pFilter);
 
         if (info.dir != PINDIR_OUTPUT)
-            goto next;
-        if (IPin_QueryInterface(pin, &IID_IKsPropertySet, (void **) &p) != S_OK)
-            goto next;
-        if (IKsPropertySet_Get(p, &AMPROPSETID_Pin, AMPROPERTY_PIN_CATEGORY,
-                               NULL, 0, &category, sizeof(GUID), &r2) != S_OK)
-            goto next;
-        if (!IsEqualGUID(&category, &PIN_CATEGORY_CAPTURE))
             goto next;
         name_buf = dup_wchar_to_utf8(info.achName);
 
@@ -1263,8 +1241,6 @@ dshow_cycle_pins(AVFormatContext *avctx, enum dshowDeviceType devtype,
             av_log(avctx, AV_LOG_DEBUG, "Selecting pin %s on %s\n", name_buf, devtypename);
         }
 next:
-        if (p)
-            IKsPropertySet_Release(p);
         if (device_pin != pin)
             IPin_Release(pin);
         av_free(name_buf);
