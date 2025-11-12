@@ -2349,7 +2349,6 @@ HEADERS_LIST="
     linux_dma_buf_h
     linux_perf_event_h
     malloc_h
-    opencv2_core_core_c_h
     poll_h
     pthread_np_h
     sys_hwprobe_h
@@ -3585,7 +3584,7 @@ av1_frame_merge_bsf_select="cbs_av1"
 av1_frame_split_bsf_select="cbs_av1"
 av1_metadata_bsf_select="cbs_av1"
 dovi_rpu_bsf_select="cbs_h265 cbs_av1 dovi_rpudec dovi_rpuenc"
-dts2pts_bsf_select="cbs_h264 h264parse"
+dts2pts_bsf_select="cbs_h264 h264parse cbs_h265 hevc_parser"
 eac3_core_bsf_select="ac3_parser"
 eia608_to_smpte436m_bsf_select="smpte_436m"
 evc_frame_merge_bsf_select="evcparse"
@@ -6066,16 +6065,17 @@ case $target_os in
         ;;
     win32|win64)
         disable symver
+        LIBSUF=".lib"
         if enabled shared; then
             # Cannot build both shared and static libs with MSVC or icl.
             disable static
+            LIBSUF="-static.lib"
         fi
         ! enabled small && test_cmd $windres --version && enable gnu_windres
         enabled x86_32 && check_ldflags -LARGEADDRESSAWARE
         add_cppflags -DWIN32_LEAN_AND_MEAN
         shlibdir_default="$bindir_default"
         LIBPREF=""
-        LIBSUF=".lib"
         SLIBPREF=""
         SLIBSUF=".dll"
         SLIBNAME_WITH_VERSION='$(SLIBPREF)$(FULLNAME)-$(LIBVERSION)$(SLIBSUF)'
@@ -7202,10 +7202,8 @@ enabled libnpp            && { test_cpp_condition "$(cd "$source_path"; pwd)/lib
                                die "ERROR: libnpp support is deprecated, version 13.0 and up are not supported"; }
 enabled libopencore_amrnb && require libopencore_amrnb opencore-amrnb/interf_dec.h Decoder_Interface_init -lopencore-amrnb
 enabled libopencore_amrwb && require libopencore_amrwb opencore-amrwb/dec_if.h D_IF_init -lopencore-amrwb
-enabled libopencv         && { check_headers opencv2/core/core_c.h &&
-                               { check_pkg_config libopencv opencv opencv2/core/core_c.h cvCreateImageHeader ||
-                                 require libopencv opencv2/core/core_c.h cvCreateImageHeader -lopencv_core -lopencv_imgproc; } ||
-                               require_pkg_config libopencv opencv opencv/cxcore.h cvCreateImageHeader; }
+enabled libopencv         && { check_pkg_config libopencv opencv4 opencv2/core/core_c.h cvCreateImageHeader ||
+                               require libopencv opencv2/core/core_c.h cvCreateImageHeader -lopencv_core -lopencv_imgproc; }
 enabled libopenh264       && require_pkg_config libopenh264 "openh264 >= 1.3.0" wels/codec_api.h WelsGetCodecVersion
 enabled libopenjpeg       && { check_pkg_config libopenjpeg "libopenjp2 >= 2.1.0" openjpeg.h opj_version ||
                                { require_pkg_config libopenjpeg "libopenjp2 >= 2.1.0" openjpeg.h opj_version -DOPJ_STATIC && add_cppflags -DOPJ_STATIC; } }
