@@ -10,6 +10,7 @@ FATE_CHECKASM = fate-checkasm-aacencdsp                                 \
                 fate-checkasm-blockdsp                                  \
                 fate-checkasm-bswapdsp                                  \
                 fate-checkasm-cavsdsp                                   \
+                fate-checkasm-crc                                       \
                 fate-checkasm-dcadsp                                    \
                 fate-checkasm-diracdsp                                  \
                 fate-checkasm-exrdsp                                    \
@@ -36,9 +37,10 @@ FATE_CHECKASM = fate-checkasm-aacencdsp                                 \
                 fate-checkasm-llauddsp                                  \
                 fate-checkasm-lls                                       \
                 fate-checkasm-llviddsp                                  \
-                fate-checkasm-llviddspenc                               \
+                fate-checkasm-llvidencdsp                               \
                 fate-checkasm-lpc                                       \
                 fate-checkasm-motion                                    \
+                fate-checkasm-mpegvideo_unquantize                      \
                 fate-checkasm-mpegvideoencdsp                           \
                 fate-checkasm-opusdsp                                   \
                 fate-checkasm-pixblockdsp                               \
@@ -54,6 +56,7 @@ FATE_CHECKASM = fate-checkasm-aacencdsp                                 \
                 fate-checkasm-sw_range_convert                          \
                 fate-checkasm-sw_rgb                                    \
                 fate-checkasm-sw_scale                                  \
+                fate-checkasm-sw_xyz2rgb                                \
                 fate-checkasm-sw_yuv2rgb                                \
                 fate-checkasm-sw_yuv2yuv                                \
                 fate-checkasm-takdsp                                    \
@@ -67,18 +70,22 @@ FATE_CHECKASM = fate-checkasm-aacencdsp                                 \
                 fate-checkasm-vf_colordetect                            \
                 fate-checkasm-vf_colorspace                             \
                 fate-checkasm-vf_eq                                     \
+                fate-checkasm-vf_fspp                                   \
                 fate-checkasm-vf_gblur                                  \
                 fate-checkasm-vf_hflip                                  \
+                fate-checkasm-vf_idet                                   \
                 fate-checkasm-vf_nlmeans                                \
                 fate-checkasm-vf_threshold                              \
                 fate-checkasm-vf_sobel                                  \
                 fate-checkasm-videodsp                                  \
                 fate-checkasm-vorbisdsp                                 \
                 fate-checkasm-vp3dsp                                    \
+                fate-checkasm-vp6dsp                                    \
                 fate-checkasm-vp8dsp                                    \
                 fate-checkasm-vp9dsp                                    \
                 fate-checkasm-vvc_alf                                   \
                 fate-checkasm-vvc_mc                                    \
+                fate-checkasm-vvc_sao                                   \
 
 $(FATE_CHECKASM): tests/checkasm/checkasm$(EXESUF)
 $(FATE_CHECKASM): CMD = run tests/checkasm/checkasm$(EXESUF) --test=$(@:fate-checkasm-%=%)

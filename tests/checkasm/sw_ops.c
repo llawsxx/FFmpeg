@@ -438,7 +438,7 @@ static AVRational rndq(SwsPixelType t)
 {
     const unsigned num = rnd();
     if (ff_sws_pixel_type_is_int(t)) {
-        const unsigned mask = (1 << (ff_sws_pixel_type_size(t) * 8)) - 1;
+        const unsigned mask = UINT_MAX >> (32 - ff_sws_pixel_type_size(t) * 8);
         return (AVRational) { num & mask, 1 };
     } else {
         const unsigned den = rnd();
@@ -588,7 +588,7 @@ static void check_convert(void)
                     .convert.to = o,
                 });
             } else if (isize > osize || !ff_sws_pixel_type_is_int(i)) {
-                uint32_t range = (1 << osize * 8) - 1;
+                uint32_t range = UINT32_MAX >> (32 - osize * 8);
                 CHECK_COMMON_RANGE(name, range, i, o, {
                     .op = SWS_OP_CONVERT,
                     .type = i,
@@ -624,6 +624,7 @@ static void check_dither(void)
         /* Test all sizes up to 256x256 */
         for (int size_log2 = 0; size_log2 <= 8; size_log2++) {
             const int size = 1 << size_log2;
+            const int mask = size - 1;
             AVRational *matrix = av_refstruct_allocz(size * size * sizeof(*matrix));
             if (!matrix) {
                 fail();
@@ -641,7 +642,8 @@ static void check_dither(void)
                 .op = SWS_OP_DITHER,
                 .type = t,
                 .dither.size_log2 = size_log2,
-                .dither.matrix = matrix,
+                .dither.matrix    = matrix,
+                .dither.y_offset  = {0, 3 & mask, 2 & mask, 5 & mask},
             });
 
             av_refstruct_unref(&matrix);

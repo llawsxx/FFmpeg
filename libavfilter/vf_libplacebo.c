@@ -451,16 +451,18 @@ static int update_settings(AVFilterContext *ctx)
         .temperature = (s->temperature - 6500.0) / 3500.0,
     };
 
-    opts->peak_detect_params = *pl_peak_detect_params(
+    opts->peak_detect_params = (struct pl_peak_detect_params) {
+        PL_PEAK_DETECT_DEFAULTS
         .smoothing_period = s->smoothing,
         .scene_threshold_low = s->scene_low,
         .scene_threshold_high = s->scene_high,
 #if PL_API_VER >= 263
         .percentile = s->percentile,
 #endif
-    );
+    };
 
-    opts->color_map_params = *pl_color_map_params(
+    opts->color_map_params = (struct pl_color_map_params) {
+        PL_COLOR_MAP_DEFAULTS
         .tone_mapping_function = get_tonemapping_func(s->tonemapping),
         .tone_mapping_param = s->tonemapping_param,
         .inverse_tone_mapping = s->inverse_tonemapping,
@@ -469,7 +471,7 @@ static int update_settings(AVFilterContext *ctx)
         .contrast_recovery = s->contrast_recovery,
         .contrast_smoothness = s->contrast_smoothness,
 #endif
-    );
+    };
 
     set_gamut_mode(&opts->color_map_params, gamut_mode);
 
@@ -484,7 +486,8 @@ static int update_settings(AVFilterContext *ctx)
         .strength = s->cone_str,
     );
 
-    opts->params = *pl_render_params(
+    opts->params = (struct pl_render_params) {
+        PL_RENDER_DEFAULTS
         .antiringing_strength = s->antiringing,
         .background_transparency = 1.0f - (float) s->fillcolor[3] / UINT8_MAX,
         .background_color = {
@@ -513,7 +516,7 @@ static int update_settings(AVFilterContext *ctx)
         .disable_builtin_scalers = s->disable_builtin,
         .force_dither = s->force_dither,
         .disable_fbos = s->disable_fbos,
-    );
+    };
 
     RET(find_scaler(ctx, &opts->params.upscaler, s->upscaler, 0));
     RET(find_scaler(ctx, &opts->params.downscaler, s->downscaler, 0));
@@ -861,6 +864,11 @@ static const AVFrame *ref_frame(const struct pl_frame_mix *mix)
     return NULL;
 }
 
+static inline double q2d_fallback(AVRational q, const double def)
+{
+    return (q.num && q.den) ? av_q2d(q) : def;
+}
+
 static void update_crops(AVFilterContext *ctx, LibplaceboInput *in,
                          struct pl_frame *target, double target_pts)
 {
@@ -882,8 +890,7 @@ static void update_crops(AVFilterContext *ctx, LibplaceboInput *in,
         s->var_values[VAR_IN_W]   = s->var_values[VAR_IW] = inlink->w;
         s->var_values[VAR_IN_H]   = s->var_values[VAR_IH] = inlink->h;
         s->var_values[VAR_A]      = (double) inlink->w / inlink->h;
-        s->var_values[VAR_SAR]    = inlink->sample_aspect_ratio.num ?
-            av_q2d(inlink->sample_aspect_ratio) : 1.0;
+        s->var_values[VAR_SAR]    = q2d_fallback(inlink->sample_aspect_ratio, 1.0);
         s->var_values[VAR_IN_T]   = s->var_values[VAR_T]  = image_pts;
         s->var_values[VAR_OUT_T]  = s->var_values[VAR_OT] = target_pts;
         s->var_values[VAR_N]      = outl->frame_count_out;
@@ -913,8 +920,9 @@ static void update_crops(AVFilterContext *ctx, LibplaceboInput *in,
         image->crop.x1 = image->crop.x0 + s->var_values[VAR_CROP_W];
         image->crop.y1 = image->crop.y0 + s->var_values[VAR_CROP_H];
 
-        const pl_rotation rot_total = image->rotation - target->rotation;
-        if ((rot_total + PL_ROTATION_360) % PL_ROTATION_180 == PL_ROTATION_90) {
+        const pl_rect2df crop_orig = image->crop;
+        pl_rotation rot_total = PL_ROTATION_360 + image->rotation - target->rotation;
+        if (rot_total % PL_ROTATION_180 == PL_ROTATION_90) {
             /* Libplacebo expects the input crop relative to the actual frame
              * dimensions, so un-transpose them here */
             FFSWAP(float, image->crop.x0, image->crop.y0);
@@ -929,11 +937,13 @@ static void update_crops(AVFilterContext *ctx, LibplaceboInput *in,
             target->crop.y1 = target->crop.y0 + s->var_values[VAR_POS_H];
 
             /* Effective visual crop */
-            const float w_adj = av_q2d(inlink->sample_aspect_ratio) /
-                                av_q2d(outlink->sample_aspect_ratio);
+            double sar_in = q2d_fallback(inlink->sample_aspect_ratio, 1.0);
+            double sar_out = q2d_fallback(outlink->sample_aspect_ratio, 1.0);
+            if (rot_total % PL_ROTATION_180 == PL_ROTATION_90)
+                sar_in = 1.0 / sar_in;
 
-            pl_rect2df fixed = image->crop;
-            pl_rect2df_stretch(&fixed, w_adj, 1.0);
+            pl_rect2df fixed = crop_orig;
+            pl_rect2df_stretch(&fixed, sar_in / sar_out, 1.0);
 
             switch (s->fit_mode) {
             case FIT_FILL:
@@ -1278,7 +1288,7 @@ static int libplacebo_activate(AVFilterContext *ctx)
             in->qstatus = pl_queue_update(in->queue, &in->mix, pl_queue_params(
                 .pts            = TS2T(out_pts, outlink->time_base),
                 .radius         = pl_frame_mix_radius(&s->opts->params),
-                .vsync_duration = l->frame_rate.num ? av_q2d(av_inv_q(l->frame_rate)) : 0,
+                .vsync_duration = q2d_fallback(av_inv_q(l->frame_rate), 0.0),
             ));
 
             switch (in->qstatus) {
@@ -1461,8 +1471,7 @@ static int libplacebo_config_output(AVFilterLink *outlink)
                                  &outlink->w, &outlink->h));
 
     s->reset_sar |= s->normalize_sar || s->nb_inputs > 1;
-    double sar_in = inlink->sample_aspect_ratio.num ?
-                    av_q2d(inlink->sample_aspect_ratio) : 1.0;
+    double sar_in = q2d_fallback(inlink->sample_aspect_ratio, 1.0);
 
     int force_oar = s->force_original_aspect_ratio;
     if (!force_oar && s->fit_sense == FIT_CONSTRAINT) {
@@ -1549,8 +1558,7 @@ static int libplacebo_config_output(AVFilterLink *outlink)
     /* Static variables */
     s->var_values[VAR_OUT_W]    = s->var_values[VAR_OW] = outlink->w;
     s->var_values[VAR_OUT_H]    = s->var_values[VAR_OH] = outlink->h;
-    s->var_values[VAR_DAR]      = outlink->sample_aspect_ratio.num ?
-        av_q2d(outlink->sample_aspect_ratio) : 1.0;
+    s->var_values[VAR_DAR]      = q2d_fallback(outlink->sample_aspect_ratio, 1.0);
     s->var_values[VAR_HSUB]     = 1 << desc->log2_chroma_w;
     s->var_values[VAR_VSUB]     = 1 << desc->log2_chroma_h;
     s->var_values[VAR_OHSUB]    = 1 << out_desc->log2_chroma_w;

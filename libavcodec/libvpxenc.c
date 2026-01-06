@@ -242,7 +242,7 @@ static av_cold void dump_enc_cfg(AVCodecContext *avctx,
            width, "g_lag_in_frames:",   cfg->g_lag_in_frames);
     av_log(avctx, level, "rate control settings\n"
            "  %*s%u\n  %*s%u\n  %*s%u\n  %*s%u\n"
-           "  %*s%d\n  %*s%p(%"SIZE_SPECIFIER")\n  %*s%u\n",
+           "  %*s%d\n  %*s%p(%zu)\n  %*s%u\n",
            width, "rc_dropframe_thresh:",   cfg->rc_dropframe_thresh,
            width, "rc_resize_allowed:",     cfg->rc_resize_allowed,
            width, "rc_resize_up_thresh:",   cfg->rc_resize_up_thresh,
@@ -352,6 +352,13 @@ static av_cold void fifo_free(AVFifo **fifo)
     av_fifo_freep2(fifo);
 }
 
+static int encoder_can_drop_frames(AVCodecContext *avctx)
+{
+    VPxContext *ctx = avctx->priv_data;
+
+    return (ctx->drop_threshold > 0) || (ctx->screen_content_mode == 2);
+}
+
 static int frame_data_submit(AVCodecContext *avctx, AVFifo *fifo,
                              const AVFrame *frame)
 {
@@ -383,6 +390,18 @@ static int frame_data_submit(AVCodecContext *avctx, AVFifo *fifo,
     }
 
     ret = av_fifo_write(fifo, &fd, 1);
+    if (ret == AVERROR(ENOSPC)) {
+        FrameData fd2;
+
+        av_log(avctx, AV_LOG_WARNING, "FIFO full, will drop a front element\n");
+
+        ret = av_fifo_read(fifo, &fd2, 1);
+        if (ret >= 0) {
+            frame_data_uninit(&fd2);
+            ret = av_fifo_write(fifo, &fd, 1);
+        }
+    }
+
     if (ret < 0)
         goto fail;
 
@@ -398,13 +417,25 @@ static int frame_data_apply(AVCodecContext *avctx, AVFifo *fifo, AVPacket *pkt)
     uint8_t *data;
     int ret = 0;
 
-    if (av_fifo_peek(fifo, &fd, 1, 0) < 0)
-        return 0;
-    if (fd.pts != pkt->pts) {
-        av_log(avctx, AV_LOG_WARNING,
-               "Mismatching timestamps: libvpx %"PRId64" queued %"PRId64"; "
-               "this is a bug, please report it\n", pkt->pts, fd.pts);
-        goto skip;
+    while (1) {
+        if (av_fifo_peek(fifo, &fd, 1, 0) < 0)
+            return 0;
+
+        if (fd.pts == pkt->pts) {
+            break;
+        }
+
+        if (!encoder_can_drop_frames(avctx)) {
+            av_log(avctx, AV_LOG_WARNING,
+                   "Mismatching timestamps: libvpx %"PRId64" queued %"PRId64"; "
+                   "this is a bug, please report it\n", pkt->pts, fd.pts);
+            goto skip;
+        }
+
+        av_log(avctx, AV_LOG_DEBUG, "Dropped frame with pts %"PRId64"\n",
+               fd.pts);
+        av_fifo_drain2(fifo, 1);
+        frame_data_uninit(&fd);
     }
 
     pkt->duration = fd.duration;
@@ -1117,7 +1148,7 @@ static av_cold int vpx_init(AVCodecContext *avctx,
         ret = av_reallocp(&ctx->twopass_stats.buf, ctx->twopass_stats.sz);
         if (ret < 0) {
             av_log(avctx, AV_LOG_ERROR,
-                   "Stat buffer alloc (%"SIZE_SPECIFIER" bytes) failed\n",
+                   "Stat buffer alloc (%zu bytes) failed\n",
                    ctx->twopass_stats.sz);
             ctx->twopass_stats.sz = 0;
             return ret;
@@ -1423,7 +1454,7 @@ static int queue_frames(AVCodecContext *avctx, struct vpx_codec_ctx *encoder,
 
                 if (!cx_frame->buf) {
                     av_log(avctx, AV_LOG_ERROR,
-                           "Data buffer alloc (%"SIZE_SPECIFIER" bytes) failed\n",
+                           "Data buffer alloc (%zu bytes) failed\n",
                            cx_frame->sz);
                     av_freep(&cx_frame);
                     return AVERROR(ENOMEM);

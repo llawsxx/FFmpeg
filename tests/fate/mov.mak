@@ -34,6 +34,7 @@ FATE_MOV_FFPROBE-$(call FRAMEMD5, MOV, H264, H264_PARSER) += fate-mov-neg-firstp
                    fate-mov-guess-delay-2 \
                    fate-mov-guess-delay-3 \
                    fate-mov-mp4-with-mov-in24-ver \
+                   fate-mov-mime-codecstring \
 
 FATE_MOV_FFPROBE-$(call FRAMEMD5, MOV, MPEG4, H264_PARSER) += fate-mov-mp4-extended-atom \
 
@@ -146,6 +147,8 @@ fate-mov-mp4-with-mov-in24-ver: CMD = run ffprobe$(PROGSSUF)$(EXESUF) -show_entr
 
 fate-mov-mp4-extended-atom: CMD = run ffprobe$(PROGSSUF)$(EXESUF) -show_packets -print_format compact -select_streams v $(TARGET_SAMPLES)/mov/extended_atom_size_probe
 
+fate-mov-mime-codecstring: CMD = run ffprobe$(PROGSSUF)$(EXESUF) -show_entries stream=mime_codec_string -v 0 $(TARGET_SAMPLES)/mov/mov_stream_shorter_than_movie.mov
+
 FATE_MOV_FFMPEG_FFPROBE_SAMPLES-$(call REMUX, MP4 MOV, OGG_DEMUXER VORBIS_DECODER) \
                           += fate-mov-mp4-chapters
 fate-mov-mp4-chapters: CMD = transcode ogg $(TARGET_SAMPLES)/vorbis/vorbis_chapter_extension_demo.ogg mp4 "-c copy" "-c copy -t 0.1" "-show_chapters"
@@ -251,8 +254,8 @@ fate-mov-channel-description: CMD = transcode wav $(TARGET_PATH)/tests/data/asyn
 # Test PCM in mp4 and channel layout
 FATE_MOV_FFMPEG-$(call TRANSCODE, PCM_S16LE, MP4 MOV, WAV_DEMUXER PAN_FILTER) \
                           += fate-mov-mp4-pcm
-fate-mov-mp4-pcm: tests/data/asynth-44100-1.wav tests/data/filtergraphs/mov-mp4-pcm
-fate-mov-mp4-pcm: CMD = transcode wav $(TARGET_PATH)/tests/data/asynth-44100-1.wav mp4 "-/filter_complex $(TARGET_PATH)/tests/data/filtergraphs/mov-mp4-pcm -map [mono] -map [stereo] -map [2.1] -map [5.1] -map [7.1] -c:a pcm_s16le" "-map 0 -c copy -frames:a 0"
+fate-mov-mp4-pcm: tests/data/asynth-96000-1.wav tests/data/filtergraphs/mov-mp4-pcm
+fate-mov-mp4-pcm: CMD = transcode wav $(TARGET_PATH)/tests/data/asynth-96000-1.wav mp4 "-/filter_complex $(TARGET_PATH)/tests/data/filtergraphs/mov-mp4-pcm -map [mono] -map [stereo] -map [2.1] -map [5.1] -map [7.1] -c:a pcm_s16le" "-map 0 -c copy -frames:a 0"
 
 # Test floating sample format PCM in mp4 and unusual channel layout
 FATE_MOV_FFMPEG-$(call TRANSCODE, PCM_F32LE, MP4 MOV, WAV_DEMUXER PAN_FILTER) \

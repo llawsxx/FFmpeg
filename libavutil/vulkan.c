@@ -212,6 +212,10 @@ int ff_vk_load_props(FFVulkanContext *s)
     vk->GetPhysicalDeviceMemoryProperties(s->hwctx->phys_dev, &s->mprops);
     vk->GetPhysicalDeviceFeatures2(s->hwctx->phys_dev, &s->feats);
 
+    for (int i = 0; i < s->mprops.memoryTypeCount; i++)
+        s->host_cached_flag |= s->mprops.memoryTypes[i].propertyFlags &
+                               VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+
     load_enabled_qfs(s);
 
     if (s->qf_props)
@@ -241,7 +245,7 @@ int ff_vk_load_props(FFVulkanContext *s)
             .sType = VK_STRUCTURE_TYPE_QUEUE_FAMILY_PROPERTIES_2,
         };
 
-        FF_VK_STRUCT_EXT(s, &s->qf_props[i], &s->query_props[i], FF_VK_EXT_NO_FLAG,
+        FF_VK_STRUCT_EXT(s, &s->qf_props[i], &s->query_props[i], FF_VK_EXT_VIDEO_QUEUE,
                          VK_STRUCTURE_TYPE_QUEUE_FAMILY_QUERY_RESULT_STATUS_PROPERTIES_KHR);
         FF_VK_STRUCT_EXT(s, &s->qf_props[i], &s->video_props[i], FF_VK_EXT_VIDEO_QUEUE,
                          VK_STRUCTURE_TYPE_QUEUE_FAMILY_VIDEO_PROPERTIES_KHR);
@@ -1066,7 +1070,7 @@ int ff_vk_create_buf(FFVulkanContext *s, FFVkBuffer *buf, size_t size,
         .pNext = &ded_req,
     };
 
-    av_log(s, AV_LOG_DEBUG, "Creating a buffer of %"SIZE_SPECIFIER" bytes, "
+    av_log(s, AV_LOG_DEBUG, "Creating a buffer of %zu bytes, "
                             "usage: 0x%x, flags: 0x%x\n",
            size, usage, flags);
 
@@ -1162,6 +1166,37 @@ int ff_vk_map_buffers(FFVulkanContext *s, FFVkBuffer **buf, uint8_t *mem[],
                    ff_vk_ret2str(ret));
             return AVERROR_EXTERNAL;
         }
+    }
+
+    return 0;
+}
+
+int ff_vk_flush_buffer(FFVulkanContext *s, FFVkBuffer *buf,
+                       VkDeviceSize offset, VkDeviceSize mem_size,
+                       int flush)
+{
+    VkResult ret;
+    FFVulkanFunctions *vk = &s->vkfn;
+
+    if (buf->host_ref || buf->flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
+        return 0;
+
+    const VkMappedMemoryRange flush_data = {
+        .sType  = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
+        .memory = buf->mem,
+        .offset = offset,
+        .size   = mem_size,
+    };
+
+    if (flush)
+        ret = vk->FlushMappedMemoryRanges(s->hwctx->act_dev, 1, &flush_data);
+    else
+        ret = vk->InvalidateMappedMemoryRanges(s->hwctx->act_dev, 1, &flush_data);
+
+    if (ret != VK_SUCCESS) {
+        av_log(s, AV_LOG_ERROR, "Failed to flush memory: %s\n",
+               ff_vk_ret2str(ret));
+        return AVERROR_EXTERNAL;
     }
 
     return 0;
@@ -1274,8 +1309,6 @@ int ff_vk_get_pooled_buffer(FFVulkanContext *ctx, AVBufferPool **buf_pool,
         return AVERROR(ENOMEM);
 
     data = (FFVkBuffer *)ref->data;
-    data->stage = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
-    data->access = VK_ACCESS_2_NONE;
 
     if (data->size >= size)
         return 0;
@@ -1567,6 +1600,12 @@ void ff_vk_set_perm(enum AVPixelFormat pix_fmt, int lut[4], int inv)
         lut[0] = 1;
         lut[1] = 2;
         lut[2] = 0;
+        lut[3] = 3;
+        break;
+    case AV_PIX_FMT_X2BGR10:
+        lut[0] = 0;
+        lut[1] = 2;
+        lut[2] = 1;
         lut[3] = 3;
         break;
     default:
@@ -2012,11 +2051,11 @@ fail:
 
 void ff_vk_frame_barrier(FFVulkanContext *s, FFVkExecContext *e,
                          AVFrame *pic, VkImageMemoryBarrier2 *bar, int *nb_bar,
-                         VkPipelineStageFlags src_stage,
-                         VkPipelineStageFlags dst_stage,
-                         VkAccessFlagBits     new_access,
-                         VkImageLayout        new_layout,
-                         uint32_t             new_qf)
+                         VkPipelineStageFlags2 src_stage,
+                         VkPipelineStageFlags2 dst_stage,
+                         VkAccessFlagBits2     new_access,
+                         VkImageLayout         new_layout,
+                         uint32_t              new_qf)
 {
     int found = -1;
     AVVkFrame *vkf = (AVVkFrame *)pic->data[0];
@@ -2548,9 +2587,10 @@ print:
                 GLSLA("%s", desc[i].buf_content);
             }
             GLSLA("\n}");
-        } else if (desc[i].elems > 0) {
-            GLSLA("[%i]", desc[i].elems);
         }
+
+        if (desc[i].elems > 0)
+            GLSLA("[%i]", desc[i].elems);
 
         GLSLA(";");
         GLSLA("\n");

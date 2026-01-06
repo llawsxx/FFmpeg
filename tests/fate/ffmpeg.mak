@@ -40,8 +40,13 @@ fate-force_key_frames-source-dup: CMD = framecrc -i $(TARGET_SAMPLES)/h264/intra
   -c:v mpeg2video -g 400 -sc_threshold 99999 \
   -force_key_frames source -r 39 -force_fps -strict experimental
 
-FATE_SAMPLES_FFMPEG-$(call ENCDEC, MPEG2VIDEO H264, FRAMECRC H264, H264_PARSER CROP_FILTER DRAWBOX_FILTER PIPE_PROTOCOL) += \
-    fate-force_key_frames-source fate-force_key_frames-source-drop fate-force_key_frames-source-dup
+fate-force_key_frames-scd_metadata: CMD = framecrc -i $(TARGET_SAMPLES)/h264/intra_refresh.h264 \
+  -vf scdet=threshold=10,crop=2:2,drawbox=color=black:t=fill \
+  -c:v mpeg2video -g 400 \
+  -force_key_frames scd_metadata
+
+FATE_SAMPLES_FFMPEG-$(call ENCDEC, MPEG2VIDEO H264, FRAMECRC H264, H264_PARSER CROP_FILTER DRAWBOX_FILTER SCDET_FILTER PIPE_PROTOCOL) += \
+    fate-force_key_frames-source fate-force_key_frames-source-drop fate-force_key_frames-source-dup fate-force_key_frames-scd_metadata
 
 # Tests that the video is properly autorotated using the contained
 # display matrix and that the generated file does not contain
@@ -128,6 +133,11 @@ fate-ffmpeg-fix_sub_duration_heartbeat: CMD = fmtstdout srt -fix_sub_duration \
   -c:v mpeg2video -b:v 2M -g 30 -sc_threshold 1000000000 \
   -c:s srt \
   -f null -
+# FIXME: disabling comparison against reference as after ffmpeg multithreading
+#        went in, this test started depending on how far the input side
+#        progressed compared to how quickly the output encoded packets,
+#        causing spurious failures on the CI.
+fate-ffmpeg-fix_sub_duration_heartbeat: CMP = null
 
 # FIXME: the integer AAC decoder does not produce the same output on all platforms
 # so until that is fixed we use the volume filter to silence the data
