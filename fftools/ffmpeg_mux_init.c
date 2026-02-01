@@ -730,6 +730,11 @@ static int new_stream_video(Muxer *mux, const OptionsContext *o,
                                                      AV_OPT_SEARCH_CHILDREN) > 0)
                     av_opt_set(video_enc, "stats", logfilename,
                                AV_OPT_SEARCH_CHILDREN);
+            } else if (!strcmp(video_enc->codec->name, "libx265")) {
+                if (av_opt_is_set_to_default_by_name(video_enc, "x265-stats",
+                                                     AV_OPT_SEARCH_CHILDREN) > 0)
+                    av_opt_set(video_enc, "x265-stats", logfilename,
+                               AV_OPT_SEARCH_CHILDREN);
             } else {
                 if (video_enc->flags & AV_CODEC_FLAG_PASS2) {
                     char  *logbuffer = read_file_to_string(logfilename);
@@ -944,7 +949,7 @@ ost_bind_filter(const Muxer *mux, MuxStream *ms, OutputFilter *ofilter,
         if (!keep_pix_fmt) {
             ret = avcodec_get_supported_config(enc_ctx, NULL,
                                                AV_CODEC_CONFIG_PIX_FORMAT, 0,
-                                               (const void **) &opts.formats, NULL);
+                                               (const void **) &opts.pix_fmts, NULL);
             if (ret < 0)
                 return ret;
         }
@@ -973,7 +978,7 @@ ost_bind_filter(const Muxer *mux, MuxStream *ms, OutputFilter *ofilter,
     } else {
         ret = avcodec_get_supported_config(enc_ctx, NULL,
                                            AV_CODEC_CONFIG_SAMPLE_FORMAT, 0,
-                                           (const void **) &opts.formats, NULL);
+                                           (const void **) &opts.sample_fmts, NULL);
         if (ret < 0)
             return ret;
         ret = avcodec_get_supported_config(enc_ctx, NULL,

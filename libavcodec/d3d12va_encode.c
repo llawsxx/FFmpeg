@@ -140,6 +140,105 @@ static int d3d12va_encode_wait(AVCodecContext *avctx,
     return 0;
 }
 
+static int d3d12va_encode_setup_roi(AVCodecContext *avctx,
+                                    D3D12VAEncodePicture *pic,
+                                    const uint8_t *data, size_t size)
+{
+    D3D12VAEncodeContext *ctx = avctx->priv_data;
+    const AVRegionOfInterest *roi;
+    uint32_t roi_size;
+    int nb_roi, i;
+    int block_width, block_height;
+    int block_size, qp_range;
+    int is_av1 = 0;
+
+    // Use the QP map region size reported by the driver
+    block_size = ctx->qp_map_region_size;
+
+    // Determine QP range and element size based on codec
+    switch (ctx->codec->d3d12_codec) {
+        case D3D12_VIDEO_ENCODER_CODEC_H264:
+        case D3D12_VIDEO_ENCODER_CODEC_HEVC:
+            qp_range = 51;
+            is_av1 = 0;
+            break;
+#if CONFIG_AV1_D3D12VA_ENCODER
+        case D3D12_VIDEO_ENCODER_CODEC_AV1:
+            qp_range = 255;
+            is_av1 = 1;
+            break;
+#endif
+        default:
+            av_log(avctx, AV_LOG_ERROR, "Unsupported codec for ROI.\n");
+            return AVERROR(EINVAL);
+    }
+
+    // Calculate map dimensions using ceil division as required by D3D12
+    block_width  = (avctx->width + block_size - 1) / block_size;
+    block_height = (avctx->height + block_size - 1) / block_size;
+
+    // Allocate QP map with correct type based on codec
+    if (is_av1) {
+        pic->qp_map = av_calloc(block_width * block_height, sizeof(int16_t));
+    } else {
+        pic->qp_map = av_calloc(block_width * block_height, sizeof(int8_t));
+    }
+    if (!pic->qp_map)
+        return AVERROR(ENOMEM);
+
+    // Process ROI regions
+    roi = (const AVRegionOfInterest *)data;
+    roi_size = roi->self_size;
+    av_assert0(roi_size && size % roi_size == 0);
+    nb_roi = size / roi_size;
+
+    // Iterate in reverse for priority (first region in array takes priority on overlap)
+    for (i = nb_roi - 1; i >= 0; i--) {
+        int startx, endx, starty, endy;
+        int delta_qp;
+        int x, y;
+
+        roi = (const AVRegionOfInterest *)(data + roi_size * i);
+
+        // Convert pixel coordinates to block coordinates
+        starty = FFMIN(block_height, roi->top / block_size);
+        endy   = FFMIN(block_height, (roi->bottom + block_size - 1) / block_size);
+        startx = FFMIN(block_width, roi->left / block_size);
+        endx   = FFMIN(block_width, (roi->right + block_size - 1) / block_size);
+
+        if (roi->qoffset.den == 0) {
+            av_freep(&pic->qp_map);
+            av_log(avctx, AV_LOG_ERROR, "AVRegionOfInterest.qoffset.den must not be zero.\n");
+            return AVERROR(EINVAL);
+        }
+
+        // Convert qoffset to delta QP
+        delta_qp = roi->qoffset.num * qp_range / roi->qoffset.den;
+
+        av_log(avctx, AV_LOG_DEBUG, "ROI: (%d,%d)-(%d,%d) -> %+d.\n",
+               roi->top, roi->left, roi->bottom, roi->right, delta_qp);
+
+        // Fill QP map for this ROI region with correct type
+        if (is_av1) {
+            int16_t *qp_map_int16 = (int16_t *)pic->qp_map;
+            delta_qp = av_clip_int16(delta_qp);
+            for (y = starty; y < endy; y++)
+                for (x = startx; x < endx; x++)
+                    qp_map_int16[x + y * block_width] = delta_qp;
+        } else {
+            int8_t *qp_map_int8 = (int8_t *)pic->qp_map;
+            delta_qp = av_clip_int8(delta_qp);
+            for (y = starty; y < endy; y++)
+                for (x = startx; x < endx; x++)
+                    qp_map_int8[x + y * block_width] = delta_qp;
+        }
+    }
+
+    pic->qp_map_size = block_width * block_height;
+
+    return 0;
+}
+
 static int d3d12va_encode_create_metadata_buffers(AVCodecContext *avctx,
                                                   D3D12VAEncodePicture *pic)
 {
@@ -298,6 +397,20 @@ static int d3d12va_encode_issue(AVCodecContext *avctx,
     err = d3d12va_encode_create_metadata_buffers(avctx, pic);
     if (err < 0)
         goto fail;
+
+    // Process ROI side data if present and supported
+    AVFrameSideData *sd = av_frame_get_side_data(base_pic->input_image,
+                                                    AV_FRAME_DATA_REGIONS_OF_INTEREST);
+    if (sd && base_ctx->roi_allowed) {
+        err = d3d12va_encode_setup_roi(avctx, pic, sd->data, sd->size);
+        if (err < 0)
+            goto fail;
+
+        // Enable delta QP flag in rate control only if supported
+        input_args.SequenceControlDesc.RateControl.Flags |= D3D12_VIDEO_ENCODER_RATE_CONTROL_FLAG_ENABLE_DELTA_QP;
+        av_log(avctx, AV_LOG_DEBUG, "ROI delta QP map created with %d blocks (region size: %d pixels).\n",
+                pic->qp_map_size, ctx->qp_map_region_size);
+    }
 
     if (ctx->codec->init_picture_params) {
         err = ctx->codec->init_picture_params(avctx, base_pic);
@@ -668,6 +781,9 @@ static int d3d12va_encode_free(AVCodecContext *avctx, FFHWBaseEncodePicture *pic
 
     if (ctx->codec->free_picture_params)
         ctx->codec->free_picture_params(priv);
+
+    // Free ROI QP map if allocated
+    av_freep(&priv->qp_map);
 
     return 0;
 }
@@ -1140,91 +1256,6 @@ rc_mode_found:
         default:
             break;
     }
-    return 0;
-}
-
-static int d3d12va_encode_init_motion_estimation_precision(AVCodecContext *avctx)
-{
-    FFHWBaseEncodeContext *base_ctx = avctx->priv_data;
-    D3D12VAEncodeContext       *ctx = avctx->priv_data;
-    AVD3D12VAFramesContext   *hwctx = base_ctx->input_frames->hwctx;
-    HRESULT hr;
-
-    if (ctx->me_precision == D3D12_VIDEO_ENCODER_MOTION_ESTIMATION_PRECISION_MODE_MAXIMUM)
-        return 0;
-
-    D3D12_VIDEO_ENCODER_PROFILE_DESC      profile = { 0 };
-    D3D12_VIDEO_ENCODER_PROFILE_H264 h264_profile = D3D12_VIDEO_ENCODER_PROFILE_H264_MAIN;
-    D3D12_VIDEO_ENCODER_PROFILE_HEVC hevc_profile = D3D12_VIDEO_ENCODER_PROFILE_HEVC_MAIN;
-#if CONFIG_AV1_D3D12VA_ENCODER
-    D3D12_VIDEO_ENCODER_AV1_PROFILE   av1_profile = D3D12_VIDEO_ENCODER_AV1_PROFILE_MAIN;
-#endif
-
-    D3D12_VIDEO_ENCODER_LEVEL_SETTING                    level = { 0 };
-    D3D12_VIDEO_ENCODER_LEVELS_H264                 h264_level = { 0 };
-    D3D12_VIDEO_ENCODER_LEVEL_TIER_CONSTRAINTS_HEVC hevc_level = { 0 };
-#if CONFIG_AV1_D3D12VA_ENCODER
-    D3D12_VIDEO_ENCODER_AV1_LEVEL_TIER_CONSTRAINTS   av1_level = { 0 };
-#endif
-
-    switch (ctx->codec->d3d12_codec) {
-        case D3D12_VIDEO_ENCODER_CODEC_H264:
-            profile.DataSize        = sizeof(D3D12_VIDEO_ENCODER_PROFILE_H264);
-            profile.pH264Profile    = &h264_profile;
-            level.DataSize          = sizeof(D3D12_VIDEO_ENCODER_LEVELS_H264);
-            level.pH264LevelSetting = &h264_level;
-            break;
-        case D3D12_VIDEO_ENCODER_CODEC_HEVC:
-            profile.DataSize        = sizeof(D3D12_VIDEO_ENCODER_PROFILE_HEVC);
-            profile.pHEVCProfile    = &hevc_profile;
-            level.DataSize          = sizeof(D3D12_VIDEO_ENCODER_LEVEL_TIER_CONSTRAINTS_HEVC);
-            level.pHEVCLevelSetting = &hevc_level;
-            break;
-#if CONFIG_AV1_D3D12VA_ENCODER
-        case D3D12_VIDEO_ENCODER_CODEC_AV1:
-            profile.DataSize        = sizeof(D3D12_VIDEO_ENCODER_AV1_PROFILE);
-            profile.pAV1Profile     = &av1_profile;
-            level.DataSize          = sizeof(D3D12_VIDEO_ENCODER_AV1_LEVEL_TIER_CONSTRAINTS);
-            level.pAV1LevelSetting  = &av1_level;
-            break;
-#endif
-        default:
-            av_assert0(0);
-    }
-
-    D3D12_FEATURE_DATA_VIDEO_ENCODER_SUPPORT support = {
-        .NodeIndex                   = 0,
-        .Codec                       = ctx->codec->d3d12_codec,
-        .InputFormat                 = hwctx->format,
-        .RateControl                 = ctx->rc,
-        .IntraRefresh                = D3D12_VIDEO_ENCODER_INTRA_REFRESH_MODE_NONE,
-        .SubregionFrameEncoding      = D3D12_VIDEO_ENCODER_FRAME_SUBREGION_LAYOUT_MODE_FULL_FRAME,
-        .ResolutionsListCount        = 1,
-        .pResolutionList             = &ctx->resolution,
-        .CodecGopSequence            = ctx->gop,
-        .MaxReferenceFramesInDPB     = MAX_DPB_SIZE - 1,
-        .CodecConfiguration          = ctx->codec_conf,
-        .SuggestedProfile            = profile,
-        .SuggestedLevel              = level,
-        .pResolutionDependentSupport = &ctx->res_limits,
-    };
-
-    hr = ID3D12VideoDevice3_CheckFeatureSupport(ctx->video_device3, D3D12_FEATURE_VIDEO_ENCODER_SUPPORT,
-                                                &support, sizeof(support));
-    if (FAILED(hr)) {
-        av_log(avctx, AV_LOG_ERROR, "Failed to check encoder support for motion estimation.\n");
-        return AVERROR(EINVAL);
-    }
-
-    if (!(support.SupportFlags & D3D12_VIDEO_ENCODER_SUPPORT_FLAG_MOTION_ESTIMATION_PRECISION_MODE_LIMIT_AVAILABLE)) {
-        av_log(avctx, AV_LOG_ERROR, "Hardware does not support motion estimation "
-            "precision mode limits.\n");
-        return AVERROR(ENOTSUP);
-    }
-
-    av_log(avctx, AV_LOG_VERBOSE, "Hardware supports motion estimation "
-        "precision mode limits.\n");
-
     return 0;
 }
 
@@ -1765,10 +1796,6 @@ int ff_d3d12va_encode_init(AVCodecContext *avctx)
         if (err < 0)
             goto fail;
     }
-
-    err = d3d12va_encode_init_motion_estimation_precision(avctx);
-    if (err < 0)
-        goto fail;
 
     if (ctx->codec->init_sequence_params) {
         err = ctx->codec->init_sequence_params(avctx);

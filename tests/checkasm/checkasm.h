@@ -110,6 +110,7 @@ void checkasm_check_h264pred(void);
 void checkasm_check_h264qpel(void);
 void checkasm_check_hevc_add_res(void);
 void checkasm_check_hevc_deblock(void);
+void checkasm_check_hevc_dequant(void);
 void checkasm_check_hevc_idct(void);
 void checkasm_check_hevc_pel(void);
 void checkasm_check_hevc_sao(void);
@@ -309,7 +310,7 @@ void checkasm_checked_call(void *func, ...);
 void checkasm_set_function(void *);
 void *checkasm_get_wrapper(void);
 
-#if HAVE_RV && (__riscv_xlen == 64) && defined (__riscv_d)
+#if HAVE_RV
 #define declare_new(ret, ...) \
     ret (*checked_call)(__VA_ARGS__) = checkasm_get_wrapper();
 #define checkasm_call_checked(func, ...) \

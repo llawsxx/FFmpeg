@@ -100,7 +100,6 @@ static int init_default_huffman_tables(MJpegDecodeContext *s)
 
 static void parse_avid(MJpegDecodeContext *s, uint8_t *buf, int len)
 {
-    s->buggy_avid = 1;
     if (len > 12 && buf[12] == 1) /* 1 - NTSC */
         s->interlace_polarity = 1;
     if (len > 12 && buf[12] == 2) /* 2 - PAL */
@@ -146,7 +145,7 @@ av_cold int ff_mjpeg_decode_init(AVCodecContext *avctx)
     if ((ret = init_default_huffman_tables(s)) < 0)
         return ret;
 
-    if (s->extern_huff) {
+    if (s->extern_huff && avctx->extradata) {
         av_log(avctx, AV_LOG_INFO, "using external huffman table\n");
         bytestream2_init(&s->gB, avctx->extradata, avctx->extradata_size);
         if (ff_mjpeg_decode_dht(s)) {
@@ -1615,10 +1614,6 @@ static int mjpeg_decode_scan_progressive_ac(MJpegDecodeContext *s, int ss,
         int block_idx    = mb_y * s->block_stride[c];
         int16_t (*block)[64] = &s->blocks[c][block_idx];
         uint8_t *last_nnz    = &s->last_nnz[c][block_idx];
-        if (get_bits_left(&s->gb) <= 0) {
-            av_log(s->avctx, AV_LOG_ERROR, "bitstream truncated in mjpeg_decode_scan_progressive_ac\n");
-            return AVERROR_INVALIDDATA;
-        }
         for (mb_x = 0; mb_x < s->mb_width; mb_x++, block++, last_nnz++) {
                 int ret;
                 if (s->restart_interval && !s->restart_count)
@@ -1893,8 +1888,7 @@ static int mjpeg_decode_app(MJpegDecodeContext *s)
         av_log(s->avctx, AV_LOG_DEBUG, "APPx (%s / %8X) len=%d\n",
                av_fourcc2str(av_bswap32(id)), id, len);
 
-    /* Buggy AVID, it puts EOI only at every 10th frame. */
-    /* Also, this fourcc is used by non-avid files too, it holds some
+    /* This fourcc is used by non-avid files too, it holds some
        information, but it's always present in AVID-created files. */
     if (id == AV_RB32("AVI1")) {
         /* structure:
@@ -1904,7 +1898,8 @@ static int mjpeg_decode_app(MJpegDecodeContext *s)
             4bytes      field_size
             4bytes      field_size_less_padding
         */
-            s->buggy_avid = 1;
+        if (len < 1)
+            goto out;
         i = bytestream2_get_byteu(&s->gB); len--;
         av_log(s->avctx, AV_LOG_DEBUG, "polarity %d\n", i);
         goto out;
@@ -1969,6 +1964,8 @@ static int mjpeg_decode_app(MJpegDecodeContext *s)
         if (s->avctx->debug & FF_DEBUG_PICT_INFO)
             av_log(s->avctx, AV_LOG_INFO,
                    "Pegasus lossless jpeg header found\n");
+        if (len < 9)
+            goto out;
         bytestream2_skipu(&s->gB, 2); /* version ? */
         bytestream2_skipu(&s->gB, 2); /* unknown always 0? */
         bytestream2_skipu(&s->gB, 2); /* unknown always 0? */
@@ -2163,7 +2160,7 @@ out:
     if (len < 0)
         av_log(s->avctx, AV_LOG_ERROR,
                "mjpeg: error, decode_app parser read over the end\n");
-    if (len)
+    if (len > 0)
         bytestream2_skipu(&s->gB, len);
 
     return 0;
