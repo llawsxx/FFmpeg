@@ -343,6 +343,8 @@ struct dshow_ctx {
     int sample_rate;
     int sample_size;
     int channels;
+
+    AVIOInterruptCB interrupt_callback;
 };
 
 /*****************************************************************************

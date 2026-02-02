@@ -1664,6 +1664,8 @@ static int dshow_read_header(AVFormatContext *avctx)
     int ret = AVERROR(EIO);
     int r;
 
+    ctx->interrupt_callback = avctx->interrupt_callback;
+
     CoInitialize(0);
 
     if (!ctx->list_devices && !parse_device_name(avctx)) {
@@ -1837,6 +1839,7 @@ static int dshow_check_event_queue(IMediaEvent *media_event)
 static int dshow_read_packet(AVFormatContext *s, AVPacket *pkt)
 {
     struct dshow_ctx *ctx = s->priv_data;
+    AVIOInterruptCB *cb = &ctx->interrupt_callback;
     PacketListEntry *pktl = NULL;
 
     while (!ctx->eof && !pktl) {
@@ -1856,7 +1859,14 @@ static int dshow_read_packet(AVFormatContext *s, AVPacket *pkt)
             } else if (s->flags & AVFMT_FLAG_NONBLOCK) {
                 return AVERROR(EAGAIN);
             } else {
-                WaitForMultipleObjects(2, ctx->event, 0, INFINITE);
+                if(cb->callback){
+                    WaitForMultipleObjects(2, ctx->event, 0, 500);
+                    if(cb->callback(cb->opaque)){
+                        av_log(s, AV_LOG_DEBUG, "dshow interrupted\n");
+                        return AVERROR_EXIT;
+                    }
+                }else
+                    WaitForMultipleObjects(2, ctx->event, 0, INFINITE);
             }
         }
     }
