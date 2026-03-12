@@ -22,6 +22,7 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include "libavutil/common.h"
 #include "libavutil/cpu.h"
 #include "avcodec.h"
 #include "codec_internal.h"
@@ -39,6 +40,77 @@ typedef struct DAVS2Context {
     davs2_seq_info_t headerset;  // output data, sequence header
 
 }DAVS2Context;
+
+static const int ff_avs2_color_primaries_tab[10] = {
+    AVCOL_PRI_RESERVED0   ,
+    AVCOL_PRI_BT709       ,
+    AVCOL_PRI_UNSPECIFIED ,
+    AVCOL_PRI_RESERVED    ,
+    AVCOL_PRI_BT470M      ,
+    AVCOL_PRI_BT470BG     ,
+    AVCOL_PRI_SMPTE170M   ,
+    AVCOL_PRI_SMPTE240M   ,
+    AVCOL_PRI_FILM        ,
+    AVCOL_PRI_BT2020
+};
+
+static const int ff_avs2_color_transfer_tab[15] = {
+    AVCOL_TRC_RESERVED0   ,
+    AVCOL_TRC_BT709       ,
+    AVCOL_TRC_UNSPECIFIED ,
+    AVCOL_TRC_RESERVED    ,
+    AVCOL_TRC_GAMMA22     ,
+    AVCOL_TRC_GAMMA28     ,
+    AVCOL_TRC_SMPTE170M   ,
+    AVCOL_TRC_SMPTE240M   ,
+    AVCOL_TRC_LINEAR      ,
+    AVCOL_TRC_LOG         ,
+    AVCOL_TRC_LOG_SQRT    ,
+    AVCOL_TRC_BT2020_12   ,
+    AVCOL_TRC_SMPTE2084   ,
+    AVCOL_TRC_UNSPECIFIED ,
+    AVCOL_TRC_ARIB_STD_B67
+};
+
+static const int ff_avs2_color_matrix_tab[12] = {
+    AVCOL_SPC_RESERVED    ,
+    AVCOL_SPC_BT709       ,
+    AVCOL_SPC_UNSPECIFIED ,
+    AVCOL_SPC_RESERVED    ,
+    AVCOL_SPC_FCC         ,
+    AVCOL_SPC_BT470BG     ,
+    AVCOL_SPC_SMPTE170M   ,
+    AVCOL_SPC_SMPTE240M   ,
+    AVCOL_SPC_BT2020_NCL  ,
+    AVCOL_SPC_BT2020_CL   ,
+    AVCOL_SPC_UNSPECIFIED ,
+    AVCOL_SPC_UNSPECIFIED
+};
+
+static void davs2_set_color_metadata(AVCodecContext *avctx, AVFrame *frame, const davs2_seq_info_t *headerset)
+{
+    if (!headerset || !headerset->sequence_display_extension)
+        return;
+
+    avctx->color_range = headerset->sample_range ? AVCOL_RANGE_JPEG : AVCOL_RANGE_MPEG;
+
+    if (headerset->colour_description) {
+        if (headerset->colour_primaries < FF_ARRAY_ELEMS(ff_avs2_color_primaries_tab))
+            avctx->color_primaries = ff_avs2_color_primaries_tab[headerset->colour_primaries];
+        if (headerset->transfer_characteristics < FF_ARRAY_ELEMS(ff_avs2_color_transfer_tab))
+            avctx->color_trc = ff_avs2_color_transfer_tab[headerset->transfer_characteristics];
+        if (headerset->matrix_coefficients < FF_ARRAY_ELEMS(ff_avs2_color_matrix_tab))
+            avctx->colorspace = ff_avs2_color_matrix_tab[headerset->matrix_coefficients];
+    }
+
+    if (frame) {
+        frame->color_range = avctx->color_range;
+        frame->color_primaries = avctx->color_primaries;
+        frame->color_trc = avctx->color_trc;
+        frame->colorspace = avctx->colorspace;
+    }
+}
+
 
 static av_cold int davs2_init(AVCodecContext *avctx)
 {
@@ -88,6 +160,7 @@ static int davs2_dump_frames(AVCodecContext *avctx, davs2_picture_t *pic, int *g
 
         if (headerset->frame_rate_id < 16)
             avctx->framerate = ff_avs2_frame_rate_tab[headerset->frame_rate_id];
+        davs2_set_color_metadata(avctx, NULL, headerset);
         *got_frame = 0;
         return 0;
     }
@@ -134,7 +207,7 @@ static int davs2_dump_frames(AVCodecContext *avctx, davs2_picture_t *pic, int *g
     frame->height    = cad->headerset.height;
     frame->pts       = cad->out_frame.pts;
     frame->format    = avctx->pix_fmt;
-
+    davs2_set_color_metadata(avctx, frame, headerset);
     *got_frame = 1;
     return 0;
 }
