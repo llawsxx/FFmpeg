@@ -63,6 +63,8 @@
 #define MV_BWD_OFFS                     12
 #define MV_STRIDE                        4
 
+#define AV_FRAME_FLAG_INTERLACED_TOP (AV_FRAME_FLAG_INTERLACED | AV_FRAME_FLAG_TOP_FIELD_FIRST) /* default top field first */
+
 typedef struct AVSFrame {
     AVFrame *f;
     int poc;
@@ -355,9 +357,9 @@ static int cavs_decode_seq_header(AVSContext *h)
     h->avctx->width  = h->width;
     h->avctx->height = h->height;
 
-	h->cur.f->flags = h->b_interlaced ? AV_FRAME_FLAG_INTERLACED : 0;
-	h->DPB[0].f->flags = h->b_interlaced ? AV_FRAME_FLAG_INTERLACED : 0;
-	h->DPB[1].f->flags = h->b_interlaced ? AV_FRAME_FLAG_INTERLACED : 0;
+	h->cur.f->flags = h->b_interlaced ? AV_FRAME_FLAG_INTERLACED_TOP : 0;
+	h->DPB[0].f->flags = h->b_interlaced ? AV_FRAME_FLAG_INTERLACED_TOP : 0;
+	h->DPB[1].f->flags = h->b_interlaced ? AV_FRAME_FLAG_INTERLACED_TOP : 0;
 		
     return 0;
 }
@@ -546,7 +548,7 @@ static int cavs_decode_frame(AVCodecContext *avctx, AVFrame *frame, int *got_fra
                     *got_frame = 1;
                     av_frame_move_ref(frame, h->cur.f);
                      
-					frame->flags = h->b_interlaced ? AV_FRAME_FLAG_INTERLACED : 0;
+					frame->flags = h->b_interlaced ? AV_FRAME_FLAG_INTERLACED_TOP : 0;
 	
                     return 0;
                }
@@ -560,7 +562,7 @@ static int cavs_decode_frame(AVCodecContext *avctx, AVFrame *frame, int *got_fra
                 decoder_get_cur_frame( h->DPB[0].f, &h->param );
                 *got_frame = 1;
                 av_frame_move_ref(frame, h->DPB[0].f);
-				frame->flags = h->b_interlaced ? AV_FRAME_FLAG_INTERLACED : 0;
+				frame->flags = h->b_interlaced ? AV_FRAME_FLAG_INTERLACED_TOP : 0;
             }
         }
 
@@ -697,7 +699,7 @@ static int cavs_decode_frame(AVCodecContext *avctx, AVFrame *frame, int *got_fra
                         {
                             return ret;
                         }
-						frame->flags = h->b_interlaced ? AV_FRAME_FLAG_INTERLACED : 0;
+						frame->flags = h->b_interlaced ? AV_FRAME_FLAG_INTERLACED_TOP : 0;
                     }
                     else
                     {
@@ -711,7 +713,7 @@ static int cavs_decode_frame(AVCodecContext *avctx, AVFrame *frame, int *got_fra
                     if(h->output_type == AV_PICTURE_TYPE_B && *got_frame == 1)
                     {   
                         av_frame_move_ref(frame, h->cur.f);
-						frame->flags = h->b_interlaced ? AV_FRAME_FLAG_INTERLACED : 0;
+						frame->flags = h->b_interlaced ? AV_FRAME_FLAG_INTERLACED_TOP : 0;
                     } 
                 }
             }
@@ -725,7 +727,7 @@ static int cavs_decode_frame(AVCodecContext *avctx, AVFrame *frame, int *got_fra
                         {
                             return ret;
                         }
-						frame->flags = h->b_interlaced ? AV_FRAME_FLAG_INTERLACED : 0;
+						frame->flags = h->b_interlaced ? AV_FRAME_FLAG_INTERLACED_TOP : 0;
                     }
                     else
                     {
@@ -738,7 +740,7 @@ static int cavs_decode_frame(AVCodecContext *avctx, AVFrame *frame, int *got_fra
 
                             *got_frame = 1;
                             av_frame_move_ref(frame, h->cur.f);
-							frame->flags = h->b_interlaced ? AV_FRAME_FLAG_INTERLACED : 0;
+							frame->flags = h->b_interlaced ? AV_FRAME_FLAG_INTERLACED_TOP : 0;
                         }
                         else
                         {
@@ -751,7 +753,7 @@ static int cavs_decode_frame(AVCodecContext *avctx, AVFrame *frame, int *got_fra
                     if(*got_frame == 1)
                     {   
                         av_frame_move_ref(frame, h->cur.f);
-						frame->flags = h->b_interlaced ? AV_FRAME_FLAG_INTERLACED : 0;
+						frame->flags = h->b_interlaced ? AV_FRAME_FLAG_INTERLACED_TOP : 0;
                     }
                 }
             }
