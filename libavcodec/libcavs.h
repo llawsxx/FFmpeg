@@ -1,5 +1,5 @@
 /*****************************************************************************
-* libcavs.h: the header file of avs/avs+ decoder 
+* libcavs.h: the header file of avs/avs+ decoder
 *****************************************************************************
 */
 
@@ -16,8 +16,9 @@ extern "C" {    // only need to export C interface if used by C++ source code
 #endif
 
 #include <stdio.h>
+#include <stdint.h>
 
-typedef struct tagcavs_decoder cavs_decoder;
+    typedef struct tagcavs_decoder cavs_decoder;
 
 #define SLICE_MAX_START_CODE    0x000001af
 #define EXT_START_CODE          0x000001b5
@@ -51,110 +52,114 @@ typedef struct tagcavs_decoder cavs_decoder;
 
 #define MAX_CODED_FRAME_SIZE 4000000         //!< bytes for one frame
 
-typedef struct tagcavs_seq_info
-{
-    long lWidth;
-    long lHeight;
-    int i_frame_rate_den;
-    int i_frame_rate_num;
-    int b_interlaced;
+    typedef struct tagcavs_seq_info
+    {
+        long lWidth;
+        long lHeight;
+        int i_frame_rate_den;
+        int i_frame_rate_num;
+        int b_interlaced;
 
-    int profile;
-    int level;
-    int aspect_ratio;
-    int low_delay;
-    int mb_width;
-    int mb_height;
-    int frame_rate_code;
-}cavs_seq_info;
+        int profile;
+        int level;
+        int aspect_ratio;
+        int low_delay;
+        int mb_width;
+        int mb_height;
+        int frame_rate_code;
+    }cavs_seq_info;
 
-typedef struct tagcavs_param
-{
-    unsigned int   i_color_space; /* color space , only support 4:2:0 now */
-    unsigned char *p_out_yuv[3]; /* memory for decoded frame */
-    unsigned int  seq_header_flag; /* first seq header flag */
-    
-    int i_thread_num;	/* number of threads (max 64)*/
+    typedef struct tagcavs_param
+    {
+        unsigned int   i_color_space; /* color space , only support 4:2:0 now */
+        unsigned char* p_out_yuv[3]; /* memory for decoded frame */
+        unsigned int  seq_header_flag; /* first seq header flag */
 
-    cavs_seq_info	seqsize; /* infos of seq header */
+        int i_thread_num;	/* number of threads (max 64)*/
 
-    int cpu; /* detect cpu type */
-    int fld_mb_end[2]; /* 0 : top 1 : bot */
-    int b_interlaced; /* 0 : frame 1 : field */
-    int b_accelerate; /* 0: off 1: on */
+        cavs_seq_info	seqsize; /* infos of seq header */
 
-    int output_type; /* mark output type, init as -1, I-0, P-1, B-2 */
-}cavs_param;
+        int cpu; /* detect cpu type */
+        int fld_mb_end[2]; /* 0 : top 1 : bot */
+        int b_interlaced; /* 0 : frame 1 : field */
+        int b_accelerate; /* 0: off 1: on */
 
-/* creat handle of decoder */
-int cavs_decoder_create( void **pp_decoder, cavs_param *param );
+        int output_type; /* mark output type, init as -1, I-0, P-1, B-2 */
+        int64_t    pts;        // 输出帧的PTS
+        int64_t    dts;        // 输出帧的DTS
+        int64_t    pts_in;     // 输入帧的PTS
+        int64_t    dts_in;     // 输入帧的DTS
+    }cavs_param;
 
-/* init stream for decoding */
-int cavs_decoder_init_stream( void *p_decoder, unsigned char *rawstream, unsigned int i_len );
+    /* creat handle of decoder */
+    int cavs_decoder_create(void** pp_decoder, cavs_param* param);
 
-/* get one nal from input stream */
-int cavs_decoder_get_one_nal( void *p_decoder, unsigned char *buf,/*int *startcodepos,*/int *length );
+    /* init stream for decoding */
+    int cavs_decoder_init_stream(void* p_decoder, unsigned char* rawstream, unsigned int i_len);
 
-/* process seq header start and seq end */
-int cavs_decoder_process( void *p_decoder, unsigned char *p_in, int i_in_len );
+    /* get one nal from input stream */
+    int cavs_decoder_get_one_nal(void* p_decoder, unsigned char* buf,/*int *startcodepos,*/int* length);
 
-/* alloc buffer for decoded yuv */
-int cavs_decoder_buffer_init( cavs_param *param );
+    /* process seq header start and seq end */
+    int cavs_decoder_process(void* p_decoder, unsigned char* p_in, int i_in_len);
 
-/* free buffer for decoded yuv */
-int cavs_decoder_buffer_end( cavs_param *param );
+    /* alloc buffer for decoded yuv */
+    int cavs_decoder_buffer_init(cavs_param* param);
 
-/* destroy decoder handle */
-void cavs_decoder_destroy( void *p_decoder );
+    /* free buffer for decoded yuv */
+    int cavs_decoder_buffer_end(cavs_param* param);
 
-/* destroy decoder handle when across different seq header */
-void cavs_decoder_slice_destroy( void *p_decoder );
+    /* destroy decoder handle */
+    void cavs_decoder_destroy(void* p_decoder);
 
-/* get info from seq header */
-int cavs_decoder_get_seq( void *p_decoder, cavs_seq_info *p_si );
+    /* destroy decoder handle when across different seq header */
+    void cavs_decoder_slice_destroy(void* p_decoder);
 
-/* output delay frame when has B-frames in stream */
-int cavs_out_delay_frame( void *p_decoder, unsigned char *p_out_yuv[3] );
-int cavs_out_delay_frame_end(void *p_decoder, unsigned char *p_out_yuv[3]);
+    /* get info from seq header */
+    int cavs_decoder_get_seq(void* p_decoder, cavs_seq_info* p_si);
 
-/* init first seq header for frame decoding */
-int cavs_decoder_seq_init( void *p_decoder , cavs_param *param );
+    /* output delay frame when has B-frames in stream */
+    int cavs_out_delay_frame(void* p_decoder, unsigned char* p_out_yuv[3], cavs_param *out_param);
+    int cavs_out_delay_frame_end(void* p_decoder, unsigned char* p_out_yuv[3], cavs_param* out_param);
 
-int cavs_decoder_seq_end( void *p_decoder );
+    /* init first seq header for frame decoding */
+    int cavs_decoder_seq_init(void* p_decoder, cavs_param* param);
 
-/* decode one frame or field when across pic header */
-/*
- void *p_decoder : decoder handle
- int i_startcode : type of current picture header 
- cavs_param *param : decoder configure param
- uint8_t* buf : buffer with current picture header
- int length : length of current NAL
-*/
-int cavs_decode_one_frame( void *p_decoder , int i_startcode, cavs_param *param, unsigned char* buf, int length );
+    int cavs_decoder_seq_end(void* p_decoder);
 
-/*return current frame type is P or B */
-int cavs_decoder_cur_frame_type( void* p_decoder );
+    /* decode one frame or field when across pic header */
+    /*
+     void *p_decoder : decoder handle
+     int i_startcode : type of current picture header
+     cavs_param *param : decoder configure param
+     uint8_t* buf : buffer with current picture header
+     int length : length of current NAL
+    */
+    int cavs_decode_one_frame(void* p_decoder, int i_startcode, cavs_param* param, unsigned char* buf, int length);
 
-int cavs_decoder_thread_param_init( void* p_decoder );
+    /*return current frame type is P or B */
+    int cavs_decoder_cur_frame_type(void* p_decoder);
 
-/*use for format probe */
-int cavs_decoder_probe_seq(void *p_decoder, unsigned char *p_in, int i_in_length);
+    int cavs_decoder_thread_param_init(void* p_decoder);
 
-int cavs_decoder_pic_header( void* p_decoder, unsigned char *p_buf,  int i_len, cavs_param* param, unsigned int cur_startcode );
+    /*use for format probe */
+    int cavs_decoder_probe_seq(void* p_decoder, unsigned char* p_in, int i_in_length);
 
-int cavs_decoder_set_format_type( void* p_decoder, cavs_param *param );
+    int cavs_decoder_pic_header(void* p_decoder, unsigned char* p_buf, int i_len, cavs_param* param, unsigned int cur_startcode);
 
-int cavs_decoder_seq_header_reset( void* p_decoder );
+    int cavs_decoder_set_format_type(void* p_decoder, cavs_param* param);
 
-int cavs_decoder_low_delay_value( void* p_decoder );
+    int cavs_decoder_seq_header_reset(void* p_decoder);
 
-int cavs_decode_one_frame_delay( void *p_decoder, cavs_param *param );
+    int cavs_decoder_low_delay_value(void* p_decoder);
 
-int cavs_set_last_delay_frame( void *p_decoder );
+    int cavs_decode_one_frame_delay(void* p_decoder, cavs_param* param);
 
-int cavs_decoder_seq_header_reset_pipeline( void* p_decoder );
+    int cavs_set_last_delay_frame(void* p_decoder);
 
-int cavs_decoder_slice_num_probe( void* p_decoder,  int i_startcode, cavs_param *param, unsigned char  *buf,  int length );
+    int cavs_decoder_seq_header_reset_pipeline(void* p_decoder);
+
+    int cavs_decoder_slice_num_probe(void* p_decoder, int i_startcode, cavs_param* param, unsigned char* buf, int length);
 
 #ifdef __cplusplus
 }
