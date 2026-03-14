@@ -89,6 +89,8 @@ extern "C" {    // only need to export C interface if used by C++ source code
         int64_t    dts;        // 输出帧的DTS
         int64_t    pts_in;     // 输入帧的PTS
         int64_t    dts_in;     // 输入帧的DTS
+        void*      *user_data_in;
+        void       *user_data;
     }cavs_param;
 
     /* creat handle of decoder */

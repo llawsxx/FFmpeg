@@ -92,7 +92,6 @@ typedef struct AVSContext {
     int probe_keyframe;
 
     int output_type; /* mark type of output frame */
-    int b_delay_frame;
     int b_decode_last_delay_frame;
     int b_last_delay_frame_already_output;
 	
@@ -136,7 +135,6 @@ av_cold int ff_libcavs_init(AVCodecContext *avctx) {
     h->b_probe_flag = 0;
     h->b_decode_last_delay_frame = 0;
     h->b_last_delay_frame_already_output = 0;
-    h->b_delay_frame = 0;
     
     h->last_frame_error= 0;
     h->probe_keyframe = 0;
@@ -262,6 +260,13 @@ static void set_frame_props(AVSContext* h, AVFrame* frame) {
         frame->flags |= AV_FRAME_FLAG_KEY;
     }
     frame->pict_type = h->param.output_type + 1;
+    frame->duration = 0;
+#if FF_API_FRAME_PKT
+FF_DISABLE_DEPRECATION_WARNINGS
+    frame->pkt_pos = -1;
+    frame->pkt_size = -1;
+FF_ENABLE_DEPRECATION_WARNINGS
+#endif
 }
 
 /*****************************************************************************
@@ -322,6 +327,7 @@ static void cavs_flush(AVCodecContext * avctx)
 {
     AVSContext *h = avctx->priv_data;
     h->got_keyframe = 0;
+    cavs_decoder_seq_header_reset_pipeline(h->p_decoder);
 }
 
 static int cavs_decoder_param_init( AVSContext *h )
@@ -346,7 +352,7 @@ static int cavs_decoder_param_init( AVSContext *h )
 
 static int cavs_decode_frame(AVCodecContext *avctx, AVFrame *frame, int *got_frame, AVPacket *avpkt)
 {
-    AVSContext *h      = avctx->priv_data;
+    AVSContext* h = avctx->priv_data;
     const uint8_t *buf = avpkt->data;
     int buf_size       = avpkt->size;
     uint32_t stc       = -1;
@@ -563,12 +569,10 @@ static int cavs_decode_frame(AVCodecContext *avctx, AVFrame *frame, int *got_fra
             {
                 if( h->param.b_accelerate )
                 {
-                    h->b_delay_frame = 0; // xun
                     if( h->last_frame_error )
                     {
                         /* reset pipeline */
                         cavs_decoder_seq_header_reset_pipeline( h->p_decoder );
-                        h->b_delay_frame = 0;
                     }
                 }
             }
@@ -618,7 +622,7 @@ static int cavs_decode_frame(AVCodecContext *avctx, AVFrame *frame, int *got_fra
                 break;
             }
 
-            if( ret == CAVS_FRAME_OUT && h->cur->data[0])
+            if( ret == CAVS_FRAME_OUT )
             {
                 *got_frame = 1;
                 if ((ret = av_frame_ref(frame, h->cur)) < 0)

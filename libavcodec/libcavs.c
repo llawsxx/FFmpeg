@@ -707,6 +707,7 @@ typedef struct tagcavs_image
 
     int64_t    pts;        // 显示时间戳
     int64_t    dts;        // 解码时间戳
+    void*      user_data;
 }cavs_image;
 
 typedef struct tagcavs_bitstream
@@ -1808,6 +1809,7 @@ struct tagcavs_decoder
     cavs_bitstream s;
     int64_t    pts_in;
     int64_t    dts_in;
+    void* user_data_for_output_frame;
     cavs_video_sequence_header vsh;
     cavs_video_sequence_header old;
     cavs_picture_header ph;
@@ -13547,6 +13549,7 @@ static void cavs_out_image_yuv420(cavs_decoder* p, cavs_image* p_cur, uint8_t* p
         out_param->output_type = p_cur->i_code_type;
         out_param->pts = p_cur->pts;
         out_param->dts = p_cur->dts;
+        out_param->user_data = p_cur->user_data;
     }
 
     if (!b_interlaced)
@@ -14028,6 +14031,7 @@ int cavs_decode_one_frame_delay(void* p_decoder, cavs_param* param)
             if (p_rec->b_complete) {
                 p_rec->p_save[0]->pts = p_rec->pts_in;
                 p_rec->p_save[0]->dts = p_rec->dts_in;
+                p_rec->p_save[0]->user_data = p_rec->user_data_for_output_frame;
             }
 
             /* this module will effect ref-list creature and update */
@@ -14103,6 +14107,7 @@ int cavs_decode_one_frame_delay(void* p_decoder, cavs_param* param)
                 if (p_rec->b_complete) {
                     p_rec->p_save[0]->pts = p_rec->pts_in;
                     p_rec->p_save[0]->dts = p_rec->dts_in;
+                    p_rec->p_save[0]->user_data = p_rec->user_data_for_output_frame;
                 }
 
                 if (p_rec->b_complete && p_rec->ph.i_picture_coding_type != CAVS_B_PICTURE)
@@ -14199,6 +14204,7 @@ int decode_one_frame(void* p_decoder, frame_pack* frame, cavs_param* param)
 
     p->pts_in = param->pts_in;
     p->dts_in = param->dts_in;
+    p->user_data_for_output_frame = param->user_data_in;
 
     /* decode header of pic */
     switch (cur_startcode)
@@ -14331,6 +14337,7 @@ int decode_one_frame(void* p_decoder, frame_pack* frame, cavs_param* param)
                 if (p->b_complete) {
                     p->p_save[0]->pts = p->pts_in;
                     p->p_save[0]->dts = p->dts_in;
+                    p->p_save[0]->user_data = p->user_data_for_output_frame;
                 }
 
                 /* this module will effect ref-list creature and update */
@@ -14599,6 +14606,7 @@ static int decode_one_frame_far(void* p_decoder, frame_pack* frame, cavs_param* 
 
     p_aec->pts_in = param->pts_in;
     p_aec->dts_in = param->dts_in;
+    p_aec->user_data_for_output_frame = param->user_data_in;
 
     cavs_threadpool_run(p_m->threadpool, (void*)frame_decode_aec_threads_far, p_aec);
     p_aec->b_thread_active = 1;
@@ -14638,6 +14646,7 @@ static int decode_one_frame_far(void* p_decoder, frame_pack* frame, cavs_param* 
         if (p_rec->b_complete) {
             p_rec->p_save[0]->pts = p_rec->pts_in;
             p_rec->p_save[0]->dts = p_rec->dts_in;
+            p_rec->p_save[0]->user_data = p_rec->user_data_for_output_frame;
         }
 
         /* this module will effect ref-list creature and update */
@@ -14806,6 +14815,7 @@ int decode_top_field(void* p_decoder, frame_pack* field, cavs_param* param)
 
     p->pts_in = param->pts_in;
     p->dts_in = param->dts_in;
+    p->user_data_for_output_frame = param->user_data_in;
 
     /* decode header of pic */
     switch (cur_startcode)
@@ -14949,6 +14959,7 @@ int decode_top_field(void* p_decoder, frame_pack* field, cavs_param* param)
                 if (p->b_complete) {
                     p->p_save[0]->pts = p->pts_in;
                     p->p_save[0]->dts = p->dts_in;
+                    p->p_save[0]->user_data = p->user_data_for_output_frame;
                 }
 
                 if (p->b_complete && p->ph.i_picture_coding_type != CAVS_B_PICTURE)
@@ -15102,6 +15113,7 @@ int decode_bot_field(void* p_decoder, frame_pack* field, cavs_param* param)
 
     p->pts_in = param->pts_in;
     p->dts_in = param->dts_in;
+    p->user_data_for_output_frame = param->user_data_in;
 
     /* decode header of pic */
     switch (cur_startcode)
@@ -15204,6 +15216,7 @@ int decode_bot_field(void* p_decoder, frame_pack* field, cavs_param* param)
                 if (p->b_complete) {
                     p->p_save[0]->pts = p->pts_in;
                     p->p_save[0]->dts = p->dts_in;
+                    p->p_save[0]->user_data = p->user_data_for_output_frame;
                 }
 
                 if (p->b_complete && p->ph.i_picture_coding_type != CAVS_B_PICTURE)
@@ -15949,6 +15962,7 @@ static int cavs_field_decode_far(void* p_decoder, frame_pack* field, cavs_param*
 
     p_aec->pts_in = param->pts_in;
     p_aec->dts_in = param->dts_in;
+    p_aec->user_data_for_output_frame = param->user_data_in;
 
     cavs_threadpool_run(p_m->threadpool, (void*)field_decode_aec_threads_far, p_aec);
     p_aec->b_thread_active = 1;
@@ -15992,6 +16006,7 @@ static int cavs_field_decode_far(void* p_decoder, frame_pack* field, cavs_param*
             if (p_rec->b_complete) {
                 p_rec->p_save[0]->pts = p_rec->pts_in;
                 p_rec->p_save[0]->dts = p_rec->dts_in;
+                p_rec->p_save[0]->user_data = p_rec->user_data_for_output_frame;
             }
 
             if (p_rec->b_complete && p_rec->ph.i_picture_coding_type != CAVS_B_PICTURE)
