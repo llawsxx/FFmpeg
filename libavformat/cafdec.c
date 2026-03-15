@@ -228,12 +228,26 @@ static int read_kuki_chunk(AVFormatContext *s, int64_t size)
         if (!last)
             av_log(s, AV_LOG_WARNING, "non-STREAMINFO FLACMetadataBlock(s) ignored\n");
     } else if (st->codecpar->codec_id == AV_CODEC_ID_OPUS) {
-        // The data layout for Opus is currently unknown, so we do not export
-        // extradata at all. Multichannel streams are not supported.
+        // The data layout for Opus is currently unknown, so we generate
+        // extradata using known sane values. Multichannel streams are not supported.
         if (st->codecpar->ch_layout.nb_channels > 2) {
             avpriv_request_sample(s, "multichannel Opus in CAF");
             return AVERROR_PATCHWELCOME;
         }
+
+        ret = ff_alloc_extradata(st->codecpar, 19);
+        if (ret < 0)
+            return ret;
+
+        AV_WB32A(st->codecpar->extradata, MKBETAG('O','p','u','s'));
+        AV_WB32A(st->codecpar->extradata + 4, MKBETAG('H','e','a','d'));
+        AV_WB8(st->codecpar->extradata + 8, 1); /* OpusHead version */
+        AV_WB8(st->codecpar->extradata + 9, st->codecpar->ch_layout.nb_channels);
+        AV_WL16A(st->codecpar->extradata + 10, st->codecpar->initial_padding);
+        AV_WL32A(st->codecpar->extradata + 12, st->codecpar->sample_rate);
+        AV_WL16A(st->codecpar->extradata + 16, 0);
+        AV_WB8(st->codecpar->extradata + 18, 0);
+
         avio_skip(pb, size);
     } else if ((ret = ff_get_extradata(s, st->codecpar, pb, size)) < 0) {
         return ret;
@@ -263,9 +277,13 @@ static int read_pakt_chunk(AVFormatContext *s, int64_t size)
     priming        = avio_rb32(pb); /* priming frames */
     caf->remainder = avio_rb32(pb); /* remainder frames */
 
+    caf->frame_cnt = -(int64_t)priming;
     st->codecpar->initial_padding = priming;
     st->nb_frames += priming;
     st->nb_frames += caf->remainder;
+
+    if (st->codecpar->codec_id == AV_CODEC_ID_OPUS && st->codecpar->extradata_size)
+        AV_WL16A(st->codecpar->extradata + 10, st->codecpar->initial_padding);
 
     if (caf->bytes_per_packet > 0 && caf->frames_per_packet > 0) {
         if (!num_packets) {
@@ -273,10 +291,10 @@ static int read_pakt_chunk(AVFormatContext *s, int64_t size)
                 return AVERROR_INVALIDDATA;
             num_packets = caf->data_size / caf->bytes_per_packet;
         }
-        st->duration = caf->frames_per_packet * num_packets;
+        st->duration = caf->frames_per_packet * num_packets - priming;
         pos          = caf-> bytes_per_packet * num_packets;
     } else {
-        st->duration = 0;
+        st->duration = caf->frame_cnt;
         for (i = 0; i < num_packets; i++) {
             if (avio_feof(pb))
                 return AVERROR_INVALIDDATA;
@@ -308,6 +326,10 @@ static void read_info_chunk(AVFormatContext *s, int64_t size)
     AVIOContext *pb = s->pb;
     unsigned int i;
     unsigned int nb_entries = avio_rb32(pb);
+
+    if (3LL * nb_entries > size)
+        return;
+
     for (i = 0; i < nb_entries && !avio_feof(pb); i++) {
         char key[32];
         char value[1024];
@@ -455,7 +477,7 @@ static int read_packet(AVFormatContext *s, AVPacket *pkt)
     FFStream *const sti = ffstream(st);
     CafContext *caf   = s->priv_data;
     int res, pkt_size = 0, pkt_frames = 0;
-    unsigned remainder = 0;
+    unsigned priming = 0, remainder = 0;
     int64_t left      = CAF_MAX_PKT_SIZE;
 
     if (avio_feof(pb))
@@ -500,13 +522,18 @@ static int read_packet(AVFormatContext *s, AVPacket *pkt)
     if (res < 0)
         return res;
 
-    if (remainder > 0) {
+    if (!caf->packet_cnt)
+        priming = st->codecpar->initial_padding;
+
+    if (priming > 0 || remainder > 0) {
         uint8_t* side_data = av_packet_new_side_data(pkt,
                                                      AV_PKT_DATA_SKIP_SAMPLES,
                                                      10);
         if (!side_data)
             return AVERROR(ENOMEM);
-        AV_WL32(side_data + 4, caf->remainder);
+
+        AV_WL32A(side_data, priming);
+        AV_WL32A(side_data + 4, remainder);
     }
 
     pkt->duration       = pkt_frames;
@@ -536,7 +563,7 @@ static int read_seek(AVFormatContext *s, int stream_index,
         if (caf->data_size > 0)
             pos = FFMIN(pos, caf->data_size);
         packet_cnt = pos / caf->bytes_per_packet;
-        frame_cnt  = caf->frames_per_packet * packet_cnt;
+        frame_cnt  = caf->frames_per_packet * packet_cnt - st->codecpar->initial_padding;
     } else if (sti->nb_index_entries) {
         packet_cnt = av_index_search_timestamp(st, timestamp, flags);
         frame_cnt  = sti->index_entries[packet_cnt].timestamp;
