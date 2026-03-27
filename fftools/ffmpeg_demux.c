@@ -312,18 +312,27 @@ static int pre_queue_read(PreQueue* q, AVPacket* pkt) {
         for (int i = 0; i < q->pre_queue_length - 1; i++) {
             AVStream* st = q->ic->streams[i];
             AVPacket* peek_pkt;
-            if (av_fifo_peek(q->pre_queue[i], &peek_pkt, 1, 0) < 0) continue;
-
-            cur_pts = av_rescale_q(peek_pkt->pts, st->time_base, AV_TIME_BASE_Q);
-
-            if (cur_pts == AV_NOPTS_VALUE) {
-                read_stream_index = i;
-                break;
+            int fifo_size = av_fifo_can_read(q->pre_queue[i]);
+            
+            for (int j = 0; j < fifo_size; j++) {
+                if (av_fifo_peek(q->pre_queue[i], &peek_pkt, 1, j) < 0) continue;
+                
+                cur_pts = av_rescale_q(peek_pkt->pts, st->time_base, AV_TIME_BASE_Q);
+                
+                if (cur_pts == AV_NOPTS_VALUE) {
+                    pts = AV_NOPTS_VALUE;
+                    read_stream_index = i;
+                    break;
+                }
+                
+                if (pts == AV_NOPTS_VALUE || cur_pts < pts) {
+                    pts = cur_pts;
+                    read_stream_index = i;
+                }
             }
-
-            if (pts == AV_NOPTS_VALUE || cur_pts < pts) {
-                pts = cur_pts;
-                read_stream_index = i;
+            
+            if (pts == AV_NOPTS_VALUE && read_stream_index != -1) {
+                break;
             }
         }
     }
