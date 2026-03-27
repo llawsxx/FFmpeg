@@ -7587,7 +7587,7 @@ static void pixel_avg_4x4_c(uint8_t* dst, int i_dst, uint8_t* src, int i_src)
 }
 #endif
 
-void init_crop_table()
+static void init_crop_table()
 {
     int i;
 
