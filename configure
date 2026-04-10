@@ -249,6 +249,7 @@ External library support:
   --enable-liblc3          enable LC3 de/encoding via liblc3 [no]
   --enable-liblcevc-dec    enable LCEVC decoding via liblcevc-dec [no]
   --enable-liblensfun      enable lensfun lens correction [no]
+  --enable-librife         enable RIFE(Real-Time Intermediate Flow Estimation for Video Frame Interpolation) filter [no]
   --enable-libmodplug      enable ModPlug via libmodplug [no]
   --enable-libmp3lame      enable MP3 encoding via libmp3lame [no]
   --enable-libmpeghdec     enable MPEG-H 3DA decoding via libmpeghdec [no]
@@ -2123,6 +2124,7 @@ EXTERNAL_LIBRARY_LIST="
     vapoursynth
     vulkan_static
     whisper
+    librife
 "
 
 HWACCEL_AUTODETECT_LIBRARY_LIST="
@@ -4161,6 +4163,7 @@ kerndeint_filter_deps="gpl"
 ladspa_filter_deps="ladspa libdl"
 lcevc_filter_deps="liblcevc_dec"
 lensfun_filter_deps="liblensfun version3"
+rife_filter_deps="librife"
 libplacebo_filter_deps="libplacebo vulkan"
 lv2_filter_deps="lv2"
 mcdeint_filter_deps="avcodec gpl"
@@ -7300,6 +7303,7 @@ enabled libkvazaar        && require_pkg_config libkvazaar "kvazaar >= 2.0.0" kv
 enabled liblc3            && require_pkg_config liblc3 "lc3 >= 1.1.0" lc3.h lc3_hr_setup_encoder
 enabled liblensfun        && require_pkg_config liblensfun lensfun lensfun.h lf_db_create
 enabled liblcevc_dec      && require_pkg_config liblcevc_dec "lcevc_dec >= 4.0.0" "LCEVC/lcevc_dec.h" LCEVC_CreateDecoder
+enabled librife           && require librife rife/rife_wrapper.h rife_wrapper_create -lrife
 
 if enabled libmfx && enabled libvpl; then
    die "ERROR: can not use libmfx and libvpl together"

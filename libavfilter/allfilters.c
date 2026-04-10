@@ -347,6 +347,7 @@ extern const FFFilter ff_vf_latency;
 extern const FFFilter ff_vf_lcevc;
 extern const FFFilter ff_vf_lenscorrection;
 extern const FFFilter ff_vf_lensfun;
+extern const FFFilter ff_vf_rife;
 extern const FFFilter ff_vf_libplacebo;
 extern const FFFilter ff_vf_libvmaf;
 extern const FFFilter ff_vf_libvmaf_cuda;
