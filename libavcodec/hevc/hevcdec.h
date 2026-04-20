@@ -371,6 +371,10 @@ typedef struct HEVCFrame {
     RefPicListTab **rpl_tab;       ///< RefStruct reference
     int ctb_count;
     int poc;
+    
+    // SEI Picture Timing Picture Structure Type.
+    // HEVC_SEI_PicStructType.
+    int sei_pic_struct;
 
     const HEVCPPS *pps;            ///< RefStruct reference
     RefPicListTab *rpl;            ///< RefStruct reference
@@ -487,6 +491,8 @@ typedef struct HEVCLayerContext {
     struct AVRefStructPool *rpl_tab_pool;
 } HEVCLayerContext;
 
+struct HEVCOutputFrameConstructionContext;
+
 typedef struct HEVCContext {
     const AVClass *c;  // needed by private avoptions
     AVCodecContext *avctx;
@@ -504,6 +510,9 @@ typedef struct HEVCContext {
 
     /** 1 if the independent slice segment header was successfully parsed */
     uint8_t slice_initialized;
+    
+    // Interlaced Frame Construction Context.
+    struct HEVCOutputFrameConstructionContext *output_frame_construction_ctx; ///< RefStruct reference
 
     struct AVContainerFifo *output_fifo;
 
@@ -666,6 +675,10 @@ static av_always_inline int ff_hevc_nal_is_nonref(enum HEVCNALUnitType type)
     }
     return 0;
 }
+
+int ff_hevc_output_frame_construction_ctx_alloc(HEVCContext *s);
+void ff_hevc_output_frame_construction_ctx_replace(HEVCContext *dst, HEVCContext *src);
+void ff_hevc_output_frame_construction_ctx_unref(HEVCContext *s);
 
 /**
  * Find frames in the DPB that are ready for output and either write them to the

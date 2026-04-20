@@ -22,8 +22,12 @@
  */
 
 #include "libavutil/container_fifo.h"
+#include "libavutil/avassert.h"
 #include "libavutil/mem.h"
+#include "libavutil/pixdesc.h"
 #include "libavutil/stereo3d.h"
+#include "libavutil/thread.h"
+#include "libavutil/timestamp.h"
 
 #include "decode.h"
 #include "hevc.h"
@@ -31,6 +35,101 @@
 #include "progressframe.h"
 #include "thread.h"
 #include "libavutil/refstruct.h"
+
+typedef struct HEVCOutputFrameConstructionContext {
+    // Thread Data Access/Synchronization.
+    AVMutex mutex;
+
+    // DPB Output Tracking.
+    uint64_t dpb_counter;
+    int dpb_poc;
+    uint64_t dpb_poc_ooorder_counter;
+
+    // Collect the First Field.
+    int have_first_field;
+    int first_field_poc;
+    int first_field_sei_pic_struct;
+    int first_field_flags;
+    AVFrame *first_field;
+
+    uint64_t orphaned_field_pictures;
+
+    // Reconstructed Interlaced Frames From Field Pictures for Output.
+    AVFrame *constructed_frame;
+
+    // Output Frame Tracking.
+    uint64_t output_counter;
+    int output_poc;
+    uint64_t output_poc_ooorder_counter;
+} HEVCOutputFrameConstructionContext;
+
+
+static void hevc_output_frame_construction_ctx_free(AVRefStructOpaque opaque, void *obj)
+{
+    HEVCOutputFrameConstructionContext * ctx = (HEVCOutputFrameConstructionContext *)obj;
+
+    if (!ctx)
+        return;
+
+    av_frame_free(&ctx->first_field);
+    av_frame_free(&ctx->constructed_frame);
+    av_assert0(ff_mutex_destroy(&ctx->mutex) == 0);
+}
+
+int ff_hevc_output_frame_construction_ctx_alloc(HEVCContext *s)
+{
+    if (s->output_frame_construction_ctx) {
+        av_log(s->avctx, AV_LOG_ERROR,
+               "s->output_frame_construction_ctx is already set.\n");
+        return AVERROR_INVALIDDATA;
+    }
+
+    s->output_frame_construction_ctx =
+        av_refstruct_alloc_ext(sizeof(*(s->output_frame_construction_ctx)),
+                               0, NULL, hevc_output_frame_construction_ctx_free);
+    if (!s->output_frame_construction_ctx)
+        return AVERROR(ENOMEM);
+
+    av_assert0(ff_mutex_init(&s->output_frame_construction_ctx->mutex, NULL) == 0);
+
+    return 0;
+}
+
+void ff_hevc_output_frame_construction_ctx_replace(HEVCContext *dst, HEVCContext *src)
+{
+    av_refstruct_replace(&dst->output_frame_construction_ctx,
+                         src->output_frame_construction_ctx);
+}
+
+void ff_hevc_output_frame_construction_ctx_unref(HEVCContext *s)
+{
+    if (s->output_frame_construction_ctx &&
+        av_refstruct_exclusive(s->output_frame_construction_ctx)) {
+
+        HEVCOutputFrameConstructionContext * ctx = s->output_frame_construction_ctx;
+
+        av_assert0(ff_mutex_lock(&ctx->mutex) == 0);
+
+       if (ctx->dpb_counter) {
+           av_log(s->avctx, AV_LOG_ERROR,
+                  "[HEVCOutputFrameConstructionContext @ 0x%p]:\n"
+                  "      DPB:    Counter=%" PRIu64 " POCOutOfOrder=%" PRIu64 " Orphaned=%" PRIu64 "\n"
+                  "      Output: Counter=%" PRIu64 " POCOutOfOrder=%" PRIu64 "\n"
+                  "%s",
+                  ctx,
+                  ctx->dpb_counter,
+                  ctx->dpb_poc_ooorder_counter,
+                  ctx->orphaned_field_pictures,
+                  ctx->output_counter,
+                  ctx->output_poc_ooorder_counter,
+                  "");
+       }
+
+       av_assert0(ff_mutex_unlock(&ctx->mutex) == 0);
+    }
+
+    av_refstruct_unref(&s->output_frame_construction_ctx);
+}
 
 void ff_hevc_unref_frame(HEVCFrame *frame, int flags)
 {
@@ -178,11 +277,20 @@ static HEVCFrame *alloc_frame(HEVCContext *s, HEVCLayerContext *l)
         for (j = 0; j < frame->ctb_count; j++)
             frame->rpl_tab[j] = frame->rpl;
 
-        if (s->sei.picture_timing.picture_struct == AV_PICTURE_STRUCTURE_TOP_FIELD)
-            frame->f->flags |= AV_FRAME_FLAG_TOP_FIELD_FIRST;
-        if ((s->sei.picture_timing.picture_struct == AV_PICTURE_STRUCTURE_TOP_FIELD) ||
-            (s->sei.picture_timing.picture_struct == AV_PICTURE_STRUCTURE_BOTTOM_FIELD))
+        frame->sei_pic_struct = s->sei.picture_timing.picture_struct;
+        if (ff_hevc_sei_pic_struct_is_interlaced(frame->sei_pic_struct)) {
             frame->f->flags |= AV_FRAME_FLAG_INTERLACED;
+            if (ff_hevc_sei_pic_struct_is_tff(frame->sei_pic_struct))
+                frame->f->flags |= AV_FRAME_FLAG_TOP_FIELD_FIRST;
+        }
+        if (frame->sei_pic_struct == HEVC_SEI_PIC_STRUCT_FRAME_TFBFTF ||
+            frame->sei_pic_struct == HEVC_SEI_PIC_STRUCT_FRAME_BFTFBF)
+            frame->f->repeat_pict = 1;
+        else if (frame->sei_pic_struct == HEVC_SEI_PIC_STRUCT_FRAME_DOUBLING)
+            frame->f->repeat_pict = 2;
+        else if (frame->sei_pic_struct == HEVC_SEI_PIC_STRUCT_FRAME_TRIPLING)
+            frame->f->repeat_pict = 3;
+
 
         ret = ff_hwaccel_frame_priv_alloc(s->avctx, &frame->hwaccel_picture_private);
         if (ret < 0)
@@ -248,7 +356,11 @@ int ff_hevc_set_new_ref(HEVCContext *s, HEVCLayerContext *l, int poc)
     ref->f->crop_right  = l->sps->output_window.right_offset;
     ref->f->crop_top    = l->sps->output_window.top_offset;
     ref->f->crop_bottom = l->sps->output_window.bottom_offset;
-
+    // We are combining field pictures so need to double the top/bottom crop here.
+    if (ff_hevc_sei_pict_struct_is_field_picture(ref->sei_pic_struct)) {
+        ref->f->crop_top    *= 2;
+        ref->f->crop_bottom *= 2;
+    }
     return 0;
 }
 
@@ -260,6 +372,77 @@ static void unref_missing_refs(HEVCLayerContext *l)
              ff_hevc_unref_frame(frame, ~0);
          }
     }
+}
+
+static void copy_field2(AVFrame *_dst, const AVFrame *_src)
+{
+    const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(_src->format);
+    int i, j, planes_nb = 0;
+    for (i = 0; i < desc->nb_components; i++)
+        planes_nb = FFMAX(planes_nb, desc->comp[i].plane + 1);
+    for (i = 0; i < planes_nb; i++) {
+        int h = _src->height;
+        uint8_t *dst = _dst->data[i] + (_dst->linesize[i] / 2);
+        uint8_t *src = _src->data[i];
+        if (i == 1 || i == 2) {
+            h = FF_CEIL_RSHIFT(_src->height, desc->log2_chroma_h);
+        }
+        for (j = 0; j < h; j++) {
+            memcpy(dst, src, _src->linesize[i]);
+            dst += _dst->linesize[i];
+            src += _src->linesize[i];
+        }
+    }
+}
+
+static int interlaced_frame_from_fields(AVFrame *dst,
+                                        const AVFrame *field1,
+                                        const AVFrame *field2)
+{
+    int i, ret = 0;
+
+    av_frame_unref(dst);
+
+    dst->format         = field1->format;
+    dst->width          = field1->width;
+    dst->height         = field1->height * 2;
+
+    ret = av_frame_copy_props(dst, field1);
+    if (ret < 0)
+        return ret;
+    if (field1->duration > 0 && field1->duration != AV_NOPTS_VALUE)
+        dst->duration = field2->duration * 2;
+    else if (field2->duration > 0 && field2->duration != AV_NOPTS_VALUE)
+        dst->duration = field2->duration * 2;
+
+    for (i = 0; i < field2->nb_side_data; i++) {
+        const AVFrameSideData *sd_src = field2->side_data[i];
+        AVFrameSideData *sd_dst;
+        AVBufferRef *ref = av_buffer_ref(sd_src->buf);
+        sd_dst = av_frame_new_side_data_from_buf(dst, sd_src->type, ref);
+        if (!sd_dst) {
+            av_buffer_unref(&ref);
+            return AVERROR(ENOMEM);
+        }
+    }
+
+    for (i = 0; i < AV_NUM_DATA_POINTERS; i++)
+        dst->linesize[i] = field1->linesize[i]*2;
+
+    ret = av_frame_get_buffer(dst, 0);
+    if (ret < 0)
+        return ret;
+
+    ret = av_frame_copy(dst, field1);
+    if (ret < 0)
+        av_frame_unref(dst);
+
+    copy_field2(dst, field2);
+
+    for (i = 0; i < AV_NUM_DATA_POINTERS; i++)
+        dst->linesize[i] = field1->linesize[i];
+
+    return ret;
 }
 
 int ff_hevc_output_frames(HEVCContext *s,
@@ -304,12 +487,247 @@ int ff_hevc_output_frames(HEVCContext *s,
             AVFrame *f = frame->needs_fg ? frame->frame_grain : frame->f;
             int output = !discard && (layers_active_output & (1 << min_layer));
 
-            if (output) {
-                if (frame->flags & HEVC_FRAME_FLAG_CORRUPT)
-                    f->flags |= AV_FRAME_FLAG_CORRUPT;
-                f->pkt_dts = s->pkt_dts;
-                ret = av_container_fifo_write(s->output_fifo, f, AV_CONTAINER_FIFO_FLAG_REF);
+            if (ff_hevc_sei_pict_struct_is_field_picture(frame->sei_pic_struct)) {
+                // Skip the extra work if the stream contains frame pictures.
+                // NOTE: This also fixes the final frame output for the fate test streams.
+                if (frame->poc != s->poc) {
+                    if (s->avctx->active_thread_type == FF_THREAD_FRAME)
+                    {
+                        // Wait for other thread to finish decoding this frame/field picture.
+                        // Otherwise I have seen image corruption for some streams..
+                        av_log(s->avctx, AV_LOG_DEBUG,
+                               "Waiting on Frame POC: %d.\n",
+                               frame->poc);
+                        ff_progress_frame_await(&frame->tf, INT_MAX);
+                    }
+                } else {
+                    // This is the Context currently decoding..
+                    // Skip it to ensure that this frame is completely decoded and finalized.
+                    // This will allow the next context to process it
+                    // Otherwise I have seen image corruption for some streams.
+                    av_log(s->avctx, AV_LOG_DEBUG,
+                           "Schedule Frame for Next Pass POC: %d.\n",
+                           frame->poc);
+                    return 0;
+                }
             }
+
+            av_assert0(s->output_frame_construction_ctx);
+            av_assert0(ff_mutex_lock(&s->output_frame_construction_ctx->mutex) == 0);
+
+            if (output) {
+                const int dpb_poc = frame->poc;
+                const int dpb_sei_pic_struct = frame->sei_pic_struct;
+                const int frame_flags = frame->flags;
+                AVFrame *output_frame = f;
+                int output_poc = dpb_poc;
+                int output_sei_pic_struct = dpb_sei_pic_struct;
+
+                s->output_frame_construction_ctx->dpb_counter++;
+                if (s->output_frame_construction_ctx->dpb_counter > 1 &&
+                        dpb_poc < s->output_frame_construction_ctx->dpb_poc &&
+                        dpb_poc > 0) {
+                    s->output_frame_construction_ctx->dpb_poc_ooorder_counter++;
+                    av_log(s->avctx, AV_LOG_ERROR,
+                           "DPB POC Out of Order POC %d < PrevPOC %d "
+                           ": Counter=%" PRIu64 " OORCounter=%" PRIu64 ".\n",
+                           dpb_poc,
+                           s->output_frame_construction_ctx->dpb_poc,
+                           s->output_frame_construction_ctx->dpb_counter,
+                           s->output_frame_construction_ctx->dpb_poc_ooorder_counter);
+                }
+                s->output_frame_construction_ctx->dpb_poc = dpb_poc;
+
+                if (ff_hevc_sei_pict_struct_is_field_picture(dpb_sei_pic_struct)) {
+                    const int have_first_field = s->output_frame_construction_ctx->have_first_field;
+                    const int is_first_field =
+                        (ff_hevc_sei_pic_struct_is_tff(dpb_sei_pic_struct) &&
+                            ff_hevc_sei_pic_struct_is_tf(dpb_sei_pic_struct)) ||
+                        (ff_hevc_sei_pic_struct_is_bff(dpb_sei_pic_struct) &&
+                            ff_hevc_sei_pic_struct_is_bf(dpb_sei_pic_struct)) ||
+                        (!s->output_frame_construction_ctx->have_first_field &&
+                            (dpb_poc % 2) == 0) ||
+                        (s->output_frame_construction_ctx->have_first_field &&
+                            s->output_frame_construction_ctx->first_field_sei_pic_struct == dpb_sei_pic_struct &&
+                            (dpb_poc % 2) == 0 &&
+                            dpb_poc > s->output_frame_construction_ctx->first_field_poc);
+
+                    output_frame = NULL;
+
+                    if (!s->output_frame_construction_ctx->first_field)
+                    {
+                        s->output_frame_construction_ctx->first_field = av_frame_alloc();
+                        if (!s->output_frame_construction_ctx->first_field) {
+                            av_log(s->avctx, AV_LOG_ERROR, "AVERROR(ENOMEM)");
+                            ret = AVERROR(ENOMEM);
+                            goto unref_frame_and_check_ret;
+                        }
+                    }
+                    if (!s->output_frame_construction_ctx->constructed_frame) {
+                        s->output_frame_construction_ctx->constructed_frame = av_frame_alloc();
+                        if (!s->output_frame_construction_ctx->constructed_frame) {
+                            av_log(s->avctx, AV_LOG_ERROR, "AVERROR(ENOMEM)");
+                            ret = AVERROR(ENOMEM);
+                            goto unref_frame_and_check_ret;
+                        }
+                    }
+
+                    if (is_first_field) {
+                        // This is a first field picture.
+                        av_log(s->avctx, AV_LOG_DEBUG,
+                               "Found first field picture POC %d.\n",
+                               dpb_poc);
+                        if (s->output_frame_construction_ctx->have_first_field) {
+                            // We were waiting for a second field, but got another frist
+                            // field instead.
+                            av_log(s->avctx, AV_LOG_ERROR,
+                                   "Discarded Orphaned First Field with POC %d.\n",
+                                   s->output_frame_construction_ctx->first_field_poc);
+                        }
+                        s->output_frame_construction_ctx->have_first_field = 1;
+                        s->output_frame_construction_ctx->first_field_sei_pic_struct = dpb_sei_pic_struct;
+                        s->output_frame_construction_ctx->first_field_poc = dpb_poc;
+                        s->output_frame_construction_ctx->first_field_flags = frame_flags;
+                        av_frame_unref(s->output_frame_construction_ctx->first_field);
+                        ret = av_frame_ref(s->output_frame_construction_ctx->first_field, f);
+                        if (ret < 0) {
+                            av_log(s->avctx, AV_LOG_ERROR,
+                                   "Failure updating first Field picture POC %d.\n",
+                                   dpb_poc);
+                            s->output_frame_construction_ctx->have_first_field = 0;
+                            s->output_frame_construction_ctx->orphaned_field_pictures++;
+                            goto unref_frame_and_check_ret;
+                        }
+                    } else if (have_first_field) {
+                        // We Found the next field.
+                        if (f->width == s->output_frame_construction_ctx->first_field->width &&
+                            f->height == s->output_frame_construction_ctx->first_field->height) {
+                            // Combine the top and bottom fields into one frame for output.
+                            AVFrame *constructed_frame = s->output_frame_construction_ctx->constructed_frame;
+                            AVFrame *top_field;
+                            AVFrame *bottom_field;
+                            int tfPoc, bfPoc;
+                            if (ff_hevc_sei_pic_struct_is_tf(dpb_sei_pic_struct)) {
+                                top_field = f;
+                                tfPoc = dpb_poc;
+                                bottom_field = s->output_frame_construction_ctx->first_field;
+                                bfPoc = s->output_frame_construction_ctx->first_field_poc;
+                            } else {
+                                top_field = s->output_frame_construction_ctx->first_field;
+                                tfPoc = s->output_frame_construction_ctx->first_field_poc;
+                                bottom_field = f;
+                                bfPoc = dpb_poc;
+                            }
+                            av_frame_unref(constructed_frame);
+                            ret = interlaced_frame_from_fields(constructed_frame, top_field, bottom_field);
+                            if (ret >= 0) {
+                                output_frame = constructed_frame;
+                                output_poc = s->output_frame_construction_ctx->first_field_poc;
+                                output_sei_pic_struct = s->output_frame_construction_ctx->first_field_sei_pic_struct;
+
+                                if ((frame_flags & HEVC_FRAME_FLAG_CORRUPT) ||
+                                    (s->output_frame_construction_ctx->first_field_flags & HEVC_FRAME_FLAG_CORRUPT))
+                                    output_frame->flags |= AV_FRAME_FLAG_CORRUPT;
+
+                                output_frame->flags |= AV_FRAME_FLAG_INTERLACED;
+                                if (!ff_hevc_sei_pic_struct_is_bf(output_sei_pic_struct)) {
+                                    output_frame->flags |= AV_FRAME_FLAG_TOP_FIELD_FIRST;
+                                } else {
+                                    output_frame->flags &= ~AV_FRAME_FLAG_TOP_FIELD_FIRST;
+                                }
+                            } else {
+                                av_log(s->avctx, AV_LOG_ERROR,
+                                       "Interlaced Frame Construction Failure POCs: %d %d.\n",
+                                       tfPoc, bfPoc);
+                                s->output_frame_construction_ctx->orphaned_field_pictures += 2;
+                            }
+                        } else if ((dpb_poc % 2) == 0) {
+                            av_log(s->avctx, AV_LOG_ERROR,
+                                   "Discarded orphaned first field pictures POC: %d.\n",
+                                   s->output_frame_construction_ctx->first_field_poc);
+                            s->output_frame_construction_ctx->orphaned_field_pictures++;
+                            // This may be the next first field.
+                            s->output_frame_construction_ctx->have_first_field = 0;
+                            av_assert0(ff_mutex_unlock(&s->output_frame_construction_ctx->mutex) == 0);
+                            continue;
+                        } else {
+                            av_log(s->avctx, AV_LOG_ERROR,
+                                   "Discarded mismatched field pictures POCs: %d %d.\n",
+                                   s->output_frame_construction_ctx->first_field_poc,
+                                   dpb_poc);
+                            s->output_frame_construction_ctx->orphaned_field_pictures++;
+                        }
+                        // Find the next first field.
+                        s->output_frame_construction_ctx->have_first_field = 0;
+                    } else {
+                        // We have a second field without a first field.
+                        av_log(s->avctx, AV_LOG_ERROR,
+                               "Discarded orphaned second field picture with POC %d.\n",
+                               dpb_poc);
+                        s->output_frame_construction_ctx->orphaned_field_pictures++;
+                    }
+                } else if (s->output_frame_construction_ctx->have_first_field) {
+                     av_log(s->avctx, AV_LOG_ERROR,
+                            "Discarded orphaned first field pictures POC: %d.\n",
+                            s->output_frame_construction_ctx->first_field_poc);
+                     s->output_frame_construction_ctx->orphaned_field_pictures++;
+                     // Find the next first field.
+                     s->output_frame_construction_ctx->have_first_field = 0;
+                }
+
+                if (output_frame) 
+                {
+                    if (frame_flags & HEVC_FRAME_FLAG_CORRUPT)
+                        output_frame->flags |= AV_FRAME_FLAG_CORRUPT;
+                    output_frame->pkt_dts = s->pkt_dts;
+
+                    //av_log(s->avctx, AV_LOG_ERROR,
+                    av_log(s->avctx, AV_LOG_DEBUG,
+                           "s=0x%" PRIx64 " s->avctx=0x%" PRIx64 "\n"
+                           "  ====Output: FrameType:%s\n"
+                           "  === POC=%d PKTDTS=%s PTS=%s Duration=%s\n"
+                           "  === SEIPic=%d Interlaced=%s TFF=%s PictType='%c' Key=%s\n"
+                           "  === WxH=%dx%d SAR=%dx%d\n"
+                           "%s",
+                           (uint64_t)s, (uint64_t)s->avctx,
+                           (output_frame->flags & AV_FRAME_FLAG_INTERLACED) ? "Interlaced" : "Progressive",
+                           output_poc,
+                           av_ts2str(output_frame->pkt_dts),
+                           av_ts2str(output_frame->pts),
+                           av_ts2str(output_frame->duration),
+                           output_sei_pic_struct,
+                           (output_frame->flags & AV_FRAME_FLAG_INTERLACED) ? "Yes" : "No",
+                           (output_frame->flags & AV_FRAME_FLAG_TOP_FIELD_FIRST) ? "Yes" : "No",
+                           av_get_picture_type_char(output_frame->pict_type),
+                           (output_frame->flags & AV_FRAME_FLAG_KEY) ? "Yes" : "No",
+                           output_frame->width, output_frame->height,
+                           (int)output_frame->sample_aspect_ratio.num,
+                           (int)output_frame->sample_aspect_ratio.den,
+                           "");
+
+                    s->output_frame_construction_ctx->output_counter++;
+                    if (s->output_frame_construction_ctx->output_counter > 1 &&
+                            output_poc < s->output_frame_construction_ctx->output_poc &&
+                            output_poc > 0) {
+                        s->output_frame_construction_ctx->output_poc_ooorder_counter++;
+                        av_log(s->avctx, AV_LOG_ERROR,
+                               "Output POC Out of Order POC %d < PrevPOC %d "
+                               ": Counter=%" PRIu64 " OORCounter=%" PRIu64 ".\n",
+                               output_poc,
+                               s->output_frame_construction_ctx->output_poc,
+                               s->output_frame_construction_ctx->output_counter,
+                               s->output_frame_construction_ctx->output_poc_ooorder_counter);
+                    }
+                    s->output_frame_construction_ctx->output_poc = output_poc;
+
+                    ret = av_container_fifo_write(s->output_fifo, output_frame, AV_CONTAINER_FIFO_FLAG_REF);
+                }
+            }
+
+unref_frame_and_check_ret:
+
+            av_assert0(ff_mutex_unlock(&s->output_frame_construction_ctx->mutex) == 0);
+
             ff_hevc_unref_frame(frame, HEVC_FRAME_FLAG_OUTPUT);
             if (ret < 0)
                 return ret;

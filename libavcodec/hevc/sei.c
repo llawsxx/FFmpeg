@@ -59,21 +59,7 @@ static int decode_nal_sei_pic_timing(HEVCSEI *s, GetBitContext *gb,
         return AVERROR_INVALIDDATA;
 
     if (sps->vui.frame_field_info_present_flag) {
-        int pic_struct = get_bits(gb, 4);
-        h->picture_struct = AV_PICTURE_STRUCTURE_UNKNOWN;
-        if (pic_struct == 2 || pic_struct == 10 || pic_struct == 12) {
-            av_log(logctx, AV_LOG_DEBUG, "BOTTOM Field\n");
-            h->picture_struct = AV_PICTURE_STRUCTURE_BOTTOM_FIELD;
-        } else if (pic_struct == 1 || pic_struct == 9 || pic_struct == 11) {
-            av_log(logctx, AV_LOG_DEBUG, "TOP Field\n");
-            h->picture_struct = AV_PICTURE_STRUCTURE_TOP_FIELD;
-        } else if (pic_struct == 7) {
-            av_log(logctx, AV_LOG_DEBUG, "Frame/Field Doubling\n");
-            h->picture_struct = HEVC_SEI_PIC_STRUCT_FRAME_DOUBLING;
-        } else if (pic_struct == 8) {
-            av_log(logctx, AV_LOG_DEBUG, "Frame/Field Tripling\n");
-            h->picture_struct = HEVC_SEI_PIC_STRUCT_FRAME_TRIPLING;
-        }
+        h->picture_struct = get_bits(gb, 4);
     }
 
     return 0;

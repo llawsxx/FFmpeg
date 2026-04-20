@@ -33,9 +33,133 @@
 
 
 typedef enum {
-        HEVC_SEI_PIC_STRUCT_FRAME_DOUBLING = 7,
-        HEVC_SEI_PIC_STRUCT_FRAME_TRIPLING = 8
+    // SEI Picture Timing Picture Structure.
+    // From the ITU-T H.265 Standards Document v3 (04/2015):
+    // Table D.2: Interpretation of pic_struct:
+    // When present, pic_struct is constrained to use one of the following:
+    //   - all pictures in CSV are one of: 0, 7 or 8.
+    //   - all pictures in CSV are one of: 1, 2, 9, 10, 11, or 12..
+    //   - all pictures in CSV are one of: 3, 4, 5 or 6...
+
+    // progressive frame.
+    HEVC_SEI_PIC_STRUCT_FRAME_PROGRESSIVE = 0,
+
+    // top field.
+    HEVC_SEI_PIC_STRUCT_FIELD_TOP         = 1,
+    // bottom field.
+    HEVC_SEI_PIC_STRUCT_FIELD_BOTTOM      = 2,
+
+    // top field, bottom field, in that order. Top Field First.
+    HEVC_SEI_PIC_STRUCT_FRAME_TFBF        = 3,
+    // bottom Field, top field, in that order. Bottom Field First.
+    HEVC_SEI_PIC_STRUCT_FRAME_BFTF        = 4,
+
+    // top field, bottom field, top field repeated, Top Field First.
+    HEVC_SEI_PIC_STRUCT_FRAME_TFBFTF      = 5,
+    // bottom field, top field, bottom field repeated, Bottom Field First.
+    HEVC_SEI_PIC_STRUCT_FRAME_BFTFBF      = 6,
+
+    // frame doubling.
+    HEVC_SEI_PIC_STRUCT_FRAME_DOUBLING    = 7,
+    // frame trippling.
+    HEVC_SEI_PIC_STRUCT_FRAME_TRIPLING    = 8,
+
+    // top field paired with previous bottom field. Bottom Field First.
+    HEVC_SEI_PIC_STRUCT_FIELD_TFPBF       = 9,
+    // bottom field paired with previous top field. Top Field First.
+    HEVC_SEI_PIC_STRUCT_FIELD_BFPTF       = 10,
+
+    // top field paired with next bottom field. Top Field First.
+    HEVC_SEI_PIC_STRUCT_FIELD_TFNBF       = 11,
+    // bottom field paired with next top field. Bottom Field First.
+    HEVC_SEI_PIC_STRUCT_FIELD_BFNTF       = 12,
 } HEVC_SEI_PicStructType;
+
+// Returns 1 - when type is interlaced, 0 - otherwise.
+static inline int ff_hevc_sei_pic_struct_is_interlaced(HEVC_SEI_PicStructType type)
+{
+    switch (type) {
+    case HEVC_SEI_PIC_STRUCT_FIELD_TOP:
+    case HEVC_SEI_PIC_STRUCT_FIELD_BOTTOM:
+    case HEVC_SEI_PIC_STRUCT_FRAME_TFBF:
+    case HEVC_SEI_PIC_STRUCT_FRAME_BFTF:
+    case HEVC_SEI_PIC_STRUCT_FRAME_TFBFTF:
+    case HEVC_SEI_PIC_STRUCT_FRAME_BFTFBF:
+    case HEVC_SEI_PIC_STRUCT_FIELD_TFPBF:
+    case HEVC_SEI_PIC_STRUCT_FIELD_BFPTF:
+    case HEVC_SEI_PIC_STRUCT_FIELD_TFNBF:
+    case HEVC_SEI_PIC_STRUCT_FIELD_BFNTF:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+// Returns 1 - when type is top field first, 0 - otherwise.
+static inline int ff_hevc_sei_pic_struct_is_tff(HEVC_SEI_PicStructType type)
+{
+    switch (type) {
+    case HEVC_SEI_PIC_STRUCT_FRAME_TFBF:
+    case HEVC_SEI_PIC_STRUCT_FRAME_TFBFTF:
+    case HEVC_SEI_PIC_STRUCT_FIELD_BFPTF:
+    case HEVC_SEI_PIC_STRUCT_FIELD_TFNBF:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+// Returns 1 - when type is bottom field first, 0 - otherwise.
+static inline int ff_hevc_sei_pic_struct_is_bff(HEVC_SEI_PicStructType type)
+{
+    switch (type) {
+    case HEVC_SEI_PIC_STRUCT_FRAME_BFTF:
+    case HEVC_SEI_PIC_STRUCT_FRAME_BFTFBF:
+    case HEVC_SEI_PIC_STRUCT_FIELD_TFPBF:
+    case HEVC_SEI_PIC_STRUCT_FIELD_BFNTF:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+// Returns 1 - when type is top field, 0 - otherwise.
+static inline int ff_hevc_sei_pic_struct_is_tf(HEVC_SEI_PicStructType type)
+{
+    switch (type) {
+    case HEVC_SEI_PIC_STRUCT_FIELD_TOP:
+    case HEVC_SEI_PIC_STRUCT_FIELD_TFPBF:
+    case HEVC_SEI_PIC_STRUCT_FIELD_TFNBF:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+// Returns 1 - when type is bottom field, 0 - otherwise.
+static inline int ff_hevc_sei_pic_struct_is_bf(HEVC_SEI_PicStructType type)
+{
+    switch (type) {
+    case HEVC_SEI_PIC_STRUCT_FIELD_BOTTOM:
+    case HEVC_SEI_PIC_STRUCT_FIELD_BFPTF:
+    case HEVC_SEI_PIC_STRUCT_FIELD_BFNTF:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+// Returns 1 - when type is a field picture, 0 - otherwise.
+static inline int ff_hevc_sei_pict_struct_is_field_picture(HEVC_SEI_PicStructType type)
+{
+    return (ff_hevc_sei_pic_struct_is_tf(type) || ff_hevc_sei_pic_struct_is_bf(type)) ? 1 : 0;
+}
+
+// Returns 1 - when type is a frame picture, 0 - otherwise.
+static inline int ff_hevc_sei_pict_struct_is_frame_picture(HEVC_SEI_PicStructType type)
+{
+    return ff_hevc_sei_pict_struct_is_field_picture(type) ? 0 : 1;
+}
 
 typedef struct HEVCSEIPictureHash {
     uint8_t       md5[3][16];
