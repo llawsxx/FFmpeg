@@ -57,28 +57,6 @@
 #endif
 
 
-static enum AVPixelFormat dshow_pixfmt(DWORD biCompression, WORD biBitCount)
-{
-    switch(biCompression) {
-    case BI_BITFIELDS:
-    case BI_RGB:
-        switch(biBitCount) { /* 1-8 are untested */
-            case 1:
-                return AV_PIX_FMT_MONOWHITE;
-            case 4:
-                return AV_PIX_FMT_RGB4;
-            case 8:
-                return AV_PIX_FMT_RGB8;
-            case 16:
-                return AV_PIX_FMT_RGB555;
-            case 24:
-                return AV_PIX_FMT_BGR24;
-            case 32:
-                return AV_PIX_FMT_0RGB32;
-        }
-    }
-    return avpriv_pix_fmt_find(PIX_FMT_LIST_RAW, biCompression); // all others
-}
 
 static enum AVColorRange dshow_color_range(DXVA2_ExtendedFormat *fmt_info)
 {
@@ -677,6 +655,148 @@ struct dshow_format_info {
     int channels;
 };
 
+
+
+static void dshow_set_pix_fmt_and_codec_id(struct dshow_format_info* info, GUID* subtype, DWORD biCompression)
+{
+    const GUID MEDIASUBTYPE_I420 = { 0x30323449,
+                0x0000,
+                0x0010,
+                {0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b,
+                 0x71} };
+
+    const GUID MEDIASUBTYPE_Y800 = { 0x30303859,
+                0x0000,
+                0x0010,
+                {0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b,
+                 0x71} };
+
+    const GUID MEDIASUBTYPE_HEVC = { 0x43564548,
+                0x0000,
+                0x0010,
+                {0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b,
+                 0x71} };
+
+    const GUID MEDIASUBTYPE_H264 = { 0x34363248,
+                0x0000,
+                0x0010,
+                {0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b,
+                 0x71 } };
+
+    const GUID MEDIASUBTYPE_P010 = { '010P',
+                0x0000,
+                0x0010,
+                {0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b,
+                 0x71} };
+
+    enum AVPixelFormat pix_fmt = AV_PIX_FMT_NONE;
+    enum AVCodecID codec_id = AV_CODEC_ID_NONE;
+    /* raw formats */
+    if (IsEqualGUID(subtype, &MEDIASUBTYPE_RGB24))
+        pix_fmt = AV_PIX_FMT_BGR24;
+    else if (IsEqualGUID(subtype, &MEDIASUBTYPE_RGB32))
+        pix_fmt = AV_PIX_FMT_0RGB32;
+    else if (IsEqualGUID(subtype, &MEDIASUBTYPE_ARGB32))
+        pix_fmt = AV_PIX_FMT_RGB32;
+
+    /* planar YUV formats */
+    else if (IsEqualGUID(subtype, &MEDIASUBTYPE_I420))
+        pix_fmt = AV_PIX_FMT_YUV420P;
+    else if (IsEqualGUID(subtype, &MEDIASUBTYPE_IYUV))
+        pix_fmt = AV_PIX_FMT_YUV420P;
+    else if (IsEqualGUID(subtype, &MEDIASUBTYPE_YV12))
+        pix_fmt = AV_PIX_FMT_YUV420P;
+    else if (IsEqualGUID(subtype, &MEDIASUBTYPE_NV12))
+        pix_fmt = AV_PIX_FMT_NV12;
+    else if (IsEqualGUID(subtype, &MEDIASUBTYPE_Y800))
+        pix_fmt = AV_PIX_FMT_GRAY8;
+    else if (IsEqualGUID(subtype, &MEDIASUBTYPE_P010))
+        pix_fmt = AV_PIX_FMT_P010;
+
+    /* packed YUV formats */
+    else if (IsEqualGUID(subtype, &MEDIASUBTYPE_YVYU))
+        pix_fmt = AV_PIX_FMT_YVYU422;
+    else if (IsEqualGUID(subtype, &MEDIASUBTYPE_YUY2))
+        pix_fmt = AV_PIX_FMT_YUYV422;
+    else if (IsEqualGUID(subtype, &MEDIASUBTYPE_UYVY))
+        pix_fmt = AV_PIX_FMT_UYVY422;
+    /* compressed formats */
+    else if (IsEqualGUID(subtype, &MEDIASUBTYPE_H264))
+        codec_id = AV_CODEC_ID_H264;
+    else if (IsEqualGUID(subtype, &MEDIASUBTYPE_HEVC))
+        codec_id = AV_CODEC_ID_HEVC;
+    else if (IsEqualGUID(subtype, &MEDIASUBTYPE_MJPG))
+        codec_id = AV_CODEC_ID_MJPEG;
+    else {
+        switch (biCompression) {
+            /* raw formats */
+        case MKTAG('R', 'G', 'B', '2'):
+            pix_fmt = AV_PIX_FMT_0RGB32;
+            break;
+        case MKTAG('R', 'G', 'B', '4'):
+            pix_fmt = AV_PIX_FMT_0RGB32;
+            break;
+        case MKTAG('A', 'R', 'G', 'B'):
+            pix_fmt = AV_PIX_FMT_RGB32;
+            break;
+
+            /* planar YUV formats */
+        case MKTAG('I', '4', '2', '0'):
+        case MKTAG('I', 'Y', 'U', 'V'):
+            pix_fmt = AV_PIX_FMT_YUV420P;
+            break;
+        case MKTAG('Y', 'V', '1', '2'):
+            pix_fmt = AV_PIX_FMT_YUV420P;
+            break;
+        case MKTAG('N', 'V', '1', '2'):
+            pix_fmt = AV_PIX_FMT_NV12;
+            break;
+        case MKTAG('Y', '8', '0', '0'):
+            pix_fmt = AV_PIX_FMT_GRAY8;
+            break;
+        case MKTAG('P', '0', '1', '0'):
+            pix_fmt = AV_PIX_FMT_P010;
+            break;
+
+            /* packed YUV formats */
+        case MKTAG('Y', 'V', 'Y', 'U'):
+            pix_fmt = AV_PIX_FMT_YVYU422;
+            break;
+        case MKTAG('Y', 'U', 'Y', '2'):
+            pix_fmt = AV_PIX_FMT_YUYV422;
+            break;
+        case MKTAG('U', 'Y', 'V', 'Y'):
+            pix_fmt = AV_PIX_FMT_UYVY422;
+            break;
+        case MKTAG('H', 'D', 'Y', 'C'):
+            pix_fmt = AV_PIX_FMT_UYVY422;
+            break;
+
+            /* compressed formats */
+        case MKTAG('H', '2', '6', '4'):
+            codec_id = AV_CODEC_ID_H264;
+            break;
+        case MKTAG('H', 'E', 'V', 'C'):
+            codec_id = AV_CODEC_ID_HEVC;
+            break;
+
+            /* compressed formats that can automatically create intermediary
+                * filters for decompression */
+        case MKTAG('M', 'J', 'P', 'G'):
+            codec_id = AV_CODEC_ID_MJPEG;
+            break;
+
+        }
+    }
+
+    if (pix_fmt != AV_PIX_FMT_NONE)
+        codec_id = AV_CODEC_ID_RAWVIDEO;
+
+    info->pix_fmt = pix_fmt;
+    info->codec_id = codec_id;
+}
+
+
 // user must av_free the returned pointer
 static struct dshow_format_info *dshow_get_format_info(AM_MEDIA_TYPE *type)
 {
@@ -723,14 +843,7 @@ static struct dshow_format_info *dshow_get_format_info(AM_MEDIA_TYPE *type)
         fmt_info->width = bih->biWidth;
         fmt_info->height = bih->biHeight;
         fmt_info->framerate = framerate;
-        fmt_info->pix_fmt = dshow_pixfmt(bih->biCompression, bih->biBitCount);
-        if (fmt_info->pix_fmt == AV_PIX_FMT_NONE) {
-            const AVCodecTag *const tags[] = { avformat_get_riff_video_tags(), NULL };
-            fmt_info->codec_id = av_codec_get_id(tags, bih->biCompression);
-        }
-        else
-            fmt_info->codec_id = AV_CODEC_ID_RAWVIDEO;
-
+        dshow_set_pix_fmt_and_codec_id(fmt_info, &type->subtype, bih->biCompression);
         if (extended_format_info) {
             fmt_info->col_range = dshow_color_range(extended_format_info);
             fmt_info->col_space = dshow_color_space(extended_format_info);
@@ -1557,7 +1670,6 @@ dshow_add_device(AVFormatContext *avctx,
         par->codec_type = AVMEDIA_TYPE_VIDEO;
         par->width      = fmt_info->width;
         par->height     = fmt_info->height;
-        par->codec_tag  = bih->biCompression;
         par->format     = fmt_info->pix_fmt;
         if (bih->biCompression == MKTAG('H', 'D', 'Y', 'C')) {
             av_log(avctx, AV_LOG_DEBUG, "attempt to use full range for HDYC...\n");
@@ -1570,7 +1682,7 @@ dshow_add_device(AVFormatContext *avctx,
         par->chroma_location = fmt_info->chroma_loc;
         par->codec_id = fmt_info->codec_id;
         if (par->codec_id == AV_CODEC_ID_RAWVIDEO) {
-            if (bih->biCompression == BI_RGB || bih->biCompression == BI_BITFIELDS) {
+            if (par->format == AV_PIX_FMT_BGR24 || par->format == AV_PIX_FMT_0RGB32 || par->format == AV_PIX_FMT_RGB32) {
                 par->bits_per_coded_sample = bih->biBitCount;
                 if (par->height < 0) {
                     par->height *= -1;
@@ -1663,7 +1775,7 @@ static int dshow_read_header(AVFormatContext *avctx)
     HANDLE proc;
     int ret = AVERROR(EIO);
     int r;
-
+    
     ctx->interrupt_callback = avctx->interrupt_callback;
 
     CoInitialize(0);
