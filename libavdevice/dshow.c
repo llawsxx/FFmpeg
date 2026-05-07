@@ -785,7 +785,14 @@ static void dshow_set_pix_fmt_and_codec_id(struct dshow_format_info* info, GUID*
         case MKTAG('M', 'J', 'P', 'G'):
             codec_id = AV_CODEC_ID_MJPEG;
             break;
+        }
+    }
 
+    if(pix_fmt == AV_PIX_FMT_NONE && codec_id == AV_CODEC_ID_NONE){
+        pix_fmt = avpriv_pix_fmt_find(PIX_FMT_LIST_RAW, biCompression); 
+        if (pix_fmt == AV_PIX_FMT_NONE) {
+            const AVCodecTag *const tags[] = { avformat_get_riff_video_tags(), NULL };
+            codec_id = av_codec_get_id(tags, biCompression);
         }
     }
 
