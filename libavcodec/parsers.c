@@ -47,6 +47,7 @@ extern const FFCodecParser ff_apv_parser;
 extern const FFCodecParser ff_av1_parser;
 extern const FFCodecParser ff_avs2_parser;
 extern const FFCodecParser ff_avs3_parser;
+extern const FFCodecParser ff_av3a_parser;
 extern const FFCodecParser ff_bmp_parser;
 extern const FFCodecParser ff_cavsvideo_parser;
 extern const FFCodecParser ff_cook_parser;

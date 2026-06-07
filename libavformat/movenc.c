@@ -74,6 +74,7 @@
 #include "version.h"
 #include "vpcc.h"
 #include "vvc.h"
+#include "libavcodec/av3a.h"
 
 static const AVOption options[] = {
     { "brand",    "Override major brand", offsetof(MOVMuxContext, major_brand),   AV_OPT_TYPE_STRING, {.str = NULL}, .flags = AV_OPT_FLAG_ENCODING_PARAM },
@@ -993,6 +994,76 @@ invalid:
     return update_size(pb, pos);
 }
 
+static int mov_write_dca3_tag(AVFormatContext *s, AVIOContext *pb, MOVTrack *track)
+{
+    int64_t pos = avio_tell(pb);
+    uint8_t buffer[AV3A_DCA3_BOX_MAX_SIZE];
+    PutBitContext pb_dca3;
+    int audio_codec_id, sampling_frequency_index, nn_type, content_type;
+    int channel_number_index, number_objects, hoa_order, resolution_index;
+    int bitrate_kbps;
+
+    if (track->par->extradata_size < 10) {
+        return 0;
+    }
+
+    avio_wb32(pb, 0);         /* Size */
+    ffio_wfourcc(pb, "dca3"); /* Type */
+
+    init_put_bits(&pb_dca3, buffer, AV3A_DCA3_BOX_MAX_SIZE);
+
+    audio_codec_id           = AV_RB8(track->par->extradata  + 0);
+    sampling_frequency_index = AV_RB8(track->par->extradata  + 1);
+    nn_type                  = AV_RB8(track->par->extradata  + 2);
+    content_type             = AV_RB8(track->par->extradata  + 3);
+    channel_number_index     = AV_RB8(track->par->extradata  + 4);
+    number_objects           = AV_RB8(track->par->extradata  + 5);
+    hoa_order                = AV_RB8(track->par->extradata  + 6);
+    resolution_index         = AV_RB8(track->par->extradata  + 7);
+    bitrate_kbps             = AV_RB16(track->par->extradata + 8);
+
+    if (audio_codec_id != AV3A_LOSSY_CODEC_ID) {
+        return AVERROR_INVALIDDATA;
+    }
+    put_bits(&pb_dca3, 4, audio_codec_id);
+    put_bits(&pb_dca3, 4, sampling_frequency_index);
+    put_bits(&pb_dca3, 3, nn_type);
+    put_bits(&pb_dca3, 1, 0); /* reserved */
+    put_bits(&pb_dca3, 4, content_type);
+
+    if (content_type == AV3A_CHANNEL_BASED_TYPE) {
+        put_bits(&pb_dca3, 7, channel_number_index);
+        put_bits(&pb_dca3, 1, 0); /* reserved */
+    } else if (content_type == AV3A_OBJECT_BASED_TYPE) {
+        put_bits(&pb_dca3, 7, number_objects);
+        put_bits(&pb_dca3, 1, 0); /* reserved */
+    } else if (content_type == AV3A_CHANNEL_OBJECT_TYPE) {
+        put_bits(&pb_dca3, 7, channel_number_index);
+        put_bits(&pb_dca3, 1, 0); /* reserved */
+        put_bits(&pb_dca3, 7, number_objects);
+        put_bits(&pb_dca3, 1, 0); /* reserved */
+    } else if (content_type == AV3A_AMBISONIC_TYPE) {
+        put_bits(&pb_dca3, 4, hoa_order);
+    } else {
+        return AVERROR_INVALIDDATA;
+    }
+
+    put_bits(&pb_dca3, 16, bitrate_kbps);
+    put_bits(&pb_dca3, 2, resolution_index);
+
+    if (content_type == AV3A_AMBISONIC_TYPE) {
+        put_bits(&pb_dca3, 2, 0); /* reserved */
+    } else {
+        put_bits(&pb_dca3, 6, 0); /* reserved */
+    }
+
+    flush_put_bits(&pb_dca3);
+    avio_write(pb, buffer, sizeof(buffer));
+
+    return update_size(pb, pos);
+}
+
+
 static int mov_write_chan_tag(AVFormatContext *s, AVIOContext *pb, MOVTrack *track)
 {
     uint32_t layout_tag, bitmap, *channel_desc;
@@ -1510,6 +1581,8 @@ static int mov_write_audio_tag(AVFormatContext *s, AVIOContext *pb, MOVMuxContex
         ret = mov_write_dops_tag(s, pb, track);
     else if (track->par->codec_id == AV_CODEC_ID_TRUEHD)
         ret = mov_write_dmlp_tag(s, pb, track);
+    else if (track->par->codec_id == AV_CODEC_ID_AV3A)
+        ret = mov_write_dca3_tag(s, pb, track);
     else if (tag == MOV_MP4_IPCM_TAG || tag == MOV_MP4_FPCM_TAG) {
         if (track->par->sample_rate > UINT16_MAX)
             mov_write_srat_tag(pb, track);
@@ -9016,6 +9089,7 @@ static const AVCodecTag codec_mp4_tags[] = {
     { AV_CODEC_ID_PCM_F64LE,       MOV_MP4_FPCM_TAG          },
 
     { AV_CODEC_ID_AVS3,            MKTAG('a', 'v', 's', '3') },
+    { AV_CODEC_ID_AV3A,            MKTAG('a', 'v', '3', 'a') },
 
     { AV_CODEC_ID_NONE,               0 },
 };

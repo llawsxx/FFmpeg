@@ -1234,6 +1234,8 @@ OBJS-$(CONFIG_LIBXEVE_ENCODER)            += libxeve.o
 OBJS-$(CONFIG_LIBXVID_ENCODER)            += libxvid.o
 OBJS-$(CONFIG_LIBZVBI_TELETEXT_DECODER)   += libzvbi-teletextdec.o ass.o
 OBJS-$(CONFIG_LIBDRA_DECODER)	       += libdradec.o dradec.o
+OBJS-$(CONFIG_LIBARCDAV3A_DECODER)        += libarcdav3a.o
+
 
 # parsers
 OBJS-$(CONFIG_AAC_LATM_PARSER)         += latm_parser.o
@@ -1247,6 +1249,7 @@ OBJS-$(CONFIG_APV_PARSER)              += apv_parser.o
 OBJS-$(CONFIG_AV1_PARSER)              += av1_parser.o av1_parse.o
 OBJS-$(CONFIG_AVS2_PARSER)             += avs2.o avs2_parser.o
 OBJS-$(CONFIG_AVS3_PARSER)             += avs3_parser.o
+OBJS-$(CONFIG_AV3A_PARSER)             += av3a_parser.o
 OBJS-$(CONFIG_BMP_PARSER)              += bmp_parser.o
 OBJS-$(CONFIG_CAVSVIDEO_PARSER)        += cavs_parser.o
 OBJS-$(CONFIG_COOK_PARSER)             += cook_parser.o

@@ -346,6 +346,7 @@ External library support:
   --enable-whisper         enable whisper filter [no]
   --disable-xlib           disable xlib [autodetect]
   --disable-zlib           disable zlib [autodetect]
+  --enable-libarcdav3a     enable AV3A decoding via ArcVideo AV3A [no]
 
   The following libraries provide various hardware acceleration features:
   --disable-amf            disable AMF video encoding code [autodetect]
@@ -2121,6 +2122,7 @@ EXTERNAL_LIBRARY_LIST="
     openssl
     pocketsphinx
     vapoursynth
+    libarcdav3a
     vulkan_static
     whisper
 "
@@ -3855,6 +3857,8 @@ vapoursynth_demuxer_deps="vapoursynth"
 videotoolbox_suggest="coreservices"
 videotoolbox_deps="corefoundation coremedia corevideo VTDecompressionSessionDecodeFrame"
 videotoolbox_encoder_deps="videotoolbox VTCompressionSessionPrepareToEncodeFrames"
+libarcdav3a_decoder_deps="libarcdav3a"
+libarcdav3a_decoder_extralibs="-lAVS3AudioDec"
 
 # demuxers / muxers
 ac3_demuxer_select="ac3_parser"

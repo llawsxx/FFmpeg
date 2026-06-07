@@ -147,6 +147,21 @@ const FFOutputFormat ff_avs3_muxer = {
 };
 #endif
 
+#if CONFIG_AV3A_MUXER
+const FFOutputFormat ff_av3a_muxer = {
+    .p.name            = "av3a",
+    .p.long_name       = NULL_IF_CONFIG_SMALL("AV3A audio vivid"),
+    .p.extensions      = "av3a",
+    .p.audio_codec     = AV_CODEC_ID_AV3A,
+    .p.video_codec     = AV_CODEC_ID_NONE,
+    .p.subtitle_codec  = AV_CODEC_ID_NONE,
+    .flags_internal    = FF_OFMT_FLAG_MAX_ONE_OF_EACH |
+                         FF_OFMT_FLAG_ONLY_DEFAULT_CODECS,
+    .write_packet      = ff_raw_write_packet,
+    .p.flags           = AVFMT_NOTIMESTAMPS,
+};
+#endif
+
 
 #if CONFIG_CAVSVIDEO_MUXER
 const FFOutputFormat ff_cavsvideo_muxer = {
