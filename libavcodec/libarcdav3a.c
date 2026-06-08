@@ -339,21 +339,21 @@ static int arcdav3a_decode_frame(AVCodecContext *avctx, AVFrame *frm, int *got_f
 			    frm->ch_layout = (AVChannelLayout)AV_CHANNEL_LAYOUT_MONO;// need set frame->ch_payout to frame ch_out verification
 			else if(h->out_frame.nChannel == 2)
 			    frm->ch_layout = (AVChannelLayout)AV_CHANNEL_LAYOUT_STEREO;// need set frame->ch_payout to frame ch_out verification
-			else if(chconf == CHANNEL_CONFIG_MC_5_1_4 && h->out_frame.nChannel == 10)
+			else if(chconf == CHANNEL_CONFIG_MC_5_1_4 && h->out_frame.nChannel >= 10)
 			    frm->ch_layout = (AVChannelLayout)AV_CHANNEL_LAYOUT_5POINT1POINT4_BACK;
-			else if(chconf == CHANNEL_CONFIG_MC_7_1_2 && h->out_frame.nChannel == 10)
+			else if(chconf == CHANNEL_CONFIG_MC_7_1_2 && h->out_frame.nChannel >= 10)
 			    frm->ch_layout = (AVChannelLayout)AV_CHANNEL_LAYOUT_7POINT1POINT2;
-			else if(chconf == CHANNEL_CONFIG_MC_7_1_4 && h->out_frame.nChannel == 12)
+			else if(chconf == CHANNEL_CONFIG_MC_7_1_4 && h->out_frame.nChannel >= 12)
 			    frm->ch_layout = (AVChannelLayout)AV_CHANNEL_LAYOUT_7POINT1POINT4_BACK;
 			else if(chconf == CHANNEL_CONFIG_HOA_ORDER3 && h->out_frame.nChannel == 16)
 			    frm->ch_layout = (AVChannelLayout)AV_CHANNEL_LAYOUT_HEXADECAGONAL;
 			else if(chconf == CHANNEL_CONFIG_UNKNOWN)//error
-			    av_log(avctx, AV_LOG_ERROR, "unknown audio chconf! Please check the source...\n");
+			av_log(avctx, AV_LOG_ERROR, "unknown audio chconf! Please check the source...\n");
+			frm->ch_layout.nb_channels = h->out_frame.nChannel;// set correct channel, OTHERWISE will crash when 声床+对象方式没有render成2声道的情况
             avctx->ch_layout  = frm->ch_layout;//need reset avctx->ch_layout for ff_get_buffer to get correct size
-			avctx->ch_layout.nb_channels = h->out_frame.nChannel;
 			avctx->sample_rate = frm->sample_rate;
 
-			av_log(avctx, AV_LOG_DEBUG, " before ff_get_buffer! h->out_frame.nlen %ld\n frm->nb_samples", h->out_frame.nlen, frm->nb_samples);
+			av_log(avctx, AV_LOG_DEBUG, " before ff_get_buffer! h->out_frame.nlen %ld frm->nb_samples %d\n", h->out_frame.nlen, frm->nb_samples);
 			ret = ff_get_buffer(avctx, frm, 0);//will copy frm->ch_layout from avctx->ch_layout
 			if (ret < 0){
 				av_log(avctx, AV_LOG_DEBUG, "ff_get_buffer error!\n");
