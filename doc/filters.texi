@@ -14699,6 +14699,89 @@ ffmpeg -i LEFT -i RIGHT -filter_complex framepack=frameseq OUTPUT
 ffmpeg -i LEFT -i RIGHT -filter_complex [0:v]scale=w=iw/2[left],[1:v]scale=w=iw/2[right],[left][right]framepack=sbs OUTPUT
 @end example
 
+@section framealign
+
+Align two video streams by searching for the pair of frame sequences with the
+highest average similarity. The filter has two video inputs, @code{main} and
+@code{reference}. By default it has two corresponding outputs with the same
+names. When @code{ref_uv} is enabled, only the combined @code{main} output is
+exposed. Frames before the selected alignment are discarded. Once locked, a
+small local search is used to detect drift; a failed local check restarts the
+full search.
+
+The supported options are:
+
+@table @option
+@item buffer
+Number of frames to retain from each input before a full search. The default is
+@code{100}.
+
+@item window
+Number of consecutive frame pairs scored by each candidate. The default is
+@code{25}.
+
+@item locked_window
+Number of consecutive frame pairs checked after alignment has been found. The
+default is @code{5}. The locked-state target buffer is
+@code{locked_window + refine}; this option can reduce steady-state latency
+without weakening the larger initial search window.
+
+@item refine
+Number of frames around the current position considered during the locked
+state. The default is @code{5}.
+
+@item metric
+Similarity metric, either @code{ssim} (the default) or @code{psnr}. PSNR
+thresholds are expressed in dB; SSIM thresholds range from -1 to 1.
+
+@item threshold
+Minimum average score required to accept an alignment. The default is
+@code{0.90}.
+
+@item fail_action
+Action after @code{max_searches} unsuccessful searches: @code{error} (the
+default), @code{warn}, or @code{pass}. The latter two pass paired frames
+through; @code{warn} emits a warning.
+
+@item max_searches
+Number of unsuccessful full searches allowed before @code{fail_action} is
+applied. @code{0} means unlimited. The default is @code{10}.
+
+@item sample_w, sample_h
+Size of the luma fingerprint used during scoring. The defaults are @code{32}
+and @code{18}. The original frames are emitted unchanged unless @code{ref_uv}
+is enabled.
+
+@item ref_uv
+Optionally replace chroma in the @code{main} output with chroma from the
+aligned @code{reference} frame. Supported values are @code{none} (the
+default), @code{top}, @code{bottom}, and @code{all}. @code{top} copies even
+rows of both reference chroma planes, while @code{bottom} copies odd rows;
+the other rows and the complete luma plane remain from @code{main}.
+@code{all} copies both complete reference chroma planes. This option requires
+a planar YUV format with separate U and V planes. When this option is not
+@code{none}, the filter exposes only the combined @code{main} output. With
+@code{none}, it exposes both @code{main} and @code{reference} outputs.
+@end table
+
+Each output frame receives @code{lavfi.framealign.score} and
+@code{lavfi.framealign.aligned} metadata.
+
+@example
+ffmpeg -i main.mkv -i reference.mkv -filter_complex \
+  "[0:v][1:v]framealign=buffer=100:window=25:threshold=0.92[a][b]" \
+  -map "[a]" main-aligned.mkv -map "[b]" reference-aligned.mkv
+@end example
+
+Combine main luma and top-field chroma with bottom-field reference chroma,
+producing a single output:
+@example
+ffmpeg -i main.mkv -i reference.mkv -filter_complex \
+  "[0:v]format=yuv422p[m];[1:v]format=yuv422p[r];\
+   [m][r]framealign=ref_uv=bottom[out]" \
+  -map "[out]" combined.mkv
+@end example
+
 @section framerate
 
 Change the frame rate by interpolating new video output frames from the source
