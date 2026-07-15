@@ -300,6 +300,7 @@ extern const FFFilter ff_vf_format;
 extern const FFFilter ff_vf_fps;
 extern const FFFilter ff_vf_fps_smooth;
 extern const FFFilter ff_vf_framepack;
+extern const FFFilter ff_vf_framealign;
 extern const FFFilter ff_vf_framerate;
 extern const FFFilter ff_vf_framestep;
 extern const FFFilter ff_vf_freezedetect;
