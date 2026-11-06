@@ -31,6 +31,7 @@
 #include "libavutil/avassert.h"
 #include "libavutil/common.h"
 #include "libavutil/frame.h"
+#include "libavutil/framepool.h"
 #include "libavutil/intreadwrite.h"
 #include "libavutil/log.h"
 #include "libavutil/mem_internal.h"
@@ -40,7 +41,7 @@
 #include "libavutil/half2float.h"
 
 #if HAVE_ALTIVEC
-#define SWSINTERNAL_ADDITIONAL_ASM_SIZE (7*16 + 2*8 + /* alignment */ 16)
+#define SWSINTERNAL_ADDITIONAL_ASM_SIZE (7*16 + /* alignment */ 16)
 #endif
 #ifndef SWSINTERNAL_ADDITIONAL_ASM_SIZE
 #define SWSINTERNAL_ADDITIONAL_ASM_SIZE 0
@@ -79,6 +80,8 @@ static inline SwsInternal *sws_internal(const SwsContext *sws)
 {
     return (SwsInternal *) sws;
 }
+
+SwsBackend ff_sws_enabled_backends(const SwsContext *ctx);
 
 typedef struct Range {
     unsigned int start;
@@ -340,7 +343,6 @@ struct SwsInternal {
 
     AVSliceThread      *slicethread;
     SwsContext        **slice_ctx;
-    int                *slice_err;
     int              nb_slice_ctx;
 
     /* Scaling graph, reinitialized dynamically as needed. */
@@ -548,11 +550,12 @@ struct SwsInternal {
 
     const uint8_t *chrDither8, *lumDither8;
 
+#if HAVE_ALTIVEC
+    int16_t (*vYCoeffsBank)[8], (*vCCoeffsBank)[8];
+#endif
+
     int use_mmx_vfilter;
 
-/* pre defined color-spaces gamma */
-#define XYZ_GAMMA (2.6)
-#define RGB_GAMMA (2.2)
     SwsColorFunc  xyz12Torgb48;
     SwsColorFunc  rgb48Toxyz12;
     SwsColorXform xyz2rgb;
@@ -699,6 +702,8 @@ struct SwsInternal {
     void *hw_priv; /* refstruct */
 
     int is_legacy_init;
+
+    FFFramePool frame_pool; /* for sws_scale_frame() data allocations */
 };
 //FIXME check init (where 0)
 
@@ -718,6 +723,8 @@ int ff_yuv2rgb_c_init_tables(SwsInternal *c, const int inv_table[4],
                              int contrast, int saturation);
 void ff_yuv2rgb_init_tables_ppc(SwsInternal *c, const int inv_table[4],
                                 int brightness, int contrast, int saturation);
+void ff_yuv2rgb_init_tables_altivec(SwsInternal *c, const int inv_table[4],
+                                    int brightness, int contrast, int saturation);
 
 void ff_updateMMXDitherTables(SwsInternal *c, int dstY);
 
@@ -732,10 +739,11 @@ av_cold void ff_sws_init_range_convert_x86(SwsInternal *c);
 av_cold void ff_sws_init_xyzdsp(SwsInternal *c);
 av_cold void ff_sws_init_xyzdsp_aarch64(SwsInternal *c);
 
-av_cold int ff_sws_fill_xyztables(SwsInternal *c);
+av_cold int ff_sws_fill_st428_tables(SwsInternal *c);
 
 SwsFunc ff_yuv2rgb_init_x86(SwsInternal *c);
 SwsFunc ff_yuv2rgb_init_ppc(SwsInternal *c);
+SwsFunc ff_yuv2rgb_init_altivec(SwsInternal *c);
 SwsFunc ff_yuv2rgb_init_loongarch(SwsInternal *c);
 SwsFunc ff_yuv2rgb_init_aarch64(SwsInternal *c);
 
@@ -1007,8 +1015,10 @@ int ff_sws_init_single_context(SwsContext *sws, SwsFilter *srcFilter,
  */
 void ff_get_unscaled_swscale(SwsInternal *c);
 void ff_get_unscaled_swscale_ppc(SwsInternal *c);
+void ff_get_unscaled_swscale_altivec(SwsInternal *c);
 void ff_get_unscaled_swscale_arm(SwsInternal *c);
 void ff_get_unscaled_swscale_aarch64(SwsInternal *c);
+void ff_get_unscaled_swscale_loongarch(SwsInternal *c);
 
 void ff_sws_init_scale(SwsInternal *c);
 
@@ -1028,6 +1038,7 @@ void ff_sws_init_output_funcs(SwsInternal *c,
                               yuv2packedX_fn *yuv2packedX,
                               yuv2anyX_fn *yuv2anyX);
 void ff_sws_init_swscale_ppc(SwsInternal *c);
+void ff_sws_init_swscale_altivec(SwsInternal *c);
 void ff_sws_init_swscale_vsx(SwsInternal *c);
 void ff_sws_init_swscale_x86(SwsInternal *c);
 void ff_sws_init_swscale_aarch64(SwsInternal *c);
@@ -1184,13 +1195,21 @@ void ff_init_vscale_pfn(SwsInternal *c, yuv2planar1_fn yuv2plane1, yuv2planarX_f
     yuv2interleavedX_fn yuv2nv12cX, yuv2packed1_fn yuv2packed1, yuv2packed2_fn yuv2packed2,
     yuv2packedX_fn yuv2packedX, yuv2anyX_fn yuv2anyX, int use_mmx);
 
-void ff_sws_slice_worker(void *priv, int jobnr, int threadnr,
-                         int nb_jobs, int nb_threads);
+int ff_sws_slice_worker(void *priv, int jobnr, int threadnr,
+                        int nb_jobs, int nb_threads);
 
 int ff_swscale(SwsInternal *c, const uint8_t *const src[], const int srcStride[],
                int srcSliceY, int srcSliceH, uint8_t *const dst[],
                const int dstStride[], int dstSliceY, int dstSliceH);
 
+/**
+ * Helper for dispatching a single function across multiple threads. This is
+ * a wrapper around avpriv_slicethread_create2() + avpriv_slicethread_execute2(),
+ * falling back to direct invocation if threading is not available.
+ */
+int ff_sws_thread_exec(void *priv,
+                       int (*func)(void *priv, int jobnr, int threadnr, int nb_jobs, int nb_threads),
+                       int nb_threads, int nb_jobs);
 
 //number of extra lines to process
 #define MAX_LINES_AHEAD 4

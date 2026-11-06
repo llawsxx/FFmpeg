@@ -59,12 +59,17 @@ static av_cold int init_filter(AVFilterContext *ctx)
         goto fail;
     }
 
-    RET(ff_vk_exec_pool_init(vkctx, s->qf, &s->e, s->qf->num*4, 0, 0, 0, NULL));
+    RET(ff_vk_exec_pool_init(vkctx, s->qf, &s->e, FF_VK_DEFAULT_EXEC_CONTEXTS, 0, 0, 0, NULL));
 
     ff_vk_shader_load(&s->shd, VK_SHADER_STAGE_COMPUTE_BIT, NULL,
                       (uint32_t [3]) { 1, 64, planes }, 0);
 
     const FFVulkanDescriptorSetBinding desc_set[] = {
+        { /* dst */
+            .type   = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+            .stages = VK_SHADER_STAGE_COMPUTE_BIT,
+            .elems  = planes,
+        },
         { /* prev */
             .type   = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
             .stages = VK_SHADER_STAGE_COMPUTE_BIT,
@@ -80,13 +85,8 @@ static av_cold int init_filter(AVFilterContext *ctx)
             .stages = VK_SHADER_STAGE_COMPUTE_BIT,
             .elems  = planes,
         },
-        { /* dst */
-            .type   = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
-            .stages = VK_SHADER_STAGE_COMPUTE_BIT,
-            .elems  = planes,
-        },
     };
-    ff_vk_shader_add_descriptor_set(vkctx, &s->shd, desc_set, 4, 0, 0);
+    ff_vk_shader_add_descriptor_set(vkctx, &s->shd, desc_set, 4, 0);
 
     ff_vk_shader_add_push_const(&s->shd, 0, sizeof(BWDIFParameters),
                                 VK_SHADER_STAGE_COMPUTE_BIT);
@@ -102,8 +102,8 @@ fail:
     return err;
 }
 
-static void bwdif_vulkan_filter_frame(AVFilterContext *ctx, AVFrame *dst,
-                                      int parity, int tff)
+static int bwdif_vulkan_filter_frame(AVFilterContext *ctx, AVFrame *dst,
+                                     int parity, int tff)
 {
     BWDIFVulkanContext *s = ctx->priv;
     YADIFContext *y = &s->yadif;
@@ -112,13 +112,16 @@ static void bwdif_vulkan_filter_frame(AVFilterContext *ctx, AVFrame *dst,
         .tff = tff,
         .current_field = y->current_field,
     };
+    int ret;
 
-    ff_vk_filter_process_Nin(&s->vkctx, &s->e, &s->shd, dst,
-                             (AVFrame *[]){ y->prev, y->cur, y->next }, 3,
-                             VK_NULL_HANDLE, &params, sizeof(params));
+    ret = ff_vk_filter_process_Nin(&s->vkctx, &s->e, &s->shd, dst,
+                                   (AVFrame *[]){ y->prev, y->cur, y->next }, 3,
+                                   VK_NULL_HANDLE, 1, &params, sizeof(params));
 
     if (y->current_field == YADIF_FIELD_END)
         y->current_field = YADIF_FIELD_NORMAL;
+
+    return ret;
 }
 
 static void bwdif_vulkan_uninit(AVFilterContext *avctx)

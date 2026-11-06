@@ -18,10 +18,12 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
-#include "bsf.h"
-#include "bsf_internal.h"
-#include "cbs.h"
-#include "cbs_av1.h"
+#include "libavcodec/bsf.h"
+#include "libavcodec/bsf_internal.h"
+#include "libavcodec/cbs.h"
+#include "libavcodec/cbs_av1.h"
+
+#define MAX_TU_OBUS (1 << 16)
 
 typedef struct AV1FMergeContext {
     CodedBitstreamContext *input;
@@ -67,6 +69,12 @@ static int av1_frame_merge_filter(AVBSFContext *bsf, AVPacket *out)
         goto fail;
     }
 
+    if (frag->nb_units > MAX_TU_OBUS) {
+        av_log(bsf, AV_LOG_ERROR, "Too many OBUs in a Temporal Unit.\n");
+        err = AVERROR_INVALIDDATA;
+        goto fail;
+    }
+
     if (tu->nb_units == 0 && frag->units[0].type != AV1_OBU_TEMPORAL_DELIMITER) {
         av_log(bsf, AV_LOG_ERROR, "Missing Temporal Delimiter.\n");
         err = AVERROR_INVALIDDATA;
@@ -93,6 +101,11 @@ eof:
         // Swap fragment index, to avoid copying fragment references.
         ctx->idx = !ctx->idx;
     } else {
+        if (tu->nb_units + frag->nb_units > MAX_TU_OBUS) {
+            av_log(bsf, AV_LOG_ERROR, "Too many OBUs in a Temporal Unit.\n");
+            err = AVERROR_INVALIDDATA;
+            goto fail;
+        }
         for (i = 0; i < frag->nb_units; i++) {
             err = ff_cbs_insert_unit_content(tu, -1, frag->units[i].type,
                                              frag->units[i].content, frag->units[i].content_ref);

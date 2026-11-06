@@ -40,6 +40,7 @@
 #include <inttypes.h>
 #include <time.h>
 
+#include "libavutil/attributes.h"
 #include "libavutil/attributes_internal.h"
 #include "libavutil/mem.h"
 #include "libavutil/opt.h"
@@ -54,7 +55,7 @@
 #include "libavcodec/golomb.h"
 #include "libavcodec/h264.h"
 #include "libavcodec/jpeg2000.h"
-#include "libavcodec/packet_internal.h"
+#include "packet_internal.h"
 #include "libavcodec/rangecoder.h"
 #include "libavcodec/startcode.h"
 #include "avformat.h"
@@ -117,6 +118,7 @@ typedef struct MXFStreamContext {
     int max_gop;             ///< maximum gop size, used by mpeg-2 descriptor
     int b_picture_count;     ///< maximum number of consecutive b pictures, used in mpeg-2 descriptor
     int low_delay;           ///< low delay, used in mpeg-2 descriptor
+    int version;             ///< format version, used in ffv1 descriptor
     int micro_version;       ///< format micro_version, used in ffv1 descriptor
     j2k_info_t j2k_info;
     enum MXFMetadataSetType sub_descriptor;
@@ -1257,6 +1259,7 @@ static int64_t mxf_write_generic_picture_desc(AVFormatContext *s, AVStream *st)
         if (sc->cid < 1270) // DNxHD
             break;
         // fall for DNxHR RI rasters
+        av_fallthrough;
     case AV_CODEC_ID_MPEG2VIDEO:
     case AV_CODEC_ID_H264:
         //Based on 16x16 macroblocks
@@ -1631,7 +1634,7 @@ static void mxf_write_ffv1_subdesc(AVFormatContext *s, AVStream *st)
     }
 
     mxf_write_local_tag(s, 2, 0xDFDA);
-    avio_wb16(pb, (*sc->codec_ul)[14]); // FFV1Version
+    avio_wb16(pb, sc->version); // FFV1Version
 
     if (st->codecpar->extradata_size) {
         mxf_write_local_tag(s, 2, 0xDFD9);
@@ -2674,8 +2677,7 @@ static int mxf_parse_ffv1_frame(AVFormatContext *s, AVStream *st, AVPacket *pkt)
         ff_init_range_decoder(&c, st->codecpar->extradata, st->codecpar->extradata_size);
         ff_build_rac_states(&c, 0.05 * (1LL << 32), 256 - 8);
         v = get_ffv1_unsigned_symbol(&c, state);
-        av_assert0(v >= 2);
-        if (v > 4) {
+        if (v < 2 || v > 4) {
             av_log(s, AV_LOG_ERROR, "unsupported ffv1 version %d\n", v);
             return 0;
         }
@@ -2686,8 +2688,10 @@ static int mxf_parse_ffv1_frame(AVFormatContext *s, AVStream *st, AVPacket *pkt)
         ff_build_rac_states(&c, 0.05 * (1LL << 32), 256 - 8);
         get_rac(&c, &keystate); // keyframe
         v = get_ffv1_unsigned_symbol(&c, state);
-        av_assert0(v < 2);
+        if (v >= 2)
+            return 0;
     }
+    sc->version = v;
     sc->codec_ul = &mxf_ffv1_codec_uls[v];
     sc->sub_descriptor = FFV1SubDescriptor;
 
@@ -3046,6 +3050,11 @@ static int mxf_init(AVFormatContext *s)
                 if (st->codecpar->codec_id != AV_CODEC_ID_PCM_S16LE &&
                     st->codecpar->codec_id != AV_CODEC_ID_PCM_S24LE) {
                     av_log(s, AV_LOG_ERROR, "MXF D-10 only support 16 or 24 bits le audio\n");
+                    return AVERROR_PATCHWELCOME;
+                }
+                if (st->codecpar->ch_layout.nb_channels > 8) {
+                    av_log(s, AV_LOG_ERROR, "MXF D-10 supports at most 8 audio channels\n");
+                    return AVERROR(EINVAL);
                 }
                 sc->index = INDEX_D10_AUDIO;
                 sc->container_ul = ((MXFStreamContext*)s->streams[0]->priv_data)->container_ul;
@@ -3594,7 +3603,7 @@ static int mxf_interleave_get_packet(AVFormatContext *s, AVPacket *out, int flus
 
         if (ffstream(s->streams[pktl->pkt.stream_index])->last_in_packet_buffer == pktl)
             ffstream(s->streams[pktl->pkt.stream_index])->last_in_packet_buffer = NULL;
-        avpriv_packet_list_get(&si->packet_buffer, out);
+        ff_packet_list_get(&si->packet_buffer, out);
         av_log(s, AV_LOG_TRACE, "out st:%d dts:%"PRId64"\n", out->stream_index, out->dts);
         return 1;
     } else {

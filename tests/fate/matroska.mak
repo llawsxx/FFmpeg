@@ -122,6 +122,19 @@ FATE_MATROSKA_FFMPEG_FFPROBE-$(call REMUX, MATROSKA, MOV_DEMUXER     \
                                += fate-matroska-dovi-write-config8
 fate-matroska-dovi-write-config8: CMD = transcode mov $(TARGET_SAMPLES)/hevc/dv84.mov matroska "-c copy" "-map 0 -c copy -t 0.4" "-show_entries stream_side_data_list -select_streams v"
 
+# These tests check that Dolby Vision Profile 7 dual-layer content is correctly
+# handled: both the dvcC BlockAdditionMapping and the hvcE BlockAdditionMapping
+# (carrying the enhancement-layer HEVCDecoderConfigurationRecord) must survive
+# remux. Two source formats are tested: MP4 (hvcE box) and Matroska (hvcE
+# BlockAdditionMapping).
+FATE_MATROSKA_FFMPEG_FFPROBE-$(call REMUX, MATROSKA, MOV_DEMUXER HEVC_DECODER) \
+                               += fate-matroska-dovi-hvce-mp4-to-mkv
+fate-matroska-dovi-hvce-mp4-to-mkv: CMD = transcode mov $(TARGET_SAMPLES)/mov/dovi-p7-hvce.mp4 matroska "-map 0 -c copy" "-map 0 -c copy" "-show_entries stream_side_data_list -select_streams v"
+
+FATE_MATROSKA_FFMPEG_FFPROBE-$(call REMUX, MATROSKA, MATROSKA_DEMUXER HEVC_DECODER) \
+                               += fate-matroska-dovi-hvce-mkv-to-mkv
+fate-matroska-dovi-hvce-mkv-to-mkv: CMD = transcode matroska $(TARGET_SAMPLES)/mkv/dovi-p7-hvce.mkv matroska "-map 0 -c copy" "-map 0 -c copy" "-show_entries stream_side_data_list -select_streams v"
+
 # This tests the scenario like tickets #4536, #5784 where
 # the first packet (with the overall lowest dts) is a video packet,
 # whereas an audio packet to be muxed later has the overall lowest pts
@@ -258,6 +271,10 @@ fate-matroska-stereo_mode: CMD = transcode ogg $(TARGET_SAMPLES)/vp3/offset_test
     "-map 0 -c copy" \
     "-show_entries stream_disposition=default,original,dub:stream_tags:stream_side_data_list"
 
+# This tests that the matroska demuxer properly scales timestamps and durations using the Track Timescale element
+FATE_MATROSKA-$(call FRAMECRC, MATROSKA) += fate-matroska-track-timescale
+fate-matroska-track-timescale: CMD = framecrc -i $(TARGET_SAMPLES)/mkv/tts10.mkv -c:s copy
+
 
 # The following test tests the various flavours of WebVTT in WebM.
 # It also tests that dispositions not supported by WebM are not written
@@ -275,14 +292,110 @@ FATE_MATROSKA_FFMPEG_FFPROBE-$(call REMUX, MATROSKA, VP9_DECODER VP9_PARSER) \
                                += fate-matroska-hdr10-plus-remux
 fate-matroska-hdr10-plus-remux: CMD = transcode webm $(TARGET_SAMPLES)/mkv/hdr10_plus_vp9_sample.webm matroska "-map 0 -c:v copy" "-map 0 -c:v copy" "-show_packets"
 
+FATE_MATROSKA_FFPROBE-$(call ALLYES, MATROSKA_DEMUXER HEVC_DECODER) += fate-matroska-dovi-hvce-mkv-read
+fate-matroska-dovi-hvce-mkv-read: CMD = run ffprobe$(PROGSSUF)$(EXESUF) -show_entries stream_side_data_list -select_streams v -v 0 $(TARGET_SAMPLES)/mkv/dovi-p7-hvce.mkv
+
 fate-matroska-side-data-pref-codec: CMD = run ffprobe$(PROGSSUF)$(EXESUF) $(TARGET_SAMPLES)/mkv/hdr10tags-both.mkv \
     -select_streams v:0 -show_streams -show_frames -show_entries stream=stream_side_data:frame=frame_side_data_list
 fate-matroska-side-data-pref-packet: CMD = run ffprobe$(PROGSSUF)$(EXESUF) $(TARGET_SAMPLES)/mkv/hdr10tags-both.mkv \
     -select_streams v:0 -show_streams -show_frames -show_entries stream=stream_side_data:frame=frame_side_data_list -side_data_prefer_packet mastering_display_metadata,content_light_level
 FATE_MATROSKA_FFPROBE-$(call ALLYES, MATROSKA_DEMUXER HEVC_DECODER) += fate-matroska-side-data-pref-codec fate-matroska-side-data-pref-packet
 
+FATE_MATROSKA_FFMPEG_FFPROBE-$(call TRANSCODE, MPEG2VIDEO HEVC, NUT MATROSKA, SCALE_FILTER) += fate-matroska-reenc-delete-metadata
+fate-matroska-reenc-delete-metadata: CMD = transcode matroska $(TARGET_SAMPLES)/mkv/hdr10tags-both.mkv nut "-map 0:v:0 -vf scale=iw:ih -c:v mpeg2video -bitexact" "-c copy -t 0.1" "-show_entries format_tags:stream_tags" "" "" "" null
+
+FATE_MATROSKA_FFMPEG_FFPROBE-$(call TRANSCODE, MPEG2VIDEO HEVC, NUT MATROSKA, SCALE_FILTER) += fate-matroska-reenc-delete-metadata-keep
+fate-matroska-reenc-delete-metadata-keep: CMD = transcode matroska $(TARGET_SAMPLES)/mkv/hdr10tags-both.mkv nut "-map 0:v:0 -vf scale=iw:ih -c:v mpeg2video -bitexact -keep_metadata NUMBER_OF_BYTES" "-c copy -t 0.1" "-show_entries format_tags:stream_tags" "" "" "" null
+
+# :s:a:0 specifier — no audio stream in output, so NUMBER_OF_BYTES should still be deleted
+FATE_MATROSKA_FFMPEG_FFPROBE-$(call TRANSCODE, MPEG2VIDEO HEVC, NUT MATROSKA, SCALE_FILTER) += fate-matroska-reenc-delete-audio-metadata
+fate-matroska-reenc-delete-audio-metadata: CMD = transcode matroska $(TARGET_SAMPLES)/mkv/hdr10tags-both.mkv nut "-map 0:v:0 -vf scale=iw:ih -c:v mpeg2video -bitexact -keep_metadata:s:a:0 NUMBER_OF_BYTES" "-c copy -t 0.1" "-show_entries format_tags:stream_tags" "" "" "" null
+
+# :s:v specifier matches the re-encoded video stream — NUMBER_OF_BYTES should be kept
+FATE_MATROSKA_FFMPEG_FFPROBE-$(call TRANSCODE, MPEG2VIDEO HEVC, NUT MATROSKA, SCALE_FILTER) += fate-matroska-reenc-delete-metadata-keep-stream-video
+fate-matroska-reenc-delete-metadata-keep-stream-video: CMD = transcode matroska $(TARGET_SAMPLES)/mkv/hdr10tags-both.mkv nut "-map 0:v:0 -vf scale=iw:ih -c:v mpeg2video -bitexact -keep_metadata:s:v NUMBER_OF_BYTES" "-c copy -t 0.1" "-show_entries format_tags:stream_tags" "" "" "" null
+
+# suffixed key (NUMBER_OF_BYTES-eng) as seen in metadata output must also work as a keep arg
+FATE_MATROSKA_FFMPEG_FFPROBE-$(call TRANSCODE, MPEG2VIDEO HEVC, NUT MATROSKA, SCALE_FILTER) += fate-matroska-reenc-delete-metadata-keep-stream-video-suffix
+fate-matroska-reenc-delete-metadata-keep-stream-video-suffix: CMD = transcode matroska $(TARGET_SAMPLES)/mkv/hdr10tags-both.mkv nut "-map 0:v:0 -vf scale=iw:ih -c:v mpeg2video -bitexact -keep_metadata:s:v NUMBER_OF_BYTES-eng" "-c copy -t 0.1" "-show_entries format_tags:stream_tags" "" "" "" null
+
+# an arbitrary prefix of a family name (NUMBER) must not match NUMBER_OF_BYTES or NUMBER_OF_BYTES-eng
+FATE_MATROSKA_FFMPEG_FFPROBE-$(call TRANSCODE, MPEG2VIDEO HEVC, NUT MATROSKA, SCALE_FILTER) += fate-matroska-reenc-delete-metadata-keep-prefix-nomatch
+fate-matroska-reenc-delete-metadata-keep-prefix-nomatch: CMD = transcode matroska $(TARGET_SAMPLES)/mkv/hdr10tags-both.mkv nut "-map 0:v:0 -vf scale=iw:ih -c:v mpeg2video -bitexact -keep_metadata:s:v NUMBER" "-c copy -t 0.1" "-show_entries format_tags:stream_tags" "" "" "" null
+
+# :s:v:1 specifier — video index 1 does not exist, so NUMBER_OF_BYTES should be deleted
+FATE_MATROSKA_FFMPEG_FFPROBE-$(call TRANSCODE, MPEG2VIDEO HEVC, NUT MATROSKA, SCALE_FILTER) += fate-matroska-reenc-delete-metadata-keep-stream-video1
+fate-matroska-reenc-delete-metadata-keep-stream-video1: CMD = transcode matroska $(TARGET_SAMPLES)/mkv/hdr10tags-both.mkv nut "-map 0:v:0 -vf scale=iw:ih -c:v mpeg2video -bitexact -keep_metadata:s:v:1 NUMBER_OF_BYTES" "-c copy -t 0.1" "-show_entries format_tags:stream_tags" "" "" "" null
+
+# -metadata:s:a:0 specifier must not suppress deletion on a non-matching (video) stream
+FATE_MATROSKA_FFMPEG_FFPROBE-$(call TRANSCODE, MPEG2VIDEO HEVC, NUT MATROSKA, SCALE_FILTER) += fate-matroska-reenc-delete-metadata-spec-scope
+fate-matroska-reenc-delete-metadata-spec-scope: CMD = transcode matroska $(TARGET_SAMPLES)/mkv/hdr10tags-both.mkv nut "-map 0:v:0 -vf scale=iw:ih -c:v mpeg2video -bitexact -metadata:s:a:0 NUMBER_OF_BYTES=custom" "-c copy -t 0.1" "-show_entries format_tags:stream_tags" "" "" "" null
+
+# stale stream tags must be pruned even for filter outputs (no ost->ist)
+FATE_MATROSKA_FFMPEG_FFPROBE-$(call TRANSCODE, MPEG2VIDEO HEVC, NUT MATROSKA, SCALE_FILTER) += fate-matroska-reenc-delete-metadata-filter-output
+fate-matroska-reenc-delete-metadata-filter-output: CMD = transcode matroska $(TARGET_SAMPLES)/mkv/hdr10tags-both.mkv nut "-filter_complex '[0:v]scale=iw:ih[v]' -map '[v]' -c:v mpeg2video -bitexact -map_metadata:s:v 0:s:v" "-c copy -t 0.1" "-show_entries stream_tags" "" "" "" null
+
+# chapter metadata is not filtered on re-encode; NUMBER_OF_FRAMES must survive
+FATE_MATROSKA_FFMPEG_FFPROBE-$(call TRANSCODE, MPEG2VIDEO HEVC, NUT MATROSKA, SCALE_FILTER) += fate-matroska-reenc-chapter-nofilter
+fate-matroska-reenc-chapter-nofilter: CMD = transcode matroska $(TARGET_SAMPLES)/mkv/hdr10tags-both.mkv nut "-map 0:v:0 -vf scale=iw:ih -c:v mpeg2video -bitexact -metadata:c:0 NUMBER_OF_FRAMES=test" "-c copy -t 0.1" "-show_entries chapter_tags" "" "" "" null
+
+FATE_MATROSKA-$(call DEMMUX, MATROSKA, MATROSKA, AV1_PARSER) += fate-matroska-lcevc-av1-itut-t35
+fate-matroska-lcevc-av1-itut-t35: CMD = stream_demux matroska $(TARGET_SAMPLES)/lcevc/L_AV1_854x480p_8bit8bit_2D_dd.mkv "" "-c:v copy"
+
+FATE_MATROSKA-$(call REMUX, WEBM MATROSKA, AV1_PARSER) += fate-matroska-lcevc-av1-itut-t35-copy
+fate-matroska-lcevc-av1-itut-t35-copy: CMD = stream_remux matroska $(TARGET_SAMPLES)/lcevc/L_AV1_854x480p_8bit8bit_2D_dd.mkv "" webm "" "" "-c:v copy"
+
+# The following tests only use the generated vsynth input, so unlike the
+# rest of this file they are runnable without the external samples.
+FATE_MATROSKA_STEREO3D-$(call ALLYES, FILE_PROTOCOL PIPE_PROTOCOL FRAMECRC_MUXER \
+                                                       RAWVIDEO_DEMUXER RAWVIDEO_DECODER \
+                                                       MPEG4_ENCODER MATROSKA_MUXER MATROSKA_DEMUXER) \
+                       += fate-matroska-stereo3d-sbs
+fate-matroska-stereo3d-sbs: tests/data/vsynth1.yuv
+fate-matroska-stereo3d-sbs: CMD = transcode rawvideo $(TARGET_PATH)/tests/data/vsynth1.yuv matroska \
+  "-c:v mpeg4 -qscale:v 10 -stereo3d:v sbsl -frames:v 2" \
+  "-c:v copy" "-show_entries stream_side_data_list" "" "" "-s 352x288 -pix_fmt yuv420p"
+
+MATROSKA_STEREO3D_PROBE = probe -v error -count_packets \
+  -show_entries stream=index:stream_tags=stereo_mode:stream_side_data_list -of default=nw=1 pipe:
+
+# The global stereo_mode fallback must keep applying to output streams that
+# do not have -stereo3d.
+FATE_MATROSKA_STEREO3D-$(call ALLYES, FILE_PROTOCOL PIPE_PROTOCOL RAWVIDEO_DEMUXER RAWVIDEO_DECODER \
+                                                       MPEG4_ENCODER MATROSKA_MUXER MATROSKA_DEMUXER) \
+                       += fate-matroska-stereo3d-override
+fate-matroska-stereo3d-override: tests/data/vsynth1.yuv
+fate-matroska-stereo3d-override: CMD = \
+  ffmpeg -bitexact -s 352x288 -pix_fmt yuv420p -f rawvideo -i $(TARGET_PATH)/tests/data/vsynth1.yuv -frames:v 2 \
+   -map 0:v -map 0:v -c:v mpeg4 -metadata:g stereo_mode=top_bottom -stereo3d:v:0 sbsl -f matroska - | \
+  $(MATROSKA_STEREO3D_PROBE)
+
+MATROSKA_STEREO3D_TAGGED = ffmpeg -bitexact -s 352x288 -pix_fmt yuv420p -f rawvideo \
+  -i $(TARGET_PATH)/tests/data/vsynth1.yuv -frames:v 2 -c:v mpeg4 \
+  -metadata:s:v:0 stereo_mode=top_bottom -f matroska -
+
+# A stereo_mode tag inherited from the input must not win over -stereo3d,
+# while an explicitly requested tag still describes the layout.
+FATE_MATROSKA_STEREO3D-$(call ALLYES, FILE_PROTOCOL PIPE_PROTOCOL RAWVIDEO_DEMUXER RAWVIDEO_DECODER \
+                                                       MPEG4_ENCODER MATROSKA_MUXER MATROSKA_DEMUXER) \
+                       += fate-matroska-stereo3d-metadata
+fate-matroska-stereo3d-metadata: tests/data/vsynth1.yuv
+fate-matroska-stereo3d-metadata: CMP = diff
+fate-matroska-stereo3d-metadata: REF = $(SRC_PATH)/tests/ref/fate/matroska-stereo3d-metadata
+fate-matroska-stereo3d-metadata: CMD = \
+  echo "option over inherited tag:" && \
+  $(MATROSKA_STEREO3D_TAGGED) | ffmpeg -i pipe: -c copy -stereo3d:v:0 sbsl -f matroska - | \
+  $(MATROSKA_STEREO3D_PROBE) && \
+  echo "explicit tag:" && \
+  $(MATROSKA_STEREO3D_TAGGED) | ffmpeg -i pipe: -c copy -metadata:s:v:0 stereo_mode=right_left -f matroska - | \
+  $(MATROSKA_STEREO3D_PROBE) && \
+  echo "empty tag:" && \
+  $(MATROSKA_STEREO3D_TAGGED) | ffmpeg -i pipe: -c copy -stereo3d:v:0 tb -metadata:s:v:0 stereo_mode= -f matroska - | \
+  $(MATROSKA_STEREO3D_PROBE)
+
 FATE_SAMPLES_AVCONV += $(FATE_MATROSKA-yes)
 FATE_SAMPLES_FFPROBE += $(FATE_MATROSKA_FFPROBE-yes)
 FATE_SAMPLES_FFMPEG_FFPROBE += $(FATE_MATROSKA_FFMPEG_FFPROBE-yes)
+FATE_FFMPEG_FFPROBE += $(FATE_MATROSKA_STEREO3D-yes)
 
-fate-matroska: $(FATE_MATROSKA-yes) $(FATE_MATROSKA_FFPROBE-yes) $(FATE_MATROSKA_FFMPEG_FFPROBE-yes)
+fate-matroska: $(FATE_MATROSKA-yes) $(FATE_MATROSKA_FFPROBE-yes) $(FATE_MATROSKA_FFMPEG_FFPROBE-yes) $(FATE_MATROSKA_STEREO3D-yes)

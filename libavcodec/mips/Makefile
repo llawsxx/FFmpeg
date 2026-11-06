@@ -36,7 +36,6 @@ MIPSFPU-OBJS-$(CONFIG_WMAVOICE_DECODER)   += mips/acelp_filters_mips.o     \
 MIPSFPU-OBJS-$(CONFIG_CELP_MATH)          += mips/celp_math_mips.o
 MIPSFPU-OBJS-$(CONFIG_MPEGAUDIODSP)       += mips/mpegaudiodsp_mips_float.o
 MIPSDSP-OBJS-$(CONFIG_MPEGAUDIODSP)       += mips/mpegaudiodsp_mips_fixed.o
-MIPSFPU-OBJS-$(CONFIG_FMTCONVERT)         += mips/fmtconvert_mips.o
 OBJS-$(CONFIG_AC3DSP)                     += mips/ac3dsp_mips.o
 OBJS-$(CONFIG_HEVC_DECODER)               += mips/hevcdsp_init_mips.o      \
                                              mips/hevcpred_init_mips.o
@@ -99,7 +98,7 @@ MMI-OBJS-$(CONFIG_H264DSP)                += mips/h264dsp_mmi.o
 MMI-OBJS-$(CONFIG_H264CHROMA)             += mips/h264chroma_mmi.o
 MMI-OBJS-$(CONFIG_H264PRED)               += mips/h264pred_mmi.o
 MMI-OBJS-$(CONFIG_MPEGVIDEO)              += mips/mpegvideo_mmi.o
-MMI-OBJS-$(CONFIG_MPEGVIDEOENCDSP)        += mips/mpegvideoenc_mmi.o
+MMI-OBJS-$(CONFIG_MPEGVIDEOENCDSP)        += mips/mpegvideoencdsp_mmi.o
 MMI-OBJS-$(CONFIG_IDCTDSP)                += mips/idctdsp_mmi.o           \
                                              mips/simple_idct_mmi.o
 MMI-OBJS-$(CONFIG_MPEG4_DECODER)          += mips/xvid_idct_mmi.o

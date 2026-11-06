@@ -12,6 +12,7 @@
 # =======
 libavcodec/.*aac.* @lynne
 libavcodec/.*ac3.* @lynne
+libavcodec/ac3dec.* @ayoubnabil
 libavcodec/.*adpcm.* @zane @pross
 libavcodec/anm.* @pross
 libavcodec/amf.* @OvchinnikovDmitrii @ArazIusubov
@@ -26,6 +27,7 @@ libavcodec/.*dirac.* @lynne
 libavcodec/.*dovi_rpu.* @haasn
 libavcodec/dpx.* @pross
 libavcodec/dsd.* @pross
+libavcodec/eac3dec.* @ayoubnabil
 libavcodec/eacmv.* @pross
 libavcodec/eaidct.* @pross
 libavcodec/eamad.* @pross
@@ -45,19 +47,19 @@ libavcodec/jv.* @pross
 libavcodec/.*jxl.* @lynne @Traneptora
 libavcodec/.*lcms2.* @haasn
 libavcodec/lead.* @pross
-libavcodec/mediacodec* @quink
-libavcodec/mjpeg* @michaelni
+libavcodec/mediacodec.* @quink
+libavcodec/mjpeg.* @michaelni
 libavcodec/mmvideo.* @pross
 libavcodec/msp2.* @pross
 libavcodec/mvc.* @pross
-libavcodec/oh* @quink
+libavcodec/oh.* @quink
 libavcodec/.*opus.* @lynne
 libavcodec/pictor.* @pross
 libavcodec/.*png.* @Traneptora
 libavcodec/.*prores.* @lynne
 libavcodec/rangecoder.* @michaelni
 libavcodec/ratecontrol.* @michaelni
-libavcodec/rkmpp* @quink
+libavcodec/rkmpp.* @quink
 libavcodec/rv60.* @pross
 libavcodec/sgirle.* @pross
 libavcodec/.*siren.* @lynne
@@ -97,7 +99,8 @@ libavcodec/x86/vpx.* @rbultje
 # =======
 libavfilter/af_loudnorm.* @kylophone
 libavfilter/af_whisper.* @vpalmisano
-libavfilter/.*_amf* @OvchinnikovDmitrii @ArazIusubov
+libavfilter/.*_amf.* @OvchinnikovDmitrii @ArazIusubov
+libavfilter/.*_d3d12.* @younengxiao
 libavfilter/avfiltergraph.* @haasn
 libavfilter/colorspace.* @rbultje
 libavfilter/formats.* @haasn
@@ -110,6 +113,7 @@ libavfilter/vf_find_rect.* @michaelni
 libavfilter/vf_icc.* @haasn
 libavfilter/vf_libplacebo.* @haasn
 libavfilter/vf_libvmaf.* @kylophone
+libavfilter/vf_mpdecimate.* @dana-feng
 libavfilter/vf_premultiply.* @haasn
 libavfilter/vf_scale.* @haasn
 libavfilter/vf_scale_vt.* @quink
@@ -140,8 +144,10 @@ libavformat/electronicarts.* @pross
 libavformat/.*exif.* @Traneptora
 libavformat/filmstrip.* @pross
 libavformat/frm.* @pross
+libavformat/hls.* @kasper93
 libavformat/hxvs.* @quink
 libavformat/iamf.* @jamrial
+libavformat/id3v2.* @toots
 libavformat/icecast.c @ePirat
 libavformat/ico.* @pross
 libavformat/iff.* @pross
@@ -149,13 +155,14 @@ libavformat/.*jpegxl.* @Traneptora
 libavformat/jv.* @pross
 libavformat/.*jxl.* @Traneptora
 libavformat/kvag.* @zane
+libavformat/libcurl.* @kasper93
 libavformat/mccdec.* @programmerjake
 libavformat/mccenc.* @programmerjake
 libavformat/mlv.* @pross
 libavformat/mm.* @pross
 libavformat/msp.* @pross
 libavformat/mv.* @pross
-libavformat/ogg* @toots
+libavformat/ogg.* @toots
 libavformat/pp_bnk.* @zane
 libavformat/rm.* @pross
 libavformat/sauce.* @pross
@@ -167,7 +174,7 @@ libavformat/wtv.* @pross
 
 # avutil
 # ======
-libavutil/.*_amf* @OvchinnikovDmitrii @ArazIusubov
+libavutil/.*_amf.* @OvchinnikovDmitrii @ArazIusubov
 libavutil/.*crc.* @lynne @michaelni
 libavutil/.*d3d12va.* @jianhuaw @tong1wu @younengxiao
 libavutil/csp.* @rbultje @haasn
@@ -225,13 +232,39 @@ doc/.* @GyanD
 # Frameworks
 # ==========
 .*d3d12va.* @jianhuaw @tong1wu @younengxiao
-.*vulkan.* @lynne @haasn
+.*vulkan.* @lynne
 
 # tests
 # =====
 tests/checkasm/riscv/.* @Courmisch
+libavutil/tests/ambient_viewing_environment.* @MarcosAsh
+libavutil/tests/buffer.* @MarcosAsh
+libavutil/tests/csp.* @MarcosAsh
+libavutil/tests/dovi_meta.* @MarcosAsh
+libavutil/tests/downmix_info.* @MarcosAsh
+libavutil/tests/hdr_dynamic_metadata.* @MarcosAsh
+libavutil/tests/hdr_dynamic_vivid_metadata.* @MarcosAsh
+libavutil/tests/mastering_display_metadata.* @MarcosAsh
+libavutil/tests/pixdesc.* @MarcosAsh
+libavutil/tests/side_data.* @MarcosAsh
+libavutil/tests/tdrdi.* @MarcosAsh
+libavutil/tests/timestamp.* @MarcosAsh
+libavutil/tests/video_hint.* @MarcosAsh
 tests/ref/.*drawvg.* @ayosec
+tests/ref/fate/ambient_viewing_environment @MarcosAsh
+tests/ref/fate/buffer @MarcosAsh
+tests/ref/fate/csp @MarcosAsh
+tests/ref/fate/dovi_meta @MarcosAsh
+tests/ref/fate/downmix_info @MarcosAsh
+tests/ref/fate/hdr_dynamic_metadata @MarcosAsh
+tests/ref/fate/hdr_dynamic_vivid_metadata @MarcosAsh
+tests/ref/fate/mastering_display_metadata @MarcosAsh
+tests/ref/fate/pixdesc @MarcosAsh
+tests/ref/fate/side_data @MarcosAsh
 tests/ref/fate/sub-mcc.* @programmerjake
+tests/ref/fate/tdrdi @MarcosAsh
+tests/ref/fate/timestamp @MarcosAsh
+tests/ref/fate/video_hint @MarcosAsh
 
 # Forgejo
 # =======

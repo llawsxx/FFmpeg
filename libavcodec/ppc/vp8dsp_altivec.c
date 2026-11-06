@@ -23,16 +23,14 @@
 #include "config.h"
 
 #include "libavutil/attributes.h"
-#include "libavutil/cpu.h"
 #include "libavutil/mem_internal.h"
-#include "libavutil/ppc/cpu.h"
 #include "libavutil/ppc/util_altivec.h"
 
 #include "libavcodec/vp8dsp.h"
 
 #include "hpeldsp_altivec.h"
+#include "vp8dsp_altivec.h"
 
-#if HAVE_ALTIVEC
 #define REPT4(...) { __VA_ARGS__, __VA_ARGS__, __VA_ARGS__, __VA_ARGS__ }
 
 // h subpel filter uses msum to multiply+add 4 pixel taps at once
@@ -136,7 +134,7 @@ void put_vp8_epel_h_altivec_core(uint8_t *dst, ptrdiff_t dst_stride,
         if (w == 16) {
             FILTER_H(f16l, 8);
             filt = vec_packsu(f16h, f16l);
-            vec_st(filt, 0, dst);
+            unaligned_store(filt, dst);
         } else {
             filt = vec_packsu(f16h, f16h);
             vec_ste((vec_u32)filt, 0, (uint32_t*)dst);
@@ -235,7 +233,7 @@ void put_vp8_epel_v_altivec_core(uint8_t *dst, ptrdiff_t dst_stride,
         if (w == 16) {
             FILTER_V(f16l, vec_mulo);
             filt = vec_packsu(f16h, f16l);
-            vec_st(filt, 0, dst);
+            unaligned_store(filt, dst);
         } else {
             filt = vec_packsu(f16h, f16h);
             if (w == 4)
@@ -317,24 +315,17 @@ static void put_vp8_pixels16_altivec(uint8_t *dst, ptrdiff_t dstride, const uint
 // -funroll-loops w/ this is bad - 74 cycles again.
 // all this is on a 7450, tuning for the 7450
     for (i = 0; i < h; i += 4) {
-        vec_st(load_with_perm_vec(0, src, perm), 0, dst);
-        vec_st(load_with_perm_vec(sstride, src, perm), dstride, dst);
-        vec_st(load_with_perm_vec(sstride2, src, perm), dstride2, dst);
-        vec_st(load_with_perm_vec(sstride3, src, perm), dstride3, dst);
+        unaligned_store(load_with_perm_vec(0, src, perm), dst);
+        unaligned_store(load_with_perm_vec(sstride, src, perm), dst + dstride);
+        unaligned_store(load_with_perm_vec(sstride2, src, perm), dst + dstride2);
+        unaligned_store(load_with_perm_vec(sstride3, src, perm), dst + dstride3);
         src += sstride4;
         dst += dstride4;
     }
 }
 
-#endif /* HAVE_ALTIVEC */
-
-
-av_cold void ff_vp78dsp_init_ppc(VP8DSPContext *c)
+av_cold void ff_vp78dsp_init_altivec(VP8DSPContext *c)
 {
-#if HAVE_ALTIVEC
-    if (!PPC_ALTIVEC(av_get_cpu_flags()))
-        return;
-
     c->put_vp8_epel_pixels_tab[0][0][0] = put_vp8_pixels16_altivec;
     c->put_vp8_epel_pixels_tab[0][0][2] = put_vp8_epel16_h6_altivec;
     c->put_vp8_epel_pixels_tab[0][2][0] = put_vp8_epel16_v6_altivec;
@@ -359,5 +350,4 @@ av_cold void ff_vp78dsp_init_ppc(VP8DSPContext *c)
     c->put_vp8_epel_pixels_tab[2][1][1] = put_vp8_epel4_h4v4_altivec;
     c->put_vp8_epel_pixels_tab[2][1][2] = put_vp8_epel4_h6v4_altivec;
     c->put_vp8_epel_pixels_tab[2][2][1] = put_vp8_epel4_h4v6_altivec;
-#endif /* HAVE_ALTIVEC */
 }

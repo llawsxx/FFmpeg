@@ -59,12 +59,26 @@ static const struct RTSPStatusMessage {
     { 0,                          "NULL"                             }
 };
 
+/* Upper bound on the whole close-time TEARDOWN exchange. */
+#define RTSP_TEARDOWN_TIMEOUT (500 * 1000)
+
 static int rtsp_read_close(AVFormatContext *s)
 {
     RTSPState *rt = s->priv_data;
 
-    if (!(rt->rtsp_flags & RTSP_FLAG_LISTEN))
-        ff_rtsp_send_cmd_async(s, "TEARDOWN", rt->control_uri, NULL);
+    if (!(rt->rtsp_flags & RTSP_FLAG_LISTEN)) {
+        /* Arm the deadline consulted by the control connection's interrupt
+         * callback, which every nested URLContext (tls, http, httpproxy, tcp)
+         * inherited.  A pending user interrupt (Ctrl-C) is thus ignored on the
+         * whole transport stack until the deadline expires, so TEARDOWN goes
+         * out and its reply can be read.  It stays armed for the connection
+         * shutdown below, which keeps the total close time bounded.  The
+         * command is sent synchronously so the 200 OK is consumed and the
+         * server releases the session. */
+        rt->teardown_deadline = av_gettime_relative() + RTSP_TEARDOWN_TIMEOUT;
+        ff_rtsp_send_cmd(s, "TEARDOWN", rt->control_uri, NULL,
+                         &(RTSPMessageHeader){0}, NULL);
+    }
 
     ff_rtsp_close_streams(s);
     ff_rtsp_close_connections(s);
@@ -191,7 +205,7 @@ static int rtsp_read_announce(AVFormatContext *s)
         rtsp_send_reply(s, RTSP_STATUS_SERVICE, NULL, request.seq);
         return AVERROR_OPTION_NOT_FOUND;
     }
-    if (request.content_length) {
+    if (request.content_length > 0 && request.content_length <= SDP_MAX_SIZE) {
         sdp = av_malloc(request.content_length + 1);
         if (!sdp)
             return AVERROR(ENOMEM);
@@ -215,10 +229,10 @@ static int rtsp_read_announce(AVFormatContext *s)
         return 0;
     }
     av_log(s, AV_LOG_ERROR,
-           "Content-Length header value exceeds sdp allocated buffer (4KB)\n");
+           "Invalid ANNOUNCE Content-Length %d\n", request.content_length);
     rtsp_send_reply(s, RTSP_STATUS_INTERNAL,
-                    "Content-Length exceeds buffer size", request.seq);
-    return AVERROR(EIO);
+                    "Invalid Content-Length", request.seq);
+    return AVERROR_INVALIDDATA;
 }
 
 static int rtsp_read_options(AVFormatContext *s)
@@ -770,8 +784,8 @@ static int rtsp_listen(AVFormatContext *s)
     int ret;
     enum RTSPMethod methodcode;
 
-    if (!ff_network_init())
-        return AVERROR(EIO);
+    if ((ret = ff_network_init()) < 0)
+        return ret;
 
     /* extract hostname and port */
     av_url_split(proto, sizeof(proto), auth, sizeof(auth), host, sizeof(host),

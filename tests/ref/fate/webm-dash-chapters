@@ -1,5 +1,5 @@
-e2d3d812e6d9cf05a36eaefe02801a99 *tests/data/fate/webm-dash-chapters.webm
-111149 tests/data/fate/webm-dash-chapters.webm
+ef1102edcd5393536206f921e02caf56 *tests/data/fate/webm-dash-chapters.webm
+111153 tests/data/fate/webm-dash-chapters.webm
 #extradata 0:     3469, 0xc6769ddc
 #tb 0: 1/1000
 #media_type 0: audio
@@ -9,7 +9,7 @@ e2d3d812e6d9cf05a36eaefe02801a99 *tests/data/fate/webm-dash-chapters.webm
 0,          0,          0,        5,       28, 0xefcf103e
 0,          6,          6,       26,      198, 0xfbbe5eb5
 0,         32,         32,       46,      198, 0xabd95c6c
-0,         99,         99,       26,       41, 0x954b12a5
+0,         79,         79,       26,       41, 0x954b12a5
 0,        105,        105,        5,       41, 0xbccd1463
 0,        110,        110,        5,       44, 0x4fa218a1
 0,        116,        116,        5,       43, 0xf87716d4
@@ -24,7 +24,7 @@ e2d3d812e6d9cf05a36eaefe02801a99 *tests/data/fate/webm-dash-chapters.webm
 0,        169,        169,       26,      236, 0xfe396f02
 0,        195,        195,       46,      208, 0x018e62d3
 0,        241,        241,       46,      223, 0x9fa76917
-0,        308,        308,       26,       46, 0xd8c314f9
+0,        288,        288,       26,       46, 0xd8c314f9
 0,        314,        314,        5,       46, 0x199018bc
 0,        319,        319,        5,       46, 0xbe8314cd
 0,        325,        325,        5,       45, 0xe0ad1622

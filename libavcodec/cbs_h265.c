@@ -26,6 +26,16 @@
 #include "cbs_sei.h"
 #include "get_bits.h"
 
+// PicWidthInCtbsY and PicHeightInCtbsY (7.4.3.2.1).
+static void cbs_h265_pic_size_in_ctbs(const H265RawSPS *sps,
+                                      unsigned int *width, unsigned int *height)
+{
+    unsigned int ctb_log2_size_y = sps->log2_min_luma_coding_block_size_minus3 + 3 +
+                                   sps->log2_diff_max_min_luma_coding_block_size;
+    *width  = AV_CEIL_RSHIFT(sps->pic_width_in_luma_samples,  ctb_log2_size_y);
+    *height = AV_CEIL_RSHIFT(sps->pic_height_in_luma_samples, ctb_log2_size_y);
+}
+
 #define HEADER(name) do { \
         ff_cbs_trace_header(ctx, name); \
     } while (0)
@@ -142,7 +152,7 @@ static int FUNC_H265(name) args
                                         AV_INPUT_BUFFER_PADDING_SIZE); \
         if (!name ## _ref) \
             return AVERROR(ENOMEM); \
-        name = name ## _ref->data; \
+        name = (void *)name ## _ref->data; \
     } while (0)
 
 #define FUNC(name) FUNC_H265(name)
@@ -715,7 +725,18 @@ static void cbs_h265_free_sei(AVRefStructOpaque unused, void *content)
 }
 
 static CodedBitstreamUnitTypeDescriptor cbs_h265_unit_types[] = {
-    CBS_UNIT_TYPE_INTERNAL_REF(HEVC_NAL_VPS, H265RawVPS, extension_data.data),
+    {
+        .nb_unit_types     = 1,
+        .unit_type.list    = { HEVC_NAL_VPS },
+        .content_type      = CBS_CONTENT_TYPE_INTERNAL_REFS,
+        .content_size      = sizeof(H265RawVPS),
+        .type.ref          = {
+            .nb_offsets = 2,
+            .offsets    = { offsetof(H265RawVPS, extension_data.data),
+                            offsetof(H265RawVPS, hrd_parameters) }
+        },
+    },
+
     CBS_UNIT_TYPE_INTERNAL_REF(HEVC_NAL_SPS, H265RawSPS, extension_data.data),
     CBS_UNIT_TYPE_INTERNAL_REF(HEVC_NAL_PPS, H265RawPPS, extension_data.data),
 

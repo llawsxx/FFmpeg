@@ -1,11 +1,9 @@
-tests/data/mp4-to-ts.m3u8: TAG = GEN
 tests/data/mp4-to-ts.m3u8: ffmpeg$(PROGSSUF)$(EXESUF) | tests/data
 	$(M)$(TARGET_EXEC) $(TARGET_PATH)/$< -nostdin \
         -i $(TARGET_SAMPLES)/h264/interlaced_crop.mp4 \
         -f ssegment -segment_time 1 -map 0 -flags +bitexact -codec copy \
         -segment_list $(TARGET_PATH)/$@ -y $(TARGET_PATH)/tests/data/mp4-to-ts-%03d.ts 2>/dev/null
 
-tests/data/adts-to-mkv.m3u8: TAG = GEN
 tests/data/adts-to-mkv.m3u8: ffmpeg$(PROGSSUF)$(EXESUF) | tests/data
 	$(M)$(TARGET_EXEC) $(TARGET_PATH)/$< -nostdin \
         -i $(TARGET_SAMPLES)/audiomatch/tones_afconvert_16000_mono_aac_lc.m4a \
@@ -40,7 +38,6 @@ FATE_SEGMENT-$(call FRAMECRC, MOV HLS MATROSKA, H264, H264_PARSER H264_MP4TOANNE
 FATE_SEGMENT += fate-segment-adts-to-mkv
 fate-segment-adts-to-mkv: tests/data/adts-to-mkv.m3u8
 fate-segment-adts-to-mkv: CMD = framecrc -flags +bitexact -i $(TARGET_PATH)/tests/data/adts-to-mkv.m3u8 -c copy
-fate-segment-adts-to-mkv: REF = $(SRC_PATH)/tests/ref/fate/segment-adts-to-mkv-header-all
 FATE_SEGMENT-$(call FRAMECRC, AAC HLS MATROSKA, AAC, AAC_ADTSTOASC_BSF MATROSKA_MUXER SEGMENT_MUXER) += fate-segment-adts-to-mkv
 
 FATE_SEGMENT_ALLPARTS = $(FATE_SEGMENT_PARTS)

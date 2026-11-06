@@ -23,7 +23,7 @@ FFMPEG=ffmpeg$(PROGSSUF)$(EXESUF)
 $(AREF): CMP=
 
 APITESTSDIR := tests/api
-FATE_OUTDIRS = tests/data tests/data/fate tests/data/filtergraphs tests/data/maps tests/data/streamgroups tests/data/lavf tests/data/lavf-fate tests/data/pixfmt tests/vsynth1 $(APITESTSDIR)
+FATE_OUTDIRS = tests/data tests/data/fate tests/data/filtergraphs tests/data/maps tests/data/streamgroups tests/data/lavf tests/data/lavf-fate tests/data/pixfmt tests/vsynth1 tests/data/samples $(APITESTSDIR)
 OUTDIRS += $(FATE_OUTDIRS)
 
 $(VREF): tests/videogen$(HOSTEXESUF) | tests/vsynth1
@@ -51,7 +51,7 @@ tests/test_copy.ffmeta: TAG = COPY
 tests/test_copy.ffmeta: tests/data
 	$(M)cp -f $(SRC_PATH)/tests/test.ffmeta tests/test_copy.ffmeta
 
-tests/data/%.sw tests/data/asynth% tests/data/vsynth%.yuv tests/vsynth%/00.pgm tests/data/%.nut: TAG = GEN
+tests/data/%.sw tests/data/asynth% tests/data/vsynth%.yuv tests/vsynth%/00.pgm tests/data/%.nut tests/data/%.m3u8: TAG = GEN
 
 tests/data/filtergraphs/%: TAG = COPY
 tests/data/filtergraphs/%: $(SRC_PATH)/tests/filtergraphs/% | tests/data/filtergraphs
@@ -64,6 +64,18 @@ tests/data/maps/%: $(SRC_PATH)/tests/maps/% | tests/data/maps
 tests/data/streamgroups/%: TAG = COPY
 tests/data/streamgroups/%: $(SRC_PATH)/tests/streamgroups/% | tests/data/streamgroups
 	$(M)cp $< $@
+
+tests/data/samples/%: TAG = COPY
+tests/data/samples/%: $(TARGET_SAMPLES)/% | tests/data/samples
+	$(M)cp $< tests/data/samples/$(subst /,_,$*)
+
+tests/data/fate/%.amr: TAG = GEN
+tests/data/fate/%.amr: tests/amrgen$(HOSTEXESUF) | tests/data/fate
+	$(M)./$< $@
+
+tests/data/fate/apng-small-bpp-%.png: TAG = GEN
+tests/data/fate/apng-small-bpp-%.png: tests/apnggen$(HOSTEXESUF) | tests/data/fate
+	$(M)./$< $@
 
 RUNNING_FATE := $(filter check fate%,$(filter-out fate-rsync,$(MAKECMDGOALS)))
 
@@ -175,6 +187,7 @@ include $(SRC_PATH)/tests/fate/checkasm.mak
 # Must be included after lavf-container.mak
 include $(SRC_PATH)/tests/fate/concatdec.mak
 include $(SRC_PATH)/tests/fate/cover-art.mak
+include $(SRC_PATH)/tests/fate/dashenc.mak
 include $(SRC_PATH)/tests/fate/dca.mak
 include $(SRC_PATH)/tests/fate/demux.mak
 include $(SRC_PATH)/tests/fate/dfa.mak
@@ -184,9 +197,11 @@ include $(SRC_PATH)/tests/fate/dvvideo.mak
 include $(SRC_PATH)/tests/fate/ea.mak
 include $(SRC_PATH)/tests/fate/exif.mak
 include $(SRC_PATH)/tests/fate/enc_external.mak
+include $(SRC_PATH)/tests/fate/astc.mak
 # Must be included after lavf-video.mak
 include $(SRC_PATH)/tests/fate/ffmpeg.mak
 include $(SRC_PATH)/tests/fate/ffprobe.mak
+include $(SRC_PATH)/tests/fate/ffv1.mak
 include $(SRC_PATH)/tests/fate/fifo-muxer.mak
 include $(SRC_PATH)/tests/fate/filter-audio.mak
 # Must be included after vcodec.mak
@@ -195,6 +210,7 @@ include $(SRC_PATH)/tests/fate/fits.mak
 include $(SRC_PATH)/tests/fate/flac.mak
 include $(SRC_PATH)/tests/fate/flvenc.mak
 include $(SRC_PATH)/tests/fate/gapless.mak
+include $(SRC_PATH)/tests/fate/generic-tags.mak
 include $(SRC_PATH)/tests/fate/gif.mak
 include $(SRC_PATH)/tests/fate/h264.mak
 include $(SRC_PATH)/tests/fate/hap.mak
@@ -207,6 +223,7 @@ include $(SRC_PATH)/tests/fate/image.mak
 include $(SRC_PATH)/tests/fate/imf.mak
 include $(SRC_PATH)/tests/fate/indeo.mak
 include $(SRC_PATH)/tests/fate/jpeg2000.mak
+include $(SRC_PATH)/tests/fate/jpegapp.mak
 include $(SRC_PATH)/tests/fate/jxl.mak
 include $(SRC_PATH)/tests/fate/libavcodec.mak
 include $(SRC_PATH)/tests/fate/libavdevice.mak
@@ -234,12 +251,15 @@ include $(SRC_PATH)/tests/fate/opus.mak
 include $(SRC_PATH)/tests/fate/pcm.mak
 include $(SRC_PATH)/tests/fate/pixfmt.mak
 include $(SRC_PATH)/tests/fate/pixlet.mak
+include $(SRC_PATH)/tests/fate/preroll.mak
 include $(SRC_PATH)/tests/fate/probe.mak
 include $(SRC_PATH)/tests/fate/prores.mak
 include $(SRC_PATH)/tests/fate/qoa.mak
 include $(SRC_PATH)/tests/fate/qt.mak
 include $(SRC_PATH)/tests/fate/qtrle.mak
 include $(SRC_PATH)/tests/fate/real.mak
+include $(SRC_PATH)/tests/fate/rtsp.mak
+include $(SRC_PATH)/tests/fate/sbc.mak
 include $(SRC_PATH)/tests/fate/screen.mak
 include $(SRC_PATH)/tests/fate/segafilm.mak
 include $(SRC_PATH)/tests/fate/segment.mak
@@ -256,6 +276,7 @@ include $(SRC_PATH)/tests/fate/vorbis.mak
 include $(SRC_PATH)/tests/fate/vpx.mak
 include $(SRC_PATH)/tests/fate/vqf.mak
 include $(SRC_PATH)/tests/fate/vvc.mak
+include $(SRC_PATH)/tests/fate/wav.mak
 include $(SRC_PATH)/tests/fate/wavpack.mak
 include $(SRC_PATH)/tests/fate/webm-dash-manifest.mak
 include $(SRC_PATH)/tests/fate/wma.mak
@@ -320,7 +341,7 @@ $(FATE): export EXECSUF = $(EXESUF)
 $(FATE): export HOSTEXECSUF = $(HOSTEXESUF)
 $(FATE): $(FATE_UTILS:%=tests/%$(HOSTEXESUF)) | $(FATE_OUTDIRS)
 	@echo "TEST    $(@:fate-%=%)$(FATE_SUFFIX)"
-	$(Q)$(SRC_PATH)/tests/fate-run.sh $@$(FATE_SUFFIX) "$(TARGET_SAMPLES)" "$(TARGET_EXEC)" "$(TARGET_PATH)" '$(CMD)' '$(CMP)' '$(REF)' '$(FUZZ)' '$(THREADS)' '$(THREAD_TYPE)' '$(CPUFLAGS)' '$(CMP_SHIFT)' '$(CMP_TARGET)' '$(SIZE_TOLERANCE)' '$(CMP_UNIT)' '$(GEN)' '$(HWACCEL)' '$(REPORT)' '$(KEEP_FILES)'
+	$(Q)$(SRC_PATH)/tests/fate-run.sh $@$(FATE_SUFFIX) "$(TARGET_SAMPLES)" "$(TARGET_EXEC)" "$(TARGET_PATH)" '$(CMD)' '$(CMP)' '$(REF)' '$(FUZZ)' '$(THREADS)' '$(THREAD_TYPE)' '$(CPUFLAGS)' '$(CMP_SHIFT)' '$(CMP_TARGET)' '$(SIZE_TOLERANCE)' '$(CMP_UNIT)' '$(GEN)' '$(HWACCEL)' '$(REPORT)' '$(KEEP_FILES)' '$(CLEANFILES)'
 
 fate-list:
 	@printf '%s\n' $(sort $(FATE))

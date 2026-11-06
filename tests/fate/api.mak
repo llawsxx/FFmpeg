@@ -1,7 +1,34 @@
+FATE_API_LIBAVCODEC-$(call ALLYES, AC3_ENCODER AC3_DECODER EAC3_DECODER AC3_FIXED_DECODER) += fate-api-ac3-flush
+fate-api-ac3-flush: $(APITESTSDIR)/api-ac3-flush-test$(EXESUF)
+fate-api-ac3-flush: CMD = run $(APITESTSDIR)/api-ac3-flush-test$(EXESUF)
+fate-api-ac3-flush: CMP = null
+
+FATE_API_LIBAVCODEC-$(call ALLYES, LIBASTCENC_ENCODER LIBASTCENC_DECODER) += fate-api-astc-profile
+fate-api-astc-profile: $(APITESTSDIR)/api-astc-profile-test$(EXESUF)
+fate-api-astc-profile: CMD = run $(APITESTSDIR)/api-astc-profile-test$(EXESUF)
+
 FATE_API_LIBAVCODEC-$(call ENCDEC, FLAC, FLAC) += fate-api-flac
 fate-api-flac: $(APITESTSDIR)/api-flac-test$(EXESUF)
 fate-api-flac: CMD = run $(APITESTSDIR)/api-flac-test$(EXESUF)
 fate-api-flac: CMP = null
+
+FATE_API_LIBAVCODEC-$(CONFIG_PCM_S16LE_DECODER) += fate-api-skip-samples
+fate-api-skip-samples: $(APITESTSDIR)/api-skip-samples-test$(EXESUF)
+fate-api-skip-samples: CMD = run $(APITESTSDIR)/api-skip-samples-test$(EXESUF)
+
+FATE_API_LIBAVCODEC-$(CONFIG_MOVTEXT_ENCODER) += fate-api-movtext
+fate-api-movtext: $(APITESTSDIR)/api-movtext-test$(EXESUF)
+fate-api-movtext: CMD = run $(APITESTSDIR)/api-movtext-test$(EXESUF)
+
+FATE_API_LIBAVCODEC-$(call ALLYES, HEVC_MP4TOANNEXB_BSF HEVC_DECODER) += fate-api-hevc-mp4toannexb
+fate-api-hevc-mp4toannexb: $(APITESTSDIR)/api-hevc-mp4toannexb-test$(EXESUF)
+fate-api-hevc-mp4toannexb: CMD = run $(APITESTSDIR)/api-hevc-mp4toannexb-test$(EXESUF)
+
+FATE_API_LIBAVCODEC-$(call ALLYES, H261_ENCODER H261_PARSER) += fate-api-enc-parser fate-api-enc-parser-cif
+fate-api-enc-parser: $(APITESTSDIR)/api-enc-parser-test$(EXESUF)
+fate-api-enc-parser: CMD = run $(APITESTSDIR)/api-enc-parser-test$(EXESUF) h261 176 144
+fate-api-enc-parser-cif: $(APITESTSDIR)/api-enc-parser-test$(EXESUF)
+fate-api-enc-parser-cif: CMD = run $(APITESTSDIR)/api-enc-parser-test$(EXESUF) h261 352 288
 
 FATE_API_SAMPLES_LIBAVFORMAT-$(call DEMDEC, FLV, FLV) += fate-api-band
 fate-api-band: $(APITESTSDIR)/api-band-test$(EXESUF)
@@ -22,6 +49,10 @@ fate-lavf-flv: KEEP_FILES ?= 1
 fate-lavf-flv: CMP =
 fate-api-seek: CMD = run $(APITESTSDIR)/api-seek-test$(EXESUF) $(TARGET_PATH)/tests/data/lavf/lavf.flv 0 720
 fate-api-seek: CMP = null
+
+FATE_API_LIBAVFORMAT-$(call ALLYES, MP4_MUXER ISMV_MUXER) += fate-api-movenc
+fate-api-movenc: $(APITESTSDIR)/api-movenc-test$(EXESUF)
+fate-api-movenc: CMD = run $(APITESTSDIR)/api-movenc-test$(EXESUF)
 
 FATE_API-$(HAVE_THREADS) += fate-api-threadmessage
 fate-api-threadmessage: $(APITESTSDIR)/api-threadmessage-test$(EXESUF)

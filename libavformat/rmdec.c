@@ -215,6 +215,7 @@ static int rm_read_audio_stream_info(AVFormatContext *s, AVIOContext *pb,
             break;
         case AV_CODEC_ID_COOK:
             sti->need_parsing = AVSTREAM_PARSE_HEADERS;
+            av_fallthrough;
         case AV_CODEC_ID_ATRAC3:
         case AV_CODEC_ID_SIPR:
             if (read_all) {
@@ -1159,10 +1160,25 @@ static int rm_read_seek(AVFormatContext *s, int stream_index,
                         int64_t pts, int flags)
 {
     RMDemuxContext *rm = s->priv_data;
+    unsigned int i;
 
     if (ff_seek_frame_binary(s, stream_index, pts, flags) < 0)
         return -1;
     rm->audio_pkt_cnt = 0;
+
+    /* A stale sub_packet_cnt makes the first interleave block after the
+     * seek reuse pre-seek payload in the remaining descramble slots and
+     * lose its container timestamp, which also shifts all following
+     * block boundaries. */
+    for (i = 0; i < s->nb_streams; i++) {
+        AVStream *st  = s->streams[i];
+        RMStream *ast = st->priv_data;
+
+        if (ast && st->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
+            ast->sub_packet_cnt = 0;
+            ast->audiotimestamp = AV_NOPTS_VALUE;
+        }
+    }
     return 0;
 }
 
@@ -1200,7 +1216,7 @@ static int ivr_probe(const AVProbeData *p)
 static int ivr_read_header(AVFormatContext *s)
 {
     unsigned tag, type, len, tlen, value;
-    int i, j, n, count, nb_streams = 0, ret;
+    int i, n, count, nb_streams = 0, ret;
     uint8_t key[256], val[256];
     AVIOContext *pb = s->pb;
     AVStream *st;
@@ -1254,7 +1270,7 @@ static int ivr_read_header(AVFormatContext *s)
             av_log(s, AV_LOG_DEBUG, "%s = '%s'\n", key, val);
         } else if (type == 4) {
             av_log(s, AV_LOG_DEBUG, "%s = '0x", key);
-            for (j = 0; j < len; j++) {
+            for (unsigned j = 0; j < len; j++) {
                 if (avio_feof(pb))
                     return AVERROR_INVALIDDATA;
                 av_log(s, AV_LOG_DEBUG, "%X", avio_r8(pb));
@@ -1307,10 +1323,8 @@ static int ivr_read_header(AVFormatContext *s)
                 if (ret < 0)
                     return ret;
             } else if (type == 4) {
-                int j;
-
                 av_log(s, AV_LOG_DEBUG, "%s = '0x", key);
-                for (j = 0; j < len; j++) {
+                for (unsigned j = 0; j < len; j++) {
                     if (avio_feof(pb))
                         return AVERROR_INVALIDDATA;
                     av_log(s, AV_LOG_DEBUG, "%X", avio_r8(pb));

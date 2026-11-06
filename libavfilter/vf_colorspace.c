@@ -23,6 +23,7 @@
  * Convert between colorspaces.
  */
 
+#include "libavutil/attributes.h"
 #include "libavutil/avassert.h"
 #include "libavutil/csp.h"
 #include "libavutil/frame.h"
@@ -394,7 +395,7 @@ static int get_range_off(AVFilterContext *ctx, int *off,
             s->did_warn_range = 1;
         }
     }
-        // fall-through
+    av_fallthrough;
     case AVCOL_RANGE_MPEG:
         *off = 16 << (depth - 8);
         *y_rng = 219 << (depth - 8);
@@ -483,7 +484,7 @@ static int create_filtergraph(AVFilterContext *ctx,
         }
         s->lrgb2lrgb_passthrough = !memcmp(s->in_primaries, s->out_primaries,
                                            sizeof(*s->in_primaries));
-        if (!s->lrgb2lrgb_passthrough) {
+        if (!s->lrgb2lrgb_passthrough && !s->fast_mode) {
             double rgb2xyz[3][3], xyz2rgb[3][3], rgb2rgb[3][3];
             const AVWhitepointCoefficients *wp_out, *wp_in;
 
@@ -505,7 +506,18 @@ static int create_filtergraph(AVFilterContext *ctx,
             }
             for (m = 0; m < 3; m++)
                 for (n = 0; n < 3; n++) {
-                    s->lrgb2lrgb_coeffs[m][n][0] = lrint(16384.0 * rgb2rgb[m][n]);
+                    long coeff = lrint(16384.0 * rgb2rgb[m][n]);
+                    if (coeff < INT16_MIN || coeff > INT16_MAX) {
+                        av_log(ctx, AV_LOG_ERROR,
+                               "Conversion from %s to %s primaries does not fit "
+                               "the fixed point range of the filter\n",
+                               av_color_primaries_name(s->in_prm),
+                               av_color_primaries_name(s->out_prm));
+                        s->in_primaries  = NULL;
+                        s->out_primaries = NULL;
+                        return AVERROR(EINVAL);
+                    }
+                    s->lrgb2lrgb_coeffs[m][n][0] = coeff;
                     for (o = 1; o < 8; o++)
                         s->lrgb2lrgb_coeffs[m][n][o] = s->lrgb2lrgb_coeffs[m][n][0];
                 }

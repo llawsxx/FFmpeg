@@ -100,6 +100,16 @@ static const AVClass ftp_context_class = {
 
 static int ftp_close(URLContext *h);
 
+static int is_bad_string(const unsigned char *s)
+{
+    while(*s) {
+        if (*s < 0x20 || *s == 0x7F || *s == 0xFF)
+            return 1;
+        s++;
+    }
+    return 0;
+}
+
 static int ftp_getc(FTPContext *s)
 {
     int len;
@@ -250,7 +260,7 @@ static int ftp_auth(FTPContext *s)
     static const int user_codes[] = {331, 230, 0};
     static const int pass_codes[] = {230, 0};
 
-    if (strpbrk(s->user, "\r\n"))
+    if (is_bad_string(s->user))
         return AVERROR(EINVAL);
     err = snprintf(buf, sizeof(buf), "USER %s\r\n", s->user);
     if (err >= sizeof(buf))
@@ -259,7 +269,7 @@ static int ftp_auth(FTPContext *s)
     err = ftp_send_command(s, buf, user_codes, NULL);
     if (err == 331) {
         if (s->password) {
-            if (strpbrk(s->password, "\r\n"))
+            if (is_bad_string(s->password))
                 return AVERROR(EINVAL);
             err = snprintf(buf, sizeof(buf), "PASS %s\r\n", s->password);
             if (err >= sizeof(buf))
@@ -503,9 +513,10 @@ static int ftp_set_dir(FTPContext *s)
 static int ftp_list_mlsd(FTPContext *s)
 {
     static const char *command = "MLSD\r\n";
-    static const int mlsd_codes[] = {150, 500, 0}; /* 500 is incorrect code */
+    static const int mlsd_codes[] = {150, 125, 500, 0}; /* 500 is incorrect code */
+    int resp_code = ftp_send_command(s, command, mlsd_codes, NULL);
 
-    if (ftp_send_command(s, command, mlsd_codes, NULL) != 150)
+    if (resp_code != 150 && resp_code != 125)
         return AVERROR(ENOSYS);
     s->listing_method = MLSD;
     return 0;
@@ -746,6 +757,11 @@ static int ftp_connect(URLContext *h, const char *url)
     av_free(s->path);
     s->path = newpath;
 
+    if (is_bad_string(s->path)) {
+        av_log(h, AV_LOG_ERROR, "Path contains non-printable characters\n");
+        return AVERROR(EINVAL);
+    }
+
     return 0;
 }
 
@@ -979,7 +995,7 @@ static int64_t ftp_parse_date(const char *date)
 static int ftp_parse_entry_nlst(char *line, AVIODirEntry *next)
 {
     next->name = av_strdup(line);
-    return 0;
+    return next->name ? 0 : AVERROR(ENOMEM);
 }
 
 static int ftp_parse_entry_mlsd(char *mlsd, AVIODirEntry *next)
@@ -990,7 +1006,8 @@ static int ftp_parse_entry_mlsd(char *mlsd, AVIODirEntry *next)
     while(fact = av_strtok(p, ";", &saveptr)) {
         p = NULL;
         if (fact[0] == ' ') {
-            next->name = av_strdup(&fact[1]);
+            if (!(next->name = av_strdup(&fact[1])))
+                return AVERROR(ENOMEM);
             continue;
         }
         fact = av_strtok(fact, "=", &value);
@@ -1054,9 +1071,9 @@ static int ftp_read_dir(URLContext *h, AVIODirEntry **next)
             if (s->dir_buffer_size)
                 memmove(s->dir_buffer, start, s->dir_buffer_size);
             ret = ffurl_read(s->conn_data, s->dir_buffer + s->dir_buffer_size, DIR_BUFFER_SIZE - (s->dir_buffer_size + 1));
-            if (ret < 0)
+            if (ret < 0 && ret != AVERROR_EOF)
                 return ret;
-            if (!ret) {
+            if (ret <= 0) {
                 *next = NULL;
                 return 0;
             }
@@ -1156,6 +1173,10 @@ static int ftp_move(URLContext *h_src, URLContext *h_dst)
     av_url_split(0, 0, 0, 0, 0, 0, 0,
                  path, sizeof(path),
                  h_dst->filename);
+    if (is_bad_string(path)) {
+        ret = AVERROR(EINVAL);
+        goto cleanup;
+    }
     ret = snprintf(command, sizeof(command), "RNTO %s\r\n", path);
     if (ret >= sizeof(command)) {
         ret = AVERROR(ENOSYS);

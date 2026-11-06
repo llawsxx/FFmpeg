@@ -228,8 +228,6 @@ static int av1_handle_packet(AVFormatContext *ctx, PayloadContext *data,
             rem_pkt_size -= num_lebs;
             buf_ptr += num_lebs;
         }
-        // read first byte (which is the header byte only for non-fragmented elements)
-        obu_hdr = *buf_ptr;
         if (obu_size > rem_pkt_size) {
             av_log(ctx, AV_LOG_ERROR, "AV1 OBU size %u larger than remaining pkt size %d\n", obu_size, rem_pkt_size);
             return AVERROR_INVALIDDATA;
@@ -240,6 +238,8 @@ static int av1_handle_packet(AVFormatContext *ctx, PayloadContext *data,
             return AVERROR_INVALIDDATA;
         }
 
+        // read first byte (which is the header byte only for non-fragmented elements)
+        obu_hdr = *buf_ptr;
         if (!is_frag_cont) {
             uint8_t obu_type = (obu_hdr >> AV1S_OBU_TYPE) & AV1M_OBU_TYPE;
             if (obu_hdr & AV1F_OBU_FORBIDDEN) {
@@ -249,7 +249,7 @@ static int av1_handle_packet(AVFormatContext *ctx, PayloadContext *data,
             // ignore and remove OBUs according to spec
             if ((obu_type == AV1_OBU_TEMPORAL_DELIMITER) ||
                 (obu_type == AV1_OBU_TILE_LIST)) {
-                pktpos += obu_size;
+                buf_ptr += obu_size;
                 rem_pkt_size -= obu_size;
                 // TODO: This probably breaks if the OBU_TILE_LIST is fragmented
                 // into the next RTP packet, so at least check and fail here
@@ -278,13 +278,9 @@ static int av1_handle_packet(AVFormatContext *ctx, PayloadContext *data,
             if (data->needs_td) {
                 output_size += 2; // for Temporal Delimiter (TD)
             }
-            if (pkt->data) {
-                if ((result = av_grow_packet(pkt, output_size)) < 0)
-                    return result;
-            } else {
-                if ((result = av_new_packet(pkt, output_size) < 0))
-                    return result;
-            }
+            result = av_grow_packet(pkt, output_size);
+            if (result < 0)
+                return result;
 
             if (data->needs_td) {
                 // restore TD

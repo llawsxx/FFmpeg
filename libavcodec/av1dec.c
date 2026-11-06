@@ -99,12 +99,11 @@ static int32_t decode_signed_subexp_with_ref(uint32_t sub_exp, int low,
 
 static void read_global_param(AV1DecContext *s, int type, int ref, int idx)
 {
-    uint8_t primary_frame, prev_frame;
+    int primary_frame;
     uint32_t abs_bits, prec_bits, round, prec_diff, sub, mx;
     int32_t r, prev_gm_param;
 
     primary_frame = s->raw_frame_header->primary_ref_frame;
-    prev_frame = s->raw_frame_header->ref_frame_idx[primary_frame];
     abs_bits = AV1_GM_ABS_ALPHA_BITS;
     prec_bits = AV1_GM_ALPHA_PREC_BITS;
 
@@ -114,8 +113,10 @@ static void read_global_param(AV1DecContext *s, int type, int ref, int idx)
      */
     if (s->raw_frame_header->primary_ref_frame == AV1_PRIMARY_REF_NONE)
         prev_gm_param = s->cur_frame.gm_params[ref][idx];
-    else
+    else {
+        int prev_frame = s->raw_frame_header->ref_frame_idx[primary_frame];
         prev_gm_param = s->ref[prev_frame].gm_params[ref][idx];
+    }
 
     if (idx < 2) {
         if (type == AV1_WARP_MODEL_TRANSLATION) {
@@ -436,6 +437,9 @@ static int get_tiles_info(AVCodecContext *avctx, const AV1RawTileGroup *tile_gro
     s->tg_start = tile_group->tg_start;
     s->tg_end = tile_group->tg_end;
 
+    if (tile_group->tg_end >= s->raw_frame_header->tile_cols * s->raw_frame_header->tile_rows)
+        return AVERROR_INVALIDDATA;
+
     for (tile_num = tile_group->tg_start; tile_num <= tile_group->tg_end; tile_num++) {
         tile_row = tile_num / s->raw_frame_header->tile_cols;
         tile_col = tile_num % s->raw_frame_header->tile_cols;
@@ -542,6 +546,7 @@ static int get_pixel_format(AVCodecContext *avctx)
                      CONFIG_AV1_D3D11VA_HWACCEL * 2 + \
                      CONFIG_AV1_D3D12VA_HWACCEL + \
                      CONFIG_AV1_NVDEC_HWACCEL + \
+                     CONFIG_AV1_NVDEC_CUARRAY_HWACCEL + \
                      CONFIG_AV1_VAAPI_HWACCEL + \
                      CONFIG_AV1_VDPAU_HWACCEL + \
                      CONFIG_AV1_VIDEOTOOLBOX_HWACCEL + \
@@ -565,6 +570,9 @@ static int get_pixel_format(AVCodecContext *avctx)
 #endif
 #if CONFIG_AV1_NVDEC_HWACCEL
         *fmtp++ = AV_PIX_FMT_CUDA;
+#endif
+#if CONFIG_AV1_NVDEC_CUARRAY_HWACCEL
+        *fmtp++ = AV_PIX_FMT_CUARRAY;
 #endif
 #if CONFIG_AV1_VAAPI_HWACCEL
         *fmtp++ = AV_PIX_FMT_VAAPI;
@@ -593,6 +601,9 @@ static int get_pixel_format(AVCodecContext *avctx)
 #if CONFIG_AV1_NVDEC_HWACCEL
         *fmtp++ = AV_PIX_FMT_CUDA;
 #endif
+#if CONFIG_AV1_NVDEC_CUARRAY_HWACCEL
+        *fmtp++ = AV_PIX_FMT_CUARRAY;
+#endif
 #if CONFIG_AV1_VAAPI_HWACCEL
         *fmtp++ = AV_PIX_FMT_VAAPI;
 #endif
@@ -607,16 +618,31 @@ static int get_pixel_format(AVCodecContext *avctx)
 #endif
         break;
     case AV_PIX_FMT_YUV420P12:
+#if CONFIG_AV1_D3D11VA_HWACCEL
+        *fmtp++ = AV_PIX_FMT_D3D11VA_VLD;
+        *fmtp++ = AV_PIX_FMT_D3D11;
+#endif
+#if CONFIG_AV1_D3D12VA_HWACCEL
+        *fmtp++ = AV_PIX_FMT_D3D12;
+#endif
 #if CONFIG_AV1_VULKAN_HWACCEL
         *fmtp++ = AV_PIX_FMT_VULKAN;
 #endif
         break;
     case AV_PIX_FMT_YUV422P:
+#if CONFIG_AV1_D3D11VA_HWACCEL
+        *fmtp++ = AV_PIX_FMT_D3D11VA_VLD;
+        *fmtp++ = AV_PIX_FMT_D3D11;
+#endif
 #if CONFIG_AV1_VULKAN_HWACCEL
         *fmtp++ = AV_PIX_FMT_VULKAN;
 #endif
         break;
     case AV_PIX_FMT_YUV422P10:
+#if CONFIG_AV1_D3D11VA_HWACCEL
+        *fmtp++ = AV_PIX_FMT_D3D11VA_VLD;
+        *fmtp++ = AV_PIX_FMT_D3D11;
+#endif
 #if CONFIG_AV1_VULKAN_HWACCEL
         *fmtp++ = AV_PIX_FMT_VULKAN;
 #endif
@@ -627,11 +653,19 @@ static int get_pixel_format(AVCodecContext *avctx)
 #endif
         break;
     case AV_PIX_FMT_YUV444P:
+#if CONFIG_AV1_D3D11VA_HWACCEL
+        *fmtp++ = AV_PIX_FMT_D3D11VA_VLD;
+        *fmtp++ = AV_PIX_FMT_D3D11;
+#endif
 #if CONFIG_AV1_VULKAN_HWACCEL
         *fmtp++ = AV_PIX_FMT_VULKAN;
 #endif
         break;
     case AV_PIX_FMT_YUV444P10:
+#if CONFIG_AV1_D3D11VA_HWACCEL
+        *fmtp++ = AV_PIX_FMT_D3D11VA_VLD;
+        *fmtp++ = AV_PIX_FMT_D3D11;
+#endif
 #if CONFIG_AV1_VULKAN_HWACCEL
         *fmtp++ = AV_PIX_FMT_VULKAN;
 #endif
@@ -645,10 +679,16 @@ static int get_pixel_format(AVCodecContext *avctx)
 #if CONFIG_AV1_NVDEC_HWACCEL
         *fmtp++ = AV_PIX_FMT_CUDA;
 #endif
+#if CONFIG_AV1_NVDEC_CUARRAY_HWACCEL
+        *fmtp++ = AV_PIX_FMT_CUARRAY;
+#endif
         break;
     case AV_PIX_FMT_GRAY10:
 #if CONFIG_AV1_NVDEC_HWACCEL
         *fmtp++ = AV_PIX_FMT_CUDA;
+#endif
+#if CONFIG_AV1_NVDEC_CUARRAY_HWACCEL
+        *fmtp++ = AV_PIX_FMT_CUARRAY;
 #endif
         break;
     }
@@ -656,11 +696,14 @@ static int get_pixel_format(AVCodecContext *avctx)
     *fmtp++ = pix_fmt;
     *fmtp = AV_PIX_FMT_NONE;
 
-    for (int i = 0; pix_fmts[i] != pix_fmt; i++)
-        if (pix_fmts[i] == avctx->pix_fmt) {
-            s->pix_fmt = pix_fmt;
-            return 1;
-        }
+    /* the negotiated hwaccel can only be kept if the underlying pixel
+     * format did not change, otherwise its surfaces have the wrong format */
+    if (pix_fmt == avctx->sw_pix_fmt)
+        for (int i = 0; pix_fmts[i] != pix_fmt; i++)
+            if (pix_fmts[i] == avctx->pix_fmt) {
+                s->pix_fmt = pix_fmt;
+                return 1;
+            }
 
     ret = ff_get_format(avctx, pix_fmts);
 
@@ -687,8 +730,8 @@ static int get_pixel_format(AVCodecContext *avctx)
 
 static void av1_frame_unref(AV1Frame *f)
 {
-    ff_progress_frame_unref(&f->pf);
     av_refstruct_unref(&f->hwaccel_picture_private);
+    ff_progress_frame_unref(&f->pf);
     av_refstruct_unref(&f->header_ref);
     f->raw_frame_header = NULL;
     f->spatial_id = f->temporal_id = 0;
@@ -706,10 +749,9 @@ static void av1_frame_replace(AV1Frame *dst, const AV1Frame *src)
 
     dst->raw_frame_header = src->raw_frame_header;
 
-    ff_progress_frame_replace(&dst->pf, &src->pf);
-
     av_refstruct_replace(&dst->hwaccel_picture_private,
                           src->hwaccel_picture_private);
+    ff_progress_frame_replace(&dst->pf, &src->pf);
 
     dst->spatial_id = src->spatial_id;
     dst->temporal_id = src->temporal_id;
@@ -790,15 +832,6 @@ static int set_context_with_sequence(AVCodecContext *avctx,
         avctx->chroma_sample_location = AVCHROMA_LOC_TOPLEFT;
         break;
     }
-
-#if FF_API_CODEC_PROPS
-FF_DISABLE_DEPRECATION_WARNINGS
-    if (seq->film_grain_params_present)
-        avctx->properties |= FF_CODEC_PROPERTY_FILM_GRAIN;
-    else
-        avctx->properties &= ~FF_CODEC_PROPERTY_FILM_GRAIN;
-FF_ENABLE_DEPRECATION_WARNINGS
-#endif
 
     if (avctx->width != width || avctx->height != height) {
         int ret = ff_set_dimensions(avctx, width, height);
@@ -967,74 +1000,19 @@ fail:
 static int export_itut_t35(AVCodecContext *avctx, AVFrame *frame,
                            const AV1RawMetadataITUTT35 *itut_t35)
 {
-    GetByteContext gb;
     AV1DecContext *s = avctx->priv_data;
-    int ret, provider_code, country_code;
+    FFITUTT35 itut35 = { .country_code = itut_t35->itu_t_t35_country_code };
+    FFITUTT35Aux aux = { .dovi = &s->dovi };
+    int ret;
 
-    bytestream2_init(&gb, itut_t35->payload, itut_t35->payload_size);
+    ret = ff_itut_t35_parse_buffer(&itut35, itut_t35->payload, itut_t35->payload_size,
+                                   FF_ITUT_T35_FLAG_COUNTRY_CODE);
+    if (ret <= 0)
+        return ret;
 
-    provider_code = bytestream2_get_be16(&gb);
-    country_code = itut_t35->itu_t_t35_country_code ;
-    if (country_code == ITU_T_T35_COUNTRY_CODE_US && provider_code == ITU_T_T35_PROVIDER_CODE_ATSC) {
-        uint32_t user_identifier = bytestream2_get_be32(&gb);
-        switch (user_identifier) {
-        case MKBETAG('G', 'A', '9', '4'): { // closed captions
-            AVBufferRef *buf = NULL;
-
-            ret = ff_parse_a53_cc(&buf, gb.buffer, bytestream2_get_bytes_left(&gb));
-            if (ret < 0)
-                return ret;
-            if (!ret)
-                break;
-
-            ret = ff_frame_new_side_data_from_buf(avctx, frame, AV_FRAME_DATA_A53_CC, &buf);
-            if (ret < 0)
-                return ret;
-
-#if FF_API_CODEC_PROPS
-FF_DISABLE_DEPRECATION_WARNINGS
-            avctx->properties |= FF_CODEC_PROPERTY_CLOSED_CAPTIONS;
-FF_ENABLE_DEPRECATION_WARNINGS
-#endif
-            break;
-        }
-        default: // ignore unsupported identifiers
-            break;
-        }
-    } else if (country_code == ITU_T_T35_COUNTRY_CODE_US && provider_code == ITU_T_T35_PROVIDER_CODE_SAMSUNG) {
-        AVDynamicHDRPlus *hdrplus;
-        int provider_oriented_code = bytestream2_get_be16(&gb);
-        int application_identifier = bytestream2_get_byte(&gb);
-
-        if (provider_oriented_code != 1 || application_identifier != 4)
-            return 0; // ignore
-
-        hdrplus = av_dynamic_hdr_plus_create_side_data(frame);
-        if (!hdrplus)
-            return AVERROR(ENOMEM);
-
-        ret = av_dynamic_hdr_plus_from_t35(hdrplus, gb.buffer,
-                                           bytestream2_get_bytes_left(&gb));
-        if (ret < 0)
-            return ret;
-    } else if (country_code == ITU_T_T35_COUNTRY_CODE_US && provider_code == ITU_T_T35_PROVIDER_CODE_DOLBY) {
-        int provider_oriented_code = bytestream2_get_be32(&gb);
-        if (provider_oriented_code != 0x800)
-            return 0; // ignore
-
-        ret = ff_dovi_rpu_parse(&s->dovi, gb.buffer, bytestream2_get_bytes_left(&gb),
-                                avctx->err_recognition);
-        if (ret < 0) {
-            av_log(avctx, AV_LOG_WARNING, "Error parsing DOVI OBU.\n");
-            return 0; // ignore
-        }
-
-        ret = ff_dovi_attach_side_data(&s->dovi, frame);
-        if (ret < 0)
-            return ret;
-    } else {
-        // ignore unsupported provider codes
-    }
+    ret = ff_itut_t35_parse_payload_to_frame(&itut35, &aux, avctx, frame);
+    if (ret < 0)
+        return ret;
 
     return 0;
 }
@@ -1150,12 +1128,12 @@ static int export_film_grain(AVCodecContext *avctx, AVFrame *frame)
         aom->ar_coeffs_uv[1][i] = film_grain->ar_coeffs_cr_plus_128[i] - 128;
     }
 
-    aom->uv_mult[0] = film_grain->cb_mult;
-    aom->uv_mult[1] = film_grain->cr_mult;
-    aom->uv_mult_luma[0] = film_grain->cb_luma_mult;
-    aom->uv_mult_luma[1] = film_grain->cr_luma_mult;
-    aom->uv_offset[0] = film_grain->cb_offset;
-    aom->uv_offset[1] = film_grain->cr_offset;
+    aom->uv_mult[0] = film_grain->cb_mult - 128;
+    aom->uv_mult[1] = film_grain->cr_mult - 128;
+    aom->uv_mult_luma[0] = film_grain->cb_luma_mult - 128;
+    aom->uv_mult_luma[1] = film_grain->cr_luma_mult - 128;
+    aom->uv_offset[0] = film_grain->cb_offset - 256;
+    aom->uv_offset[1] = film_grain->cr_offset - 256;
 
     return 0;
 }
@@ -1192,6 +1170,10 @@ static int set_output_frame(AVCodecContext *avctx, AVFrame *frame)
 
     frame->pts = pkt->pts;
     frame->pkt_dts = pkt->dts;
+    if (pkt->flags & AV_PKT_FLAG_DISCARD)
+        frame->flags |= AV_FRAME_FLAG_DISCARD;
+    else
+        frame->flags &= ~AV_FRAME_FLAG_DISCARD;
 
     av_packet_unref(pkt);
 
@@ -1334,7 +1316,7 @@ static int av1_receive_frame_internal(AVCodecContext *avctx, AVFrame *frame)
         case AV1_OBU_REDUNDANT_FRAME_HEADER:
             if (s->raw_frame_header)
                 break;
-        // fall-through
+            av_fallthrough;
         case AV1_OBU_FRAME:
         case AV1_OBU_FRAME_HEADER:
             if (!s->raw_seq) {
@@ -1392,7 +1374,7 @@ static int av1_receive_frame_internal(AVCodecContext *avctx, AVFrame *frame)
             }
             if (unit->type != AV1_OBU_FRAME)
                 break;
-        // fall-through
+            av_fallthrough;
         case AV1_OBU_TILE_GROUP:
             if (!s->raw_frame_header) {
                 av_log(avctx, AV_LOG_ERROR, "Missing Frame Header.\n");
@@ -1422,7 +1404,7 @@ static int av1_receive_frame_internal(AVCodecContext *avctx, AVFrame *frame)
         case AV1_OBU_TEMPORAL_DELIMITER:
             s->raw_frame_header = NULL;
             raw_tile_group      = NULL;
-        // fall-through
+            break;
         case AV1_OBU_TILE_LIST:
         case AV1_OBU_PADDING:
             break;
@@ -1617,6 +1599,9 @@ const FFCodec ff_av1_decoder = {
 #endif
 #if CONFIG_AV1_NVDEC_HWACCEL
         HWACCEL_NVDEC(av1),
+#endif
+#if CONFIG_AV1_NVDEC_CUARRAY_HWACCEL
+        HWACCEL_NVDEC_CUARRAY(av1),
 #endif
 #if CONFIG_AV1_VAAPI_HWACCEL
         HWACCEL_VAAPI(av1),

@@ -65,13 +65,14 @@ Communication
 =============
 website                                 (T: https://git.ffmpeg.org/ffmpeg-web) Deby Barbara Lepage
 fate.ffmpeg.org                         (L: fate-admin@ffmpeg.org) (W: https://fate.ffmpeg.org) (P: https://ffmpeg.org/fate.html) (S: https://git.ffmpeg.org/fateserver) Timo Rothenpieler
-Trac bug tracker                        (W: https://trac.ffmpeg.org) Alexander Strasser, Michael Niedermayer, Carl Eugen Hoyos
+Trac bug tracker                    [X] (W: https://trac.ffmpeg.org) Alexander Strasser, Michael Niedermayer, Carl Eugen Hoyos
+Forgejo issue tracker                   (W: https://code.ffmpeg.org/FFmpeg/FFmpeg/issues)
 Patchwork                           [2] (W: https://patchwork.ffmpeg.org) Andriy Gelman
 mailing lists                           (W: https://ffmpeg.org/contact.html#MailingLists) Baptiste Coudurier
 Twitter                                 Reynaldo H. Verdejo Pinochet
 Launchpad                               Timothy Gu
 ffmpeg-security                     [2] (L: ffmpeg-security@ffmpeg.org) (W: https://ffmpeg.org/security.html) Michael Niedermayer, Reimar Doeffinger
-
+YesWeHack Security reports          [2] Timo Rothenpieler, Michael Niedermayer
 
 libavutil
 =========
@@ -105,6 +106,21 @@ Other:
   rational.c, rational.h            [2] Michael Niedermayer
   rc4                                   Reimar Doeffinger
   ripemd.c, ripemd.h                    James Almer
+  tests/ambient_viewing_environment.c,
+  tests/buffer.c, tests/csp.c,
+  tests/detection_bbox.c,
+  tests/dovi_meta.c,
+  tests/downmix_info.c,
+  tests/film_grain_params.c,
+  tests/hdr_dynamic_metadata.c,
+  tests/hdr_dynamic_vivid_metadata.c,
+  tests/mastering_display_metadata.c,
+  tests/mathematics.c, tests/rc4.c,
+  tests/samplefmt.c, tests/side_data.c,
+  tests/spherical.c, tests/stereo3d.c,
+  tests/tdrdi.c, tests/timestamp.c,
+  tests/video_enc_params.c,
+  tests/video_hint.c                    Marcos Ashton Iglesias
   tx*                               [2] Lynne
 
 
@@ -150,6 +166,7 @@ Codecs:
   8bps.c                                Roberto Togni
   8svx.c                                Jaikrishnan Menon
   aacenc*, aaccoder.c                   Rostislav Pehlivanov
+  ac3dec*, eac3dec*                     Ayoub Nabil Boubagrat
   adpcm.c                               Zane van Iperen
   alacenc.c                             Jaikrishnan Menon
   alsdec.c                              Thilo Borgmann, Umair Khan
@@ -234,7 +251,6 @@ Codecs:
   nuv.c                                 Reimar Doeffinger
   nvdec*, nvenc*                        Timo Rothenpieler
   oh*                                   Zhao Zhili
-  omx.c                                 Martin Storsjo, Aman Gupta
   opus*                                 Rostislav Pehlivanov
   pcx.c                                 Ivo van Poorten
   pgssubdec.c                           Reimar Doeffinger
@@ -253,7 +269,6 @@ Codecs:
   sanm.c                                Manuel Lauss
   smc.c                                 Mike Melanson
   snow*                                 Michael Niedermayer, Loren Merritt
-  sonic.c                               Alex Beregszaszi
   speedhq.c                             Steinar H. Gunderson
   srt*                                  Aurelien Jacobs
   sunrast.c                             Ivo van Poorten
@@ -308,7 +323,6 @@ libavdevice
   iec61883.c                            Georg Lippitsch
   lavfi                                 Stefano Sabatini
   libdc1394.c                           Roman Shaposhnik
-  opengl_enc.c                          Lukasz Marek
   pulse_audio_enc.c                     Lukasz Marek
   sdl                                   Stefano Sabatini
   sdl2.c                                Josh de Kock
@@ -320,6 +334,10 @@ libavfilter
 ===========
 
 Generic parts:
+
+  Framework and orphaned filters        Nicolas George
+  (except hardware acceleration)
+
   graphdump.c                           Nicolas George
 
   motion_estimation.c                   Davinder Singh
@@ -338,6 +356,7 @@ Filters:
   vf_colorconstancy.c                   Mina Sami    (CC <minas.gorgy@gmail.com>)
   vf_colorkey.c                         Timo Rothenpieler
   vf_coreimage.m                        Thilo Borgmann
+  vf_*_d3d12.c                          Steven Xiao
   vf_dejudder.c                         Nicholas Robbins
   vf_delogo.c                           Jean Delvare (CC <jdelvare@suse.com>)
   vf_drawbox.c/drawgrid                 Andrey Utkin
@@ -411,9 +430,11 @@ Muxers/Demuxers:
   flvenc.c                              Michael Niedermayer, Steven Liu
   gxf.c                                 Reimar Doeffinger
   gxfenc.c                              Baptiste Coudurier
+  hls.c                                 Kacper Michajłow
   hlsenc.c                              Christian Suloway, Steven Liu
   hxvs.c                                Zhao Zhili
   iamf*                             [2] James Almer
+  id3v2*                                Romain Beauxis
   idcin.c                               Mike Melanson
   idroqdec.c                            Mike Melanson
   iff.c                                 Jaikrishnan Menon
@@ -497,6 +518,7 @@ Protocols:
   bluray.c                              Petri Hintukainen
   ftp.c                                 Lukasz Marek
   http.c                                Ronald S. Bultje
+  libcurl.c                             Kacper Michajłow
   libsrt.c                              Zhao Zhili
   libssh.c                              Lukasz Marek
   libzmq.c                              Andriy Gelman
@@ -629,6 +651,7 @@ Sean McGovern (Sean_McG)      6D03 BC60 3A33 E615 6E2E 06AD 8C06 8175 6F59 8684
 Stefano Sabatini              0D0B AD6B 5330 BBAD D3D6 6A0C 719C 2839 FC43 2D5F
 Steinar H. Gunderson          C2E9 004F F028 C18E 4EAD DB83 7F61 7561 7797 8F76
 Stephan Hilb                  4F38 0B3A 5F39 B99B F505 E562 8D5C 5554 4E17 8863
+Steven Xiao                   7ED9 67BF 738C 77D1 E28B FBC4 1C2B 2A37 51E2 98A0
 Thilo Borgmann (thilo)        CE1D B7F4 4D20 FC3A DD9F FE5A 257C 5B8F 1D20 B92F
 Tiancheng "Timothy" Gu        9456 AFC0 814A 8139 E994 8351 7FE6 B095 B582 B0D4
 Tim Nicholson                 38CF DB09 3ED0 F607 8B67 6CED 0C0B FC44 8B0B FC83

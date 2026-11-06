@@ -216,6 +216,16 @@ void term_init(void)
 #endif
 
 #if HAVE_TERMIOS_H
+    /* A closed fd 0 is later reused by the first opened input file. read_key()
+     * would then read from that input instead of the terminal and corrupt the
+     * stream, so disable interaction when fd 0 is not an open descriptor.
+     */
+    if (stdin_interaction && fcntl(0, F_GETFD) == -1) {
+        av_log(NULL, AV_LOG_WARNING,
+               "fd 0 is not an open file descriptor, stdin interaction disabled\n");
+        stdin_interaction = 0;
+    }
+
     if (stdin_interaction) {
         struct termios tty;
         if (tcgetattr (0, &tty) == 0) {
@@ -406,6 +416,7 @@ static void frame_data_free(void *opaque, uint8_t *data)
 
     av_frame_side_data_free(&fd->side_data, &fd->nb_side_data);
     avcodec_parameters_free(&fd->par_enc);
+    av_dict_free(&fd->reinit_opts);
 
     av_free(data);
 }
@@ -436,6 +447,7 @@ static int frame_data_ensure(AVBufferRef **dst, int writable)
             fd->par_enc = NULL;
             fd->side_data = NULL;
             fd->nb_side_data = 0;
+            fd->reinit_opts = NULL;
 
             if (fd_src->par_enc) {
                 int ret = 0;
@@ -444,6 +456,8 @@ static int frame_data_ensure(AVBufferRef **dst, int writable)
                 ret = fd->par_enc ?
                       avcodec_parameters_copy(fd->par_enc, fd_src->par_enc) :
                       AVERROR(ENOMEM);
+                if (!ret && fd_src->reinit_opts)
+                    ret = av_dict_copy(&fd->reinit_opts, fd_src->reinit_opts, 0);
                 if (ret < 0) {
                     av_buffer_unref(dst);
                     av_buffer_unref(&src);

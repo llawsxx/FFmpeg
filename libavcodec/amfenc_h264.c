@@ -16,11 +16,12 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
-
+#include "libavutil/avassert.h"
 #include "libavutil/hwcontext_amf.h"
 #include "libavutil/internal.h"
 #include "libavutil/mem.h"
 #include "libavutil/opt.h"
+#include "libavutil/pixdesc.h"
 #include "amfenc.h"
 #include "codec_internal.h"
 #include <AMF/components/PreAnalysis.h>
@@ -72,11 +73,12 @@ static const AVOption options[] = {
     { "latency",        "enables low latency mode", OFFSET(latency), AV_OPT_TYPE_BOOL, {.i64 = -1 },  -1, 1, VE },
 
     /// Quality Preset
-    { "quality",        "Set the encoding quality preset",  OFFSET(quality),    AV_OPT_TYPE_INT,   { .i64 = -1 }, -1, AMF_VIDEO_ENCODER_QUALITY_PRESET_QUALITY, VE, .unit = "quality" },
-    { "preset",         "Set the encoding quality preset",  OFFSET(quality),    AV_OPT_TYPE_INT,   { .i64 = -1 }, -1, AMF_VIDEO_ENCODER_QUALITY_PRESET_QUALITY, VE, .unit = "quality" },
+    { "quality",        "Set the encoding quality preset",  OFFSET(quality),    AV_OPT_TYPE_INT,   { .i64 = -1 }, -1, AMF_VIDEO_ENCODER_QUALITY_PRESET_HIGH_QUALITY, VE, .unit = "quality" },
+    { "preset",         "Set the encoding quality preset",  OFFSET(quality),    AV_OPT_TYPE_INT,   { .i64 = -1 }, -1, AMF_VIDEO_ENCODER_QUALITY_PRESET_HIGH_QUALITY, VE, .unit = "quality" },
     { "balanced",       "Balanced",                         0,                  AV_OPT_TYPE_CONST, { .i64 = AMF_VIDEO_ENCODER_QUALITY_PRESET_BALANCED },    0, 0, VE, .unit = "quality" },
     { "speed",          "Prefer Speed",                     0,                  AV_OPT_TYPE_CONST, { .i64 = AMF_VIDEO_ENCODER_QUALITY_PRESET_SPEED    },    0, 0, VE, .unit = "quality" },
     { "quality",        "Prefer Quality",                   0,                  AV_OPT_TYPE_CONST, { .i64 = AMF_VIDEO_ENCODER_QUALITY_PRESET_QUALITY  },    0, 0, VE, .unit = "quality" },
+    { "high_quality",   "Prefer High Quality",              0,                  AV_OPT_TYPE_CONST, { .i64 = AMF_VIDEO_ENCODER_QUALITY_PRESET_HIGH_QUALITY  },    0, 0, VE, .unit = "quality" },
 
     // Dynamic
     /// Rate Control Method
@@ -138,6 +140,7 @@ static const AVOption options[] = {
     { "me_quarter_pel", "Enable ME Quarter Pixel",              OFFSET(me_quarter_pel),AV_OPT_TYPE_BOOL,  { .i64 = -1 }, -1, 1, VE },
 
     { "forced_idr",     "Force I frames to be IDR frames",      OFFSET(forced_idr)   , AV_OPT_TYPE_BOOL,  { .i64 = 0  }, 0, 1, VE },
+    { "qp_stats",       "Report average QP per frame as packet side data (reduces throughput)", OFFSET(qp_stats), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, VE },
     { "aud",            "Inserts AU Delimiter NAL unit",        OFFSET(aud)          , AV_OPT_TYPE_BOOL,  { .i64 = -1 }, -1, 1, VE },
 
     { "smart_access_video",     "Enable Smart Access Video to enhance  performance by utilizing both APU and dGPU memory access",    OFFSET(smart_access_video), AV_OPT_TYPE_BOOL, {.i64 = -1  }, -1, 1, VE},
@@ -207,6 +210,7 @@ static av_cold int amf_encode_init_h264(AVCodecContext *avctx)
     int                              deblocking_filter = (avctx->flags & AV_CODEC_FLAG_LOOP_FILTER) ? 1 : 0;
     amf_int64                        color_profile;
     enum                             AVPixelFormat pix_fmt;
+    const AVPixFmtDescriptor        *pix_desc;
 
     if (avctx->framerate.num > 0 && avctx->framerate.den > 0) {
         framerate = AMFConstructRate(avctx->framerate.num, avctx->framerate.den);
@@ -275,14 +279,16 @@ static av_cold int amf_encode_init_h264(AVCodecContext *avctx)
     AMF_ASSIGN_PROPERTY_INT64(res, ctx->encoder, AMF_VIDEO_ENCODER_OUTPUT_COLOR_PROFILE, color_profile);
 
     /// Color Range (Support for older Drivers)
-    AMF_ASSIGN_PROPERTY_BOOL(res, ctx->encoder, AMF_VIDEO_ENCODER_FULL_RANGE_COLOR, !!(avctx->color_range == AVCOL_RANGE_JPEG));
+    AMF_ASSIGN_PROPERTY_BOOL(res, ctx->encoder, AMF_VIDEO_ENCODER_OUTPUT_FULL_RANGE_COLOR, (avctx->color_range == AVCOL_RANGE_JPEG));
 
     /// Color Depth
     pix_fmt = avctx->hw_frames_ctx ? ((AVHWFramesContext*)avctx->hw_frames_ctx->data)->sw_format
-                                : avctx->pix_fmt;
+                                   : avctx->pix_fmt;
+    pix_desc = av_pix_fmt_desc_get(pix_fmt);
+    av_assert0(pix_desc);
 
     // 10 bit input video is not supported by AMF H264 encoder
-    AMF_RETURN_IF_FALSE(ctx, pix_fmt != AV_PIX_FMT_P010, AVERROR_INVALIDDATA, "10-bit input video is not supported by AMF H264 encoder\n");
+    AMF_RETURN_IF_FALSE(ctx, pix_desc->comp[0].depth == 8, AVERROR_INVALIDDATA, "10-bit input video is not supported by AMF H264 encoder\n");
 
     AMF_ASSIGN_PROPERTY_INT64(res, ctx->encoder, AMF_VIDEO_ENCODER_COLOR_BIT_DEPTH, AMF_COLOR_BIT_DEPTH_8);
     /// Color Transfer Characteristics (AMF matches ISO/IEC)

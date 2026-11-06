@@ -24,6 +24,7 @@
 #include <stdint.h>
 #include "libavutil/intreadwrite.h"
 #include "parser.h"
+#include "parser_internal.h"
 #include "get_bits.h"
 #include "av3a.h"
 
@@ -221,8 +222,8 @@ static int raw_av3a_parse(AVCodecParserContext *s, AVCodecContext *avctx, const 
     return buf_size;
 }
 
-const AVCodecParser ff_av3a_parser = {
-    .codec_ids = { AV_CODEC_ID_AV3A },
+const FFCodecParser ff_av3a_parser = {
+    PARSER_CODEC_LIST(AV_CODEC_ID_AV3A),
     .priv_data_size = sizeof(Av3aParseContext),
-    .parser_parse = raw_av3a_parse,
+    .parse          = raw_av3a_parse,
 };

@@ -39,6 +39,7 @@
 #include "libavutil/opt.h"
 #include "libavutil/dict.h"
 #include "libavutil/time.h"
+#include "libavutil/tree.h"
 #include "avformat.h"
 #include "demux.h"
 #include "internal.h"
@@ -55,6 +56,8 @@
 
 #define MPEG_TIME_BASE 90000
 #define MPEG_TIME_BASE_Q (AVRational){1, MPEG_TIME_BASE}
+
+#define PACKED_AUDIO_FORMATS "aac,ac3,eac3,mp3"
 
 /*
  * An apple http stream consists of a playlist with media segment files,
@@ -82,11 +85,14 @@ struct segment {
     char *key;
     enum KeyType key_type;
     uint8_t iv[16];
+    uint64_t discontinuity_seq;
     /* associated Media Initialization Section, treated as a segment */
     struct segment *init_section;
 };
 
 struct rendition;
+struct rendition_group;
+struct variant;
 
 enum PlaylistType {
     PLS_TYPE_UNSPECIFIED,
@@ -102,15 +108,24 @@ enum PlaylistType {
 struct playlist {
     char url[MAX_URL_SIZE];
     FFIOContext pb;
-    uint8_t* read_buffer;
     AVIOContext *input;
     int input_read_done;
+    int64_t input_end; /* end of the byte range requested on input, or -1 */
     AVIOContext *input_next;
     int input_next_requested;
+    int64_t input_next_end;
     AVFormatContext *parent;
     int index;
     AVFormatContext *ctx;
     AVPacket *pkt;
+    int64_t last_cue_pts; /* reference for the cues read without media */
+    AVPacket **prev_cues;
+    int n_prev_cues;
+    int prev_cue_pos;
+    int cues_unanchored; /* cues kept before the media position was known */
+    uint64_t cues_discontinuity_seq; /* of the segment the kept cues are from */
+    AVPacket **cur_cues;
+    int n_cur_cues;
     int has_noheader_flag;
 
     /* main demuxer streams associated with this playlist
@@ -130,6 +145,7 @@ struct playlist {
     int broken;
     int64_t cur_seq_no;
     int64_t last_seq_no;
+    int64_t first_read_seq_no;
     int m3u8_hold_counters;
     int64_t cur_seg_offset;
     int64_t last_load_time;
@@ -158,6 +174,9 @@ struct playlist {
 
     HLSAudioSetupInfo audio_setup_info;
 
+    /* Constant offset of this playlist's DTS baseline relative to
+     * c->first_timestamp. */
+    int64_t ts_offset;
     int64_t seek_timestamp;
     int seek_flags;
     int seek_stream_index; /* into subdemuxer stream array */
@@ -169,11 +188,24 @@ struct playlist {
     int n_renditions;
     struct rendition **renditions;
 
+    /* The last variant this playlist was added to and the last rendition
+     * group whose renditions were added to it. */
+    struct variant *last_variant;
+    struct rendition_group *last_group;
+
     /* Media Initialization Sections (EXT-X-MAP) associated with this
      * playlist, if any. */
     int n_init_sections;
     struct segment **init_sections;
     int is_subtitle; /* Indicates if it's a subtitle playlist */
+
+    /* Some HLS streams repeat the current timed-ID3 metadata at every segment
+     * boundary so late-joining clients get a fresh copy. Track the last seen
+     * value to avoid raising AVSTREAM_EVENT_FLAG_METADATA_UPDATED spuriously
+     * on those duplicates. timed_id3_stream_index is the subdemuxer stream
+     * index of the first timed-ID3 stream seen; -1 if none. */
+    AVDictionary *timed_id3_metadata;
+    int timed_id3_stream_index;
 };
 
 /*
@@ -185,7 +217,6 @@ struct playlist {
 struct rendition {
     enum AVMediaType type;
     struct playlist *playlist;
-    char group_id[MAX_FIELD_LEN];
     char language[MAX_FIELD_LEN];
     char name[MAX_FIELD_LEN];
     int disposition;
@@ -203,6 +234,27 @@ struct variant {
     char subtitles_group[MAX_FIELD_LEN];
 };
 
+/*
+ * The renditions with the same TYPE and GROUP-ID, which variants reference
+ * by the group id.
+ */
+struct rendition_group {
+    enum AVMediaType type;
+    char id[MAX_FIELD_LEN];
+
+    /* playlists of the external renditions */
+    int n_playlists;
+    struct playlist **playlists;
+
+    /* renditions that are part of the variant main Media Playlists */
+    int n_renditions;
+    struct rendition **renditions;
+
+    /* variants that reference the group */
+    int n_variants;
+    struct variant **variants;
+};
+
 typedef struct HLSContext {
     AVClass *class;
     AVFormatContext *ctx;
@@ -210,15 +262,22 @@ typedef struct HLSContext {
     struct variant **variants;
     int n_playlists;
     struct playlist **playlists;
+    struct AVTreeNode *playlists_by_url;
     int n_renditions;
     struct rendition **renditions;
+    int n_rendition_groups;
+    struct rendition_group **rendition_groups;
+    struct AVTreeNode *rendition_groups_by_id;
 
     int64_t cur_seq_no;
     int m3u8_hold_counters;
     int live_start_index;
     int prefer_x_start;
+    int master_time_offset_flag; ///< EXT-X-START was set by the Master Playlist
     int first_packet;
     int64_t first_timestamp;
+    struct playlist *first_timestamp_pls;
+    int first_timestamp_locked;
     int64_t cur_timestamp;
     AVIOInterruptCB *interrupt_callback;
     AVDictionary *avio_opts;
@@ -264,6 +323,23 @@ static void free_init_section_list(struct playlist *pls)
     pls->n_init_sections = 0;
 }
 
+static void free_cue_list(AVPacket ***cues, int *n_cues)
+{
+    for (int i = 0; i < *n_cues; i++)
+        av_packet_free(&(*cues)[i]);
+    av_freep(cues);
+    *n_cues = 0;
+}
+
+static void free_subtitle_cues(struct playlist *pls)
+{
+    free_cue_list(&pls->prev_cues, &pls->n_prev_cues);
+    free_cue_list(&pls->cur_cues, &pls->n_cur_cues);
+    pls->prev_cue_pos = 0;
+    pls->cues_unanchored = 0;
+    pls->last_cue_pts = AV_NOPTS_VALUE;
+}
+
 static void free_playlist_list(HLSContext *c)
 {
     int i;
@@ -271,10 +347,12 @@ static void free_playlist_list(HLSContext *c)
         struct playlist *pls = c->playlists[i];
         free_segment_list(pls);
         free_init_section_list(pls);
+        free_subtitle_cues(pls);
         av_freep(&pls->main_streams);
         av_freep(&pls->renditions);
         av_freep(&pls->id3_buf);
         av_dict_free(&pls->id3_initial);
+        av_dict_free(&pls->timed_id3_metadata);
         ff_id3v2_free_extra_meta(&pls->id3_deferred_extra);
         av_freep(&pls->init_sec_buf);
         av_packet_free(&pls->pkt);
@@ -291,6 +369,8 @@ static void free_playlist_list(HLSContext *c)
     }
     av_freep(&c->playlists);
     c->n_playlists = 0;
+    av_tree_destroy(c->playlists_by_url);
+    c->playlists_by_url = NULL;
 }
 
 static void free_variant_list(HLSContext *c)
@@ -312,32 +392,76 @@ static void free_rendition_list(HLSContext *c)
         av_freep(&c->renditions[i]);
     av_freep(&c->renditions);
     c->n_renditions = 0;
+    for (i = 0; i < c->n_rendition_groups; i++) {
+        av_freep(&c->rendition_groups[i]->playlists);
+        av_freep(&c->rendition_groups[i]->renditions);
+        av_freep(&c->rendition_groups[i]->variants);
+        av_freep(&c->rendition_groups[i]);
+    }
+    av_freep(&c->rendition_groups);
+    c->n_rendition_groups = 0;
+    av_tree_destroy(c->rendition_groups_by_id);
+    c->rendition_groups_by_id = NULL;
+}
+
+static int cmp_url_playlist(const void *key, const void *b)
+{
+    const struct playlist *pls = b;
+    return strcmp(key, pls->url);
+}
+
+static int cmp_playlist_url(const void *a, const void *b)
+{
+    const struct playlist *pa = a, *pb = b;
+    return strcmp(pa->url, pb->url);
 }
 
 static struct playlist *new_playlist(HLSContext *c, const char *url,
                                      const char *base)
 {
-    struct playlist *pls = av_mallocz(sizeof(struct playlist));
-    if (!pls)
+    struct playlist *pls;
+    struct AVTreeNode *node;
+    char abs_url[MAX_URL_SIZE];
+
+    ff_make_absolute_url(abs_url, sizeof(abs_url), base, url);
+    if (!abs_url[0])
         return NULL;
+
+    /* the same URL in several variants or renditions shares one playlist */
+    pls = av_tree_find(c->playlists_by_url, abs_url, cmp_url_playlist, NULL);
+    if (pls)
+        return pls;
+
+    pls  = av_mallocz(sizeof(struct playlist));
+    node = av_tree_node_alloc();
+    if (!pls || !node)
+        goto fail;
+
     pls->pkt = av_packet_alloc();
-    if (!pls->pkt) {
-        av_free(pls);
-        return NULL;
-    }
-    ff_make_absolute_url(pls->url, sizeof(pls->url), base, url);
-    if (!pls->url[0]) {
-        av_packet_free(&pls->pkt);
-        av_free(pls);
-        return NULL;
-    }
+    if (!pls->pkt)
+        goto fail;
+
+    av_strlcpy(pls->url, abs_url, sizeof(pls->url));
+    pls->ts_offset = AV_NOPTS_VALUE;
+    pls->last_cue_pts = AV_NOPTS_VALUE;
     pls->seek_timestamp = AV_NOPTS_VALUE;
+    pls->first_read_seq_no = -1;
 
     pls->is_id3_timestamped = -1;
     pls->id3_mpegts_timestamp = AV_NOPTS_VALUE;
+    pls->timed_id3_stream_index = -1;
 
-    dynarray_add(&c->playlists, &c->n_playlists, pls);
+    if (av_dynarray_add_nofree(&c->playlists, &c->n_playlists, pls) < 0)
+        goto fail;
+    av_tree_insert(&c->playlists_by_url, pls, cmp_playlist_url, &node);
     return pls;
+
+fail:
+    if (pls)
+        av_packet_free(&pls->pkt);
+    av_free(pls);
+    av_free(node);
+    return NULL;
 }
 
 struct variant_info {
@@ -374,9 +498,10 @@ static struct variant *new_variant(HLSContext *c, struct variant_info *info,
     return var;
 }
 
-static void handle_variant_args(struct variant_info *info, const char *key,
+static void handle_variant_args(void *context, const char *key,
                                 int key_len, char **dest, int *dest_len)
 {
+    struct variant_info *info = context;
     if (!strncmp(key, "BANDWIDTH=", key_len)) {
         *dest     =        info->bandwidth;
         *dest_len = sizeof(info->bandwidth);
@@ -398,9 +523,10 @@ struct key_info {
      char iv[35];
 };
 
-static void handle_key_args(struct key_info *info, const char *key,
+static void handle_key_args(void *context, const char *key,
                             int key_len, char **dest, int *dest_len)
 {
+    struct key_info *info = context;
     if (!strncmp(key, "METHOD=", key_len)) {
         *dest     =        info->method;
         *dest_len = sizeof(info->method);
@@ -452,6 +578,11 @@ static struct segment *new_init_section(struct playlist *pls,
         ptr = strchr(info->byterange, '@');
         if (ptr)
             sec->url_offset = strtoll(ptr+1, NULL, 10);
+        if (sec->size < 0 || sec->url_offset < 0 || sec->size > INT64_MAX - sec->url_offset) {
+            av_freep(&sec->url);
+            av_free(sec);
+            return NULL;
+        }
     } else {
         /* the entire file is the init section */
         sec->size = -1;
@@ -475,6 +606,20 @@ static void handle_init_section_args(void *context, const char *key,
     }
 }
 
+struct start_info {
+    char time_offset[MAX_FIELD_LEN];
+};
+
+static void handle_start_args(void *context, const char *key,
+                              int key_len, char **dest, int *dest_len)
+{
+    struct start_info *info = context;
+    if (!strncmp(key, "TIME-OFFSET=", key_len)) {
+        *dest     =        info->time_offset;
+        *dest_len = sizeof(info->time_offset);
+    }
+}
+
 struct rendition_info {
     char type[16];
     char uri[MAX_URL_SIZE];
@@ -487,14 +632,59 @@ struct rendition_info {
     char characteristics[MAX_CHARACTERISTICS_LEN];
 };
 
-static struct rendition *new_rendition(HLSContext *c, struct rendition_info *info,
-                                      const char *url_base)
+static int cmp_rendition_group(const void *a, const void *b)
 {
+    const struct rendition_group *ga = a, *gb = b;
+
+    if (ga->type != gb->type)
+        return FFDIFFSIGN(ga->type, gb->type);
+    return strcmp(ga->id, gb->id);
+}
+
+static struct rendition_group *find_rendition_group(HLSContext *c,
+                                                    enum AVMediaType type,
+                                                    const char *id)
+{
+    struct rendition_group key = { .type = type };
+
+    av_strlcpy(key.id, id, sizeof(key.id));
+    return av_tree_find(c->rendition_groups_by_id, &key, cmp_rendition_group, NULL);
+}
+
+static struct rendition_group *new_rendition_group(HLSContext *c,
+                                                   enum AVMediaType type,
+                                                   const char *id)
+{
+    struct rendition_group *group = find_rendition_group(c, type, id);
+    struct AVTreeNode *node;
+
+    if (group)
+        return group;
+
+    group = av_mallocz(sizeof(*group));
+    node  = av_tree_node_alloc();
+    if (!group || !node ||
+        av_dynarray_add_nofree(&c->rendition_groups, &c->n_rendition_groups, group) < 0) {
+        av_free(group);
+        av_free(node);
+        return NULL;
+    }
+    group->type = type;
+    av_strlcpy(group->id, id, sizeof(group->id));
+    av_tree_insert(&c->rendition_groups_by_id, group, cmp_rendition_group, &node);
+    return group;
+}
+
+static int new_rendition(HLSContext *c, struct rendition_info *info,
+                         const char *url_base)
+{
+    struct rendition_group *group;
     struct rendition *rend;
     enum AVMediaType type = AVMEDIA_TYPE_UNKNOWN;
     char *characteristic;
     char *chr_ptr;
     char *saveptr;
+    int ret;
 
     if (!strcmp(info->type, "AUDIO"))
         type = AVMEDIA_TYPE_AUDIO;
@@ -505,27 +695,34 @@ static struct rendition *new_rendition(HLSContext *c, struct rendition_info *inf
     else if (!strcmp(info->type, "CLOSED-CAPTIONS"))
         /* CLOSED-CAPTIONS is ignored since we do not support CEA-608 CC in
          * AVC SEI RBSP anyway */
-        return NULL;
+        return 0;
 
     if (type == AVMEDIA_TYPE_UNKNOWN) {
         av_log(c->ctx, AV_LOG_WARNING, "Can't support the type: %s\n", info->type);
-        return NULL;
+        return 0;
     }
 
     /* URI is mandatory for subtitles as per spec */
     if (type == AVMEDIA_TYPE_SUBTITLE && !info->uri[0]) {
         av_log(c->ctx, AV_LOG_ERROR, "The URI tag is REQUIRED for subtitle.\n");
-        return NULL;
+        return 0;
     }
+
+    group = new_rendition_group(c, type, info->group_id);
+    if (!group)
+        return AVERROR(ENOMEM);
 
     rend = av_mallocz(sizeof(struct rendition));
     if (!rend)
-        return NULL;
+        return AVERROR(ENOMEM);
 
-    dynarray_add(&c->renditions, &c->n_renditions, rend);
+    ret = av_dynarray_add_nofree(&c->renditions, &c->n_renditions, rend);
+    if (ret < 0) {
+        av_free(rend);
+        return ret;
+    }
 
     rend->type = type;
-    strcpy(rend->group_id, info->group_id);
     strcpy(rend->language, info->language);
     strcpy(rend->name, info->name);
 
@@ -537,10 +734,18 @@ static struct rendition *new_rendition(HLSContext *c, struct rendition_info *inf
                 rend->playlist->is_subtitle = 1;
                 rend->playlist->is_id3_timestamped = 0;
             }
-            dynarray_add(&rend->playlist->renditions,
-                         &rend->playlist->n_renditions, rend);
+            ret = av_dynarray_add_nofree(&rend->playlist->renditions,
+                                         &rend->playlist->n_renditions, rend);
+            if (ret < 0)
+                return ret;
         }
     }
+    if (rend->playlist)
+        ret = av_dynarray_add_nofree(&group->playlists, &group->n_playlists, rend->playlist);
+    else
+        ret = av_dynarray_add_nofree(&group->renditions, &group->n_renditions, rend);
+    if (ret < 0)
+        return ret;
 
     if (info->assoc_language[0]) {
         size_t langlen = strlen(rend->language);
@@ -571,7 +776,7 @@ static struct rendition *new_rendition(HLSContext *c, struct rendition_info *inf
         chr_ptr = NULL;
     }
 
-    return rend;
+    return 0;
 }
 
 static void handle_rendition_args(void *vinfo, const char *key,
@@ -624,10 +829,21 @@ static int ensure_playlist(HLSContext *c, struct playlist **pls, const char *url
 {
     if (*pls)
         return 0;
-    if (!new_variant(c, NULL, url, NULL))
+    struct variant *var = new_variant(c, NULL, url, NULL);
+    if (!var)
         return AVERROR(ENOMEM);
-    *pls = c->playlists[c->n_playlists - 1];
+    *pls = var->playlists[0];
     return 0;
+}
+
+static int is_native_http(AVIOContext *pb)
+{
+#if !CONFIG_HTTP_PROTOCOL
+    return 0;
+#else
+    URLContext *uc = ffio_geturlcontext(pb);
+    return uc && !strncmp(uc->prot->name, "http", 4);
+#endif
 }
 
 static int open_url_keepalive(AVFormatContext *s, AVIOContext **pb,
@@ -699,7 +915,7 @@ static int open_url(AVFormatContext *s, AVIOContext **pb, const char *url,
     av_dict_copy(&tmp, *opts, 0);
     av_dict_copy(&tmp, opts2, 0);
 
-    if (is_http && c->http_persistent && *pb) {
+    if (is_http && c->http_persistent && is_native_http(*pb)) {
         ret = open_url_keepalive(c->ctx, pb, url, &tmp);
         if (ret == AVERROR_EXIT) {
             av_dict_free(&tmp);
@@ -714,6 +930,7 @@ static int open_url(AVFormatContext *s, AVIOContext **pb, const char *url,
             ret = s->io_open(s, pb, url, AVIO_FLAG_READ, &tmp);
         }
     } else {
+        av_assert0(!*pb);
         ret = s->io_open(s, pb, url, AVIO_FLAG_READ, &tmp);
     }
     if (ret >= 0) {
@@ -787,6 +1004,7 @@ static int parse_playlist(HLSContext *c, const char *url,
 {
     int ret = 0, is_segment = 0, is_variant = 0;
     int64_t duration = 0;
+    uint64_t discontinuity_seq = 0;
     enum KeyType key_type = KEY_NONE;
     uint8_t iv[16] = "";
     int has_iv = 0;
@@ -804,6 +1022,10 @@ static int parse_playlist(HLSContext *c, const char *url,
     struct segment **prev_segments = NULL;
     int prev_n_segments = 0;
     int64_t prev_start_seq_no = -1;
+    int64_t load_start = av_gettime_relative();
+    int64_t start_time_offset = 0;
+    int time_offset_flag = 0;
+    int finished = 0;
 
     if (is_http && !in && c->http_persistent && c->playlist_pb) {
         in = c->playlist_pb;
@@ -826,12 +1048,12 @@ static int parse_playlist(HLSContext *c, const char *url,
         if (c->http_persistent)
             av_dict_set(&opts, "multiple_requests", "1", 0);
 
-        ret = c->ctx->io_open(c->ctx, &in, url, AVIO_FLAG_READ, &opts);
+        ret = open_url(c->ctx, &in, url, &opts, NULL, NULL);
         av_dict_free(&opts);
         if (ret < 0)
             return ret;
 
-        if (is_http && c->http_persistent)
+        if (is_http && c->http_persistent && is_native_http(in))
             c->playlist_pb = in;
         else
             close_in = 1;
@@ -859,14 +1081,18 @@ static int parse_playlist(HLSContext *c, const char *url,
     while (!avio_feof(in)) {
         ff_get_chomp_line(in, line, sizeof(line));
         if (av_strstart(line, "#EXT-X-STREAM-INF:", &ptr)) {
+            if (pls) {
+                av_log(c->ctx, AV_LOG_ERROR,
+                       "Master Playlist tag found in a Media Playlist\n");
+                ret = AVERROR_INVALIDDATA;
+                goto fail;
+            }
             is_variant = 1;
             memset(&variant_info, 0, sizeof(variant_info));
-            ff_parse_key_value(ptr, (ff_parse_key_val_cb) handle_variant_args,
-                               &variant_info);
+            ff_parse_key_value(ptr, handle_variant_args, &variant_info);
         } else if (av_strstart(line, "#EXT-X-KEY:", &ptr)) {
             struct key_info info = {{0}};
-            ff_parse_key_value(ptr, (ff_parse_key_val_cb) handle_key_args,
-                               &info);
+            ff_parse_key_value(ptr, handle_key_args, &info);
             key_type = KEY_NONE;
             has_iv = 0;
             if (!strcmp(info.method, "AES-128"))
@@ -880,9 +1106,16 @@ static int parse_playlist(HLSContext *c, const char *url,
             av_strlcpy(key, info.uri, sizeof(key));
         } else if (av_strstart(line, "#EXT-X-MEDIA:", &ptr)) {
             struct rendition_info info = {{0}};
-            ff_parse_key_value(ptr, (ff_parse_key_val_cb) handle_rendition_args,
-                               &info);
-            new_rendition(c, &info, url);
+            if (pls) {
+                av_log(c->ctx, AV_LOG_ERROR,
+                       "Master Playlist tag found in a Media Playlist\n");
+                ret = AVERROR_INVALIDDATA;
+                goto fail;
+            }
+            ff_parse_key_value(ptr, handle_rendition_args, &info);
+            ret = new_rendition(c, &info, url);
+            if (ret < 0)
+                goto fail;
         } else if (av_strstart(line, "#EXT-X-TARGETDURATION:", &ptr)) {
             int64_t t;
             ret = ensure_playlist(c, &pls, url);
@@ -952,23 +1185,28 @@ static int parse_playlist(HLSContext *c, const char *url,
             }
 
         } else if (av_strstart(line, "#EXT-X-START:", &ptr)) {
-            const char *time_offset_value = NULL;
-            ret = ensure_playlist(c, &pls, url);
-            if (ret < 0) {
-                goto fail;
-            }
-            if (av_strstart(ptr, "TIME-OFFSET=", &time_offset_value)) {
-                float offset = strtof(time_offset_value, NULL);
-                pls->start_time_offset = offset * AV_TIME_BASE;
-                pls->time_offset_flag = 1;
+            struct start_info info = {0};
+            ff_parse_key_value(ptr, handle_start_args, &info);
+            if (info.time_offset[0]) {
+                double offset = strtod(info.time_offset, NULL) * AV_TIME_BASE;
+                if (offset >= -0x1p63 && offset < 0x1p63) {
+                    start_time_offset = offset;
+                    time_offset_flag  = 1;
+                } else {
+                    av_log(c->ctx, AV_LOG_WARNING, "TIME-OFFSET value is "
+                                                    "invalid, it will be ignored\n");
+                }
             } else {
-                av_log(c->ctx, AV_LOG_WARNING, "#EXT-X-START value is"
-                                                "invalid, it will be ignored");
+                av_log(c->ctx, AV_LOG_WARNING, "#EXT-X-START value is "
+                                                "invalid, it will be ignored\n");
                 continue;
             }
         } else if (av_strstart(line, "#EXT-X-ENDLIST", &ptr)) {
-            if (pls)
-                pls->finished = 1;
+            finished = 1;
+        } else if (av_strstart(line, "#EXT-X-DISCONTINUITY-SEQUENCE:", &ptr)) {
+            discontinuity_seq = strtoull(ptr, NULL, 10);
+        } else if (!strcmp(line, "#EXT-X-DISCONTINUITY")) {
+            discontinuity_seq++;
         } else if (av_strstart(line, "#EXTINF:", &ptr)) {
             double d = atof(ptr) * AV_TIME_BASE;
             if (d < 0 || d > INT64_MAX || isnan(d)) {
@@ -1063,6 +1301,7 @@ static int parse_playlist(HLSContext *c, const char *url,
                 }
                 seg->duration = duration;
                 seg->key_type = key_type;
+                seg->discontinuity_seq = discontinuity_seq;
                 dynarray_add(&pls->segments, &pls->n_segments, seg);
                 is_segment = 0;
 
@@ -1081,7 +1320,8 @@ static int parse_playlist(HLSContext *c, const char *url,
         }
     }
     if (prev_segments) {
-        if (pls->start_seq_no > prev_start_seq_no && c->first_timestamp != AV_NOPTS_VALUE) {
+        if (pls->start_seq_no > prev_start_seq_no && c->first_timestamp != AV_NOPTS_VALUE &&
+            c->first_timestamp_pls == pls) {
             int64_t prev_timestamp = c->first_timestamp;
             int i;
             int64_t diff = pls->start_seq_no - prev_start_seq_no;
@@ -1096,21 +1336,52 @@ static int parse_playlist(HLSContext *c, const char *url,
             av_log(c->ctx, AV_LOG_WARNING, "Media sequence changed unexpectedly: %"PRId64" -> %"PRId64"\n",
                    prev_start_seq_no, pls->start_seq_no);
         }
-        free_segment_dynarray(prev_segments, prev_n_segments);
-        av_freep(&prev_segments);
     }
-    if (pls)
-        pls->last_load_time = av_gettime_relative();
+
+    /* Media Playlist tags may precede the first tag that allocates the
+     * playlist. */
+    if (pls && finished)
+        pls->finished = 1;
+
+    /* EXT-X-START is valid in both playlist types. A value from the Master
+     * Playlist applies to all its Media Playlists, which then ignore their
+     * own (RFC 8216 4.3.5). */
+    if (time_offset_flag && !c->master_time_offset_flag) {
+        if (pls) {
+            pls->start_time_offset = start_time_offset;
+            pls->time_offset_flag  = 1;
+        } else {
+            c->master_time_offset_flag = 1;
+            for (int i = 0; i < c->n_playlists; i++) {
+                c->playlists[i]->start_time_offset = start_time_offset;
+                c->playlists[i]->time_offset_flag  = 1;
+            }
+        }
+    }
 
 fail:
+    free_segment_dynarray(prev_segments, prev_n_segments);
+    av_freep(&prev_segments);
+    if (pls)
+        pls->last_load_time = load_start;
     av_free(new_url);
     if (close_in)
         ff_format_io_close(c->ctx, &in);
     c->ctx->ctx_flags = c->ctx->ctx_flags & ~(unsigned)AVFMTCTX_UNSEEKABLE;
     if (!c->n_variants || !c->variants[0]->n_playlists ||
-        !(c->variants[0]->playlists[0]->finished ||
-          c->variants[0]->playlists[0]->type == PLS_TYPE_EVENT))
+        !c->variants[0]->playlists[0]->n_segments)
         c->ctx->ctx_flags |= AVFMTCTX_UNSEEKABLE;
+
+    if (c->n_variants && c->variants[0]->n_playlists &&
+        c->variants[0]->playlists[0]->type == PLS_TYPE_EVENT &&
+        !c->variants[0]->playlists[0]->finished) {
+        struct playlist *p = c->variants[0]->playlists[0];
+        int64_t duration = 0;
+        for (int i = 0; i < p->n_segments; i++)
+            duration += p->segments[i]->duration;
+        c->ctx->duration = duration;
+    }
+
     return ret;
 }
 
@@ -1128,6 +1399,36 @@ static struct segment *next_segment(struct playlist *pls)
     if (n >= pls->n_segments)
         return NULL;
     return pls->segments[n];
+}
+
+/* True if 'next' is an unencrypted byte range that directly follows 'cur' in
+ * the same resource and ends within the range requested up to 'end', so that
+ * it is read on from the input of 'cur' (i.e. consecutive EXT-X-BYTERANGE
+ * segments). */
+static int segment_continues(const struct segment *cur,
+                             const struct segment *next, int64_t end)
+{
+    return cur && next &&
+           cur->size >= 0 && next->size >= 0 &&
+           next->url_offset == cur->url_offset + cur->size &&
+           next->url_offset + next->size <= end &&
+           cur->key_type == KEY_NONE && next->key_type == KEY_NONE &&
+           next->init_section == cur->init_section &&
+           !strcmp(next->url, cur->url);
+}
+
+static int64_t range_end(struct playlist *pls, const struct segment *seg)
+{
+    int64_t n = pls->cur_seq_no - pls->start_seq_no + 1;
+
+    if (seg == next_segment(pls))
+        n++;
+    else if (seg != current_segment(pls))
+        return seg->url_offset + seg->size;
+    for (; n < pls->n_segments &&
+           segment_continues(seg, pls->segments[n], INT64_MAX); n++)
+        seg = pls->segments[n];
+    return seg->url_offset + seg->size;
 }
 
 static int read_from_url(struct playlist *pls, struct segment *seg,
@@ -1155,7 +1456,7 @@ static void parse_id3(AVFormatContext *s, AVIOContext *pb,
     static const char id3_priv_owner_audio_setup[] = "com.apple.streaming.audioDescription";
     ID3v2ExtraMeta *meta;
 
-    ff_id3v2_read_dict(pb, metadata, ID3v2_DEFAULT_MAGIC, extra_meta);
+    ff_id3v2_read_dict(NULL, pb, metadata, ID3v2_DEFAULT_MAGIC, extra_meta);
     for (meta = *extra_meta; meta; meta = meta->next) {
         if (!strcmp(meta->tag, "PRIV")) {
             ID3v2ExtraMetaPRIV *priv = &meta->data.priv;
@@ -1225,9 +1526,10 @@ static void handle_id3(AVIOContext *pb, struct playlist *pls)
         pls->id3_found = 1;
 
         /* get picture attachment and set text metadata */
-        if (pls->ctx->nb_streams)
-            ff_id3v2_parse_apic(pls->ctx, extra_meta);
-        else
+        if (pls->ctx->nb_streams) {
+            if (av_match_name(pls->ctx->iformat->name, PACKED_AUDIO_FORMATS))
+                ff_id3v2_parse_apic(pls->ctx, extra_meta);
+        } else
             /* demuxer not yet opened, defer picture attachment */
             pls->id3_deferred_extra = extra_meta;
 
@@ -1243,7 +1545,7 @@ static void handle_id3(AVIOContext *pb, struct playlist *pls)
         av_dict_free(&metadata);
     }
 
-    if (!pls->id3_deferred_extra)
+    if (pls->id3_deferred_extra != extra_meta)
         ff_id3v2_free_extra_meta(&extra_meta);
 }
 
@@ -1378,7 +1680,8 @@ static int read_key(HLSContext *c, struct playlist *pls, struct segment *seg)
     return 0;
 }
 
-static int open_input(HLSContext *c, struct playlist *pls, struct segment *seg, AVIOContext **in)
+static int open_input(HLSContext *c, struct playlist *pls, struct segment *seg,
+                      AVIOContext **in, int64_t *end)
 {
     AVDictionary *opts = NULL;
     int ret;
@@ -1387,11 +1690,13 @@ static int open_input(HLSContext *c, struct playlist *pls, struct segment *seg, 
     if (c->http_persistent)
         av_dict_set(&opts, "multiple_requests", "1", 0);
 
+    *end = -1;
     if (seg->size >= 0) {
-        /* try to restrict the HTTP request to the part we want
-         * (if this is in fact a HTTP request) */
+        /* Restrict the request to the wanted byte range, extended so that one
+         * request serves the whole run of segments that continue it. */
+        *end = range_end(pls, seg);
         av_dict_set_int(&opts, "offset", seg->url_offset, 0);
-        av_dict_set_int(&opts, "end_offset", seg->url_offset + seg->size, 0);
+        av_dict_set_int(&opts, "end_offset", *end, 0);
     }
 
     av_log(pls->parent, AV_LOG_VERBOSE, "HLS request for url '%s', offset %"PRId64", playlist %d\n",
@@ -1467,7 +1772,7 @@ static int update_init_section(struct playlist *pls, struct segment *seg)
     if (!seg->init_section)
         return 0;
 
-    ret = open_input(c, pls, seg->init_section, &pls->input);
+    ret = open_input(c, pls, seg->init_section, &pls->input, &pls->input_end);
     if (ret < 0) {
         av_log(pls->parent, AV_LOG_WARNING,
                "Failed to open an initialization section in playlist %d\n",
@@ -1648,6 +1953,7 @@ static int read_data_continuous(void *opaque, uint8_t *buf, int buf_size)
     struct segment *seg;
 
     if (c->http_persistent && v->input_read_done) {
+        av_assert0(v->input);
         ret = reload_playlist(v, c);
         if (ret < 0)
             return ret;
@@ -1662,7 +1968,7 @@ restart:
 
     seg = current_segment(v);
 
-    if (!v->input || (c->http_persistent && v->input_read_done)) {
+    if (!v->input || v->input_read_done) {
         /* load/update Media Initialization Section, if any */
         ret = update_init_section(v, seg);
         if (ret)
@@ -1670,11 +1976,12 @@ restart:
 
         if (c->http_multiple == 1 && v->input_next_requested) {
             FFSWAP(AVIOContext *, v->input, v->input_next);
+            FFSWAP(int64_t, v->input_end, v->input_next_end);
             v->cur_seg_offset = 0;
             v->input_next_requested = 0;
             ret = 0;
         } else {
-            ret = open_input(c, v, seg, &v->input);
+            ret = open_input(c, v, seg, &v->input, &v->input_end);
         }
         if (ret < 0) {
             if (ff_check_interrupt(c->interrupt_callback))
@@ -1695,6 +2002,9 @@ restart:
         }
         segment_retries = 0;
         just_opened = 1;
+        v->input_read_done = 0;
+        if (v->first_read_seq_no < 0)
+            v->first_read_seq_no = v->cur_seq_no;
     }
 
     if (c->http_multiple == -1) {
@@ -1708,8 +2018,9 @@ restart:
 
     seg = next_segment(v);
     if (c->http_multiple == 1 && !v->input_next_requested &&
-        seg && seg->key_type == KEY_NONE && av_strstart(seg->url, "http", NULL)) {
-        ret = open_input(c, v, seg, &v->input_next);
+        seg && seg->key_type == KEY_NONE && av_strstart(seg->url, "http", NULL) &&
+        !segment_continues(current_segment(v), seg, v->input_end)) {
+        ret = open_input(c, v, seg, &v->input_next, &v->input_next_end);
         if (ret < 0) {
             if (ff_check_interrupt(c->interrupt_callback))
                 return AVERROR_EXIT;
@@ -1724,7 +2035,7 @@ restart:
     if (v->init_sec_buf_read_offset < v->init_sec_data_len) {
         /* Push init section out first before first actual segment */
         int copy_size = FFMIN(v->init_sec_data_len - v->init_sec_buf_read_offset, buf_size);
-        memcpy(buf, v->init_sec_buf, copy_size);
+        memcpy(buf, v->init_sec_buf + v->init_sec_buf_read_offset, copy_size);
         v->init_sec_buf_read_offset += copy_size;
         return copy_size;
     }
@@ -1740,8 +2051,21 @@ restart:
 
         return ret;
     }
-    if (c->http_persistent &&
-        seg->key_type == KEY_NONE && av_strstart(seg->url, "http", NULL)) {
+    if (ret == 0 && segment_continues(seg, next_segment(v), v->input_end)) {
+        /* The next segment follows within the requested range and is read
+         * on from the same input. */
+        v->cur_seq_no++;
+        c->cur_seq_no = v->cur_seq_no;
+        v->cur_seg_offset = 0;
+        just_opened = 1;
+        goto restart;
+    }
+    /* Keep the connection for the next request only if its reply was read
+     * to the end. */
+    if (c->http_persistent && is_native_http(v->input) &&
+        seg->key_type == KEY_NONE && av_strstart(seg->url, "http", NULL) &&
+        (seg->size >= 0 ? ret == 0 && seg->url_offset + seg->size == v->input_end
+                        : ret == AVERROR_EOF)) {
         v->input_read_done = 1;
     } else {
         ff_format_io_close(v->parent, &v->input);
@@ -1767,7 +2091,7 @@ static int read_data_subtitle_segment(void *opaque, uint8_t *buf, int buf_size)
     }
 
     if (!v->input) {
-        ret = open_input(c, v, seg, &v->input);
+        ret = open_input(c, v, seg, &v->input, &v->input_end);
         if (ret < 0) {
             if (ff_check_interrupt(c->interrupt_callback))
                 return AVERROR_EXIT;
@@ -1775,6 +2099,8 @@ static int read_data_subtitle_segment(void *opaque, uint8_t *buf, int buf_size)
                    v->index);
             return ret;
         }
+        if (v->first_read_seq_no < 0)
+            v->first_read_seq_no = v->cur_seq_no;
     }
 
     return read_from_url(v, seg, buf, buf_size);
@@ -1795,27 +2121,32 @@ static int init_subtitle_context(struct playlist *pls)
     HLSContext *c = pls->parent->priv_data;
     const AVInputFormat *in_fmt;
     AVDictionary *opts = NULL;
+    uint8_t *buf;
     int ret;
 
     if (!(pls->ctx = avformat_alloc_context()))
         return AVERROR(ENOMEM);
 
-    pls->read_buffer = av_malloc(INITIAL_BUFFER_SIZE);
-    if (!pls->read_buffer) {
+    buf = av_malloc(INITIAL_BUFFER_SIZE);
+    if (!buf) {
         avformat_free_context(pls->ctx);
         pls->ctx = NULL;
         return AVERROR(ENOMEM);
     }
 
-    ffio_init_context(&pls->pb, pls->read_buffer, INITIAL_BUFFER_SIZE, 0, pls,
+    av_freep(&pls->pb.pub.buffer);
+    ffio_init_context(&pls->pb, buf, INITIAL_BUFFER_SIZE, 0, pls,
                       read_data_subtitle_segment, NULL, NULL);
     pls->pb.pub.seekable = 0;
     pls->ctx->pb       = &pls->pb.pub;
     pls->ctx->io_open  = nested_io_open;
 
     ret = ff_copy_whiteblacklists(pls->ctx, pls->parent);
-    if (ret < 0)
+    if (ret < 0) {
+        avformat_free_context(pls->ctx);
+        pls->ctx = NULL;
         return ret;
+    }
 
     in_fmt = av_find_input_format("webvtt");
     av_dict_copy(&opts, c->seg_format_opts, 0);
@@ -1825,9 +2156,117 @@ static int init_subtitle_context(struct playlist *pls)
     return ret;
 }
 
+static int cue_repeated(struct playlist *v, const AVPacket *pkt)
+{
+    /* both segments are in pts order, so the candidates start where the
+     * previous lookup stopped */
+    while (v->prev_cue_pos < v->n_prev_cues &&
+           v->prev_cues[v->prev_cue_pos]->pts < pkt->pts)
+        v->prev_cue_pos++;
+
+    for (int i = v->prev_cue_pos; i < v->n_prev_cues; i++) {
+        const AVPacket *prev = v->prev_cues[i];
+        const uint8_t *settings, *prev_settings;
+        size_t size, prev_size;
+
+        if (prev->pts != pkt->pts)
+            break;
+        if (prev->duration != pkt->duration || prev->size != pkt->size ||
+            memcmp(prev->data, pkt->data, pkt->size))
+            continue;
+        settings = av_packet_get_side_data(pkt, AV_PKT_DATA_WEBVTT_SETTINGS, &size);
+        prev_settings = av_packet_get_side_data(prev, AV_PKT_DATA_WEBVTT_SETTINGS,
+                                                &prev_size);
+        if (size == prev_size && (!size || !memcmp(settings, prev_settings, size)))
+            return 1;
+    }
+    return 0;
+}
+
+static int remember_cue(struct playlist *v, const AVPacket *pkt)
+{
+    AVPacket *cue = av_packet_clone(pkt);
+
+    if (!cue)
+        return AVERROR(ENOMEM);
+    if (av_dynarray_add_nofree(&v->cur_cues, &v->n_cur_cues, cue) < 0) {
+        av_packet_free(&cue);
+        return AVERROR(ENOMEM);
+    }
+    return 0;
+}
+
+static AVRational get_timebase(struct playlist *pls);
+
+/* The position of the media, the reference for the cue times: the last
+ * returned packet, or a packet buffered from a media playlist before
+ * anything was returned. AV_NOPTS_VALUE without media. */
+static int64_t media_position(HLSContext *c)
+{
+    if (c->cur_timestamp != AV_NOPTS_VALUE)
+        return c->cur_timestamp;
+    for (int i = 0; i < c->n_playlists; i++) {
+        struct playlist *pls = c->playlists[i];
+
+        if (!pls->is_subtitle && pls->needed && pls->pkt->data &&
+            pls->pkt->dts != AV_NOPTS_VALUE)
+            return av_rescale_q(pls->pkt->dts, get_timebase(pls), AV_TIME_BASE_Q);
+    }
+    return AV_NOPTS_VALUE;
+}
+
+/* The MPEG-TS time of a cue is on the 33 bit PES clock, this is the period
+ * of that clock nearest to ref, both in MPEG_TIME_BASE_Q. */
+static int64_t nearest_period(int64_t pts, int64_t ref)
+{
+    const int64_t period = 1LL << 33, half = 1LL << 32;
+    int64_t d = pts - ref;
+
+    return pts - (d >= 0 ? d + half : d - half) / period * period;
+}
+
+static void unwrap_pkt(AVPacket *pkt, AVRational tb, int64_t ref)
+{
+    int64_t pts;
+
+    if (pkt->pts == AV_NOPTS_VALUE)
+        return;
+    pts = nearest_period(av_rescale_q(pkt->pts, tb, MPEG_TIME_BASE_Q), ref);
+    pkt->pts = pkt->dts = av_rescale_q(pts, MPEG_TIME_BASE_Q, tb);
+}
+
+/* Put a cue on the period nearest to the media position, where the
+ * timestamps of the other renditions continue after a wrap. Without media
+ * a cue follows the previous cue of its playlist, and the cues kept from
+ * that time move to the media position once it is known. */
+static void unwrap_cue_pts(HLSContext *c, struct playlist *v, AVPacket *pkt)
+{
+    AVRational tb = v->ctx->streams[pkt->stream_index]->time_base;
+    int64_t ref = media_position(c);
+
+    if (ref != AV_NOPTS_VALUE) {
+        ref = av_rescale_q(ref, AV_TIME_BASE_Q, MPEG_TIME_BASE_Q);
+        if (v->cues_unanchored) {
+            for (int i = 0; i < v->n_prev_cues; i++)
+                unwrap_pkt(v->prev_cues[i], tb, ref);
+            for (int i = 0; i < v->n_cur_cues; i++)
+                unwrap_pkt(v->cur_cues[i], tb, ref);
+            v->prev_cue_pos    = 0;
+            v->cues_unanchored = 0;
+        }
+        unwrap_pkt(pkt, tb, ref);
+    } else {
+        v->cues_unanchored = 1;
+        if (v->last_cue_pts != AV_NOPTS_VALUE)
+            unwrap_pkt(pkt, tb, av_rescale_q(v->last_cue_pts, tb, MPEG_TIME_BASE_Q));
+    }
+    v->last_cue_pts = pkt->pts;
+}
+
 static int read_subtitle_packet(struct playlist *v, AVPacket *pkt)
 {
     HLSContext *c = v->parent->priv_data;
+    struct segment *seg;
     int ret;
 
 restart:
@@ -1839,14 +2278,31 @@ restart:
         ff_format_io_close(v->parent, &v->input);
 
     if (!v->input && !v->ctx) {
+        /* nothing is repeated across a discontinuity */
+        seg = current_segment(v);
+        if (seg && seg->discontinuity_seq != v->cues_discontinuity_seq) {
+            free_subtitle_cues(v);
+            v->cues_discontinuity_seq = seg->discontinuity_seq;
+        }
         ret = init_subtitle_context(v);
         if (ret < 0)
             return ret;
     }
 
-    ret = av_read_frame(v->ctx, v->pkt);
-    if (!ret) {
-        return ret;
+    while (!(ret = av_read_frame(v->ctx, v->pkt))) {
+        int repeated;
+
+        unwrap_cue_pts(c, v, v->pkt);
+        repeated = cue_repeated(v, v->pkt);
+
+        ret = remember_cue(v, v->pkt);
+        if (ret < 0) {
+            av_packet_unref(v->pkt);
+            return ret;
+        }
+        if (!repeated)
+            return 0;
+        av_packet_unref(v->pkt);
     }
     ff_format_io_close(v->parent, &v->input);
     v->cur_seq_no++;
@@ -1854,31 +2310,67 @@ restart:
 
     avformat_close_input(&v->ctx);
 
+    free_cue_list(&v->prev_cues, &v->n_prev_cues);
+    FFSWAP(AVPacket **, v->prev_cues, v->cur_cues);
+    FFSWAP(int, v->n_prev_cues, v->n_cur_cues);
+    v->prev_cue_pos = 0;
+
     goto restart;
 }
 
-static void add_renditions_to_variant(HLSContext *c, struct variant *var,
-                                      enum AVMediaType type, const char *group_id)
+static int add_renditions_to_variant(HLSContext *c, struct variant *var,
+                                     enum AVMediaType type, const char *group_id)
 {
-    int i;
+    struct rendition_group *group = find_rendition_group(c, type, group_id);
+    int ret;
 
-    for (i = 0; i < c->n_renditions; i++) {
-        struct rendition *rend = c->renditions[i];
+    if (!group)
+        return 0;
 
-        if (rend->type == type && !strcmp(rend->group_id, group_id)) {
+    ret = av_dynarray_add_nofree(&group->variants, &group->n_variants, var);
+    if (ret < 0)
+        return ret;
 
-            if (rend->playlist)
-                /* rendition is an external playlist
-                 * => add the playlist to the variant */
-                dynarray_add(&var->playlists, &var->n_playlists, rend->playlist);
-            else
-                /* rendition is part of the variant main Media Playlist
-                 * => add the rendition to the main Media Playlist */
-                dynarray_add(&var->playlists[0]->renditions,
-                             &var->playlists[0]->n_renditions,
-                             rend);
+    /* add the playlists of the external renditions to the variant */
+    for (int i = 0; i < group->n_playlists; i++) {
+        struct playlist *pls = group->playlists[i];
+
+        if (pls->last_variant != var) {
+            ret = av_dynarray_add_nofree(&var->playlists, &var->n_playlists, pls);
+            if (ret < 0)
+                return ret;
+            pls->last_variant = var;
         }
     }
+    return 0;
+}
+
+/* The renditions without a playlist are part of the main Media Playlist of
+ * every variant that references their group. */
+static int add_renditions_to_playlists(HLSContext *c, enum AVMediaType type)
+{
+    for (int i = 0; i < c->n_rendition_groups; i++) {
+        struct rendition_group *group = c->rendition_groups[i];
+
+        if (group->type != type || !group->n_renditions)
+            continue;
+
+        for (int j = 0; j < group->n_variants; j++) {
+            struct playlist *pls = group->variants[j]->playlists[0];
+
+            if (pls->last_group == group)
+                continue;
+
+            for (int k = 0; k < group->n_renditions; k++) {
+                int ret = av_dynarray_add_nofree(&pls->renditions, &pls->n_renditions,
+                                                 group->renditions[k]);
+                if (ret < 0)
+                    return ret;
+            }
+            pls->last_group = group;
+        }
+    }
+    return 0;
 }
 
 static void add_metadata_from_renditions(AVFormatContext *s, struct playlist *pls,
@@ -1922,8 +2414,11 @@ static int find_timestamp_in_playlist(HLSContext *c, struct playlist *pls,
                   0 : c->first_timestamp;
 
     if (timestamp < pos) {
+        /* Seeking before the start of the playlist, clamp to the first segment. */
         *seq_no = pls->start_seq_no;
-        return 0;
+        if (seg_start_ts)
+            *seg_start_ts = pos;
+        return 1;
     }
 
     for (i = 0; i < pls->n_segments; i++) {
@@ -1939,6 +2434,12 @@ static int find_timestamp_in_playlist(HLSContext *c, struct playlist *pls,
     }
 
     *seq_no = pls->start_seq_no + pls->n_segments - 1;
+
+    if (!pls->finished && pls->n_segments > 0) {
+        if (seg_start_ts)
+            *seg_start_ts = pos - pls->segments[pls->n_segments - 1]->duration;
+        return 1;
+    }
 
     return 0;
 }
@@ -2033,10 +2534,10 @@ static void add_stream_to_programs(AVFormatContext *s, struct playlist *pls, AVS
 
             av_program_add_stream_index(s, i, stream->index);
 
-            if (bandwidth < 0)
+            if (bandwidth == -1)
                 bandwidth = v->bandwidth;
             else if (bandwidth != v->bandwidth)
-                bandwidth = -1; /* stream in multiple variants with different bandwidths */
+                bandwidth = -2; /* stream in multiple variants with different bandwidths */
         }
     }
 
@@ -2057,8 +2558,8 @@ static int set_stream_info_from_input_stream(AVStream *st, struct playlist *pls,
     else
         avpriv_set_pts_info(st, ist->pts_wrap_bits, ist->time_base.num, ist->time_base.den);
 
-    // copy disposition
-    st->disposition = ist->disposition;
+    // add the dispositions of the subdemuxer stream to the rendition ones
+    st->disposition |= ist->disposition;
 
     av_dict_copy(&st->metadata, ist->metadata, 0);
 
@@ -2070,6 +2571,7 @@ static int set_stream_info_from_input_stream(AVStream *st, struct playlist *pls,
 /* add new subdemuxer streams to our context, if any */
 static int update_streams_from_subdemuxer(AVFormatContext *s, struct playlist *pls)
 {
+    HLSContext *c = s->priv_data;
     int err;
 
     while (pls->n_main_streams < pls->ctx->nb_streams) {
@@ -2088,6 +2590,21 @@ static int update_streams_from_subdemuxer(AVFormatContext *s, struct playlist *p
         err = set_stream_info_from_input_stream(st, pls, ist);
         if (err < 0)
             return err;
+
+        /* Match the start_time of streams created before playback began. */
+        if (c->first_timestamp != AV_NOPTS_VALUE)
+            st->start_time = av_rescale_q(c->first_timestamp,
+                                          AV_TIME_BASE_Q, st->time_base);
+
+        if (ist->codecpar->codec_id == AV_CODEC_ID_TIMED_ID3) {
+            if (pls->timed_id3_stream_index < 0)
+                pls->timed_id3_stream_index = ist_idx;
+            else
+                av_log(s, AV_LOG_WARNING,
+                       "Playlist has multiple timed ID3 streams; "
+                       "only stream %d will be used for metadata propagation\n",
+                       pls->timed_id3_stream_index);
+        }
     }
 
     return 0;
@@ -2142,10 +2659,28 @@ static int hls_read_header(AVFormatContext *s)
 
     c->first_packet = 1;
     c->first_timestamp = AV_NOPTS_VALUE;
+    c->first_timestamp_pls = NULL;
+    c->first_timestamp_locked = 0;
     c->cur_timestamp = AV_NOPTS_VALUE;
 
     if ((ret = ffio_copy_url_options(s->pb, &c->avio_opts)) < 0)
         return ret;
+
+    /* http_persistent and http_multiple auto-detection both rely on the
+     * AVIOContext being backed by the builtin URLContext. Neither works
+     * when io_open is overridden with a custom callback. */
+    if (!ffio_geturlcontext(s->pb)) {
+        if (c->http_persistent) {
+            av_log(s, AV_LOG_WARNING, "Disabling http_persistent due to custom io_open.\n");
+            c->http_persistent = 0;
+        }
+        /* Only auto-detection is disabled, enabling http_multiple can still work
+         * with custom io_open. */
+        if (c->http_multiple == -1) {
+            av_log(s, AV_LOG_WARNING, "Disabling http_multiple due to custom io_open.\n");
+            c->http_multiple = 0;
+        }
+    }
 
     /* XXX: Some HLS servers don't like being sent the range header,
        in this case, we need to set http_seekable = 0 to disable
@@ -2182,9 +2717,10 @@ static int hls_read_header(AVFormatContext *s)
         }
     }
 
-    /* If this isn't a live stream, calculate the total duration of the
-     * stream. */
-    if (c->variants[0]->playlists[0]->finished) {
+    /* Calculate the total duration of the stream if all segments are
+     * available (finished or EVENT playlists). */
+    if (c->variants[0]->playlists[0]->finished ||
+        c->variants[0]->playlists[0]->type == PLS_TYPE_EVENT) {
         int64_t duration = 0;
         for (i = 0; i < c->variants[0]->playlists[0]->n_segments; i++)
             duration += c->variants[0]->playlists[0]->segments[i]->duration;
@@ -2195,13 +2731,19 @@ static int hls_read_header(AVFormatContext *s)
     for (i = 0; i < c->n_variants; i++) {
         struct variant *var = c->variants[i];
 
-        if (var->audio_group[0])
-            add_renditions_to_variant(c, var, AVMEDIA_TYPE_AUDIO, var->audio_group);
-        if (var->video_group[0])
-            add_renditions_to_variant(c, var, AVMEDIA_TYPE_VIDEO, var->video_group);
-        if (var->subtitles_group[0])
-            add_renditions_to_variant(c, var, AVMEDIA_TYPE_SUBTITLE, var->subtitles_group);
+        if (var->audio_group[0] &&
+            (ret = add_renditions_to_variant(c, var, AVMEDIA_TYPE_AUDIO, var->audio_group)) < 0)
+            return ret;
+        if (var->video_group[0] &&
+            (ret = add_renditions_to_variant(c, var, AVMEDIA_TYPE_VIDEO, var->video_group)) < 0)
+            return ret;
+        if (var->subtitles_group[0] &&
+            (ret = add_renditions_to_variant(c, var, AVMEDIA_TYPE_SUBTITLE, var->subtitles_group)) < 0)
+            return ret;
     }
+    if ((ret = add_renditions_to_playlists(c, AVMEDIA_TYPE_AUDIO)) < 0 ||
+        (ret = add_renditions_to_playlists(c, AVMEDIA_TYPE_VIDEO)) < 0)
+        return ret;
 
     /* Create a program for each variant */
     for (i = 0; i < c->n_variants; i++) {
@@ -2225,7 +2767,7 @@ static int hls_read_header(AVFormatContext *s)
         highest_cur_seq_no = FFMAX(highest_cur_seq_no, pls->cur_seq_no);
     }
 
-    av_dict_set(&c->seg_format_opts, "prefer_hls_mpegts_pts", "1", 0);
+    av_dict_set(&c->seg_format_opts, "timestamp_map", "1", 0);
 
     /* Open the demuxer for each playlist */
     for (i = 0; i < c->n_playlists; i++) {
@@ -2234,6 +2776,8 @@ static int hls_read_header(AVFormatContext *s)
         char *url;
         AVDictionary *options = NULL;
         struct segment *seg = NULL;
+        uint8_t *buf;
+        int buf_size;
 
         if (!(pls->ctx = avformat_alloc_context()))
             return AVERROR(ENOMEM);
@@ -2257,19 +2801,21 @@ static int hls_read_header(AVFormatContext *s)
             pls->cur_seq_no = highest_cur_seq_no;
         }
 
-        pls->read_buffer = av_malloc(INITIAL_BUFFER_SIZE);
-        if (!pls->read_buffer){
+        if (pls->is_subtitle) {
+            buf_size = strlen("WEBVTT\n");
+            buf = av_memdup("WEBVTT\n", buf_size);
+        } else {
+            buf_size = INITIAL_BUFFER_SIZE;
+            buf = av_malloc(buf_size);
+        }
+        if (!buf) {
             avformat_free_context(pls->ctx);
             pls->ctx = NULL;
             return AVERROR(ENOMEM);
         }
 
-        if (pls->is_subtitle)
-            ffio_init_context(&pls->pb, (unsigned char*)av_strdup("WEBVTT\n"), (int)strlen("WEBVTT\n"), 0, pls,
-                                       NULL, NULL, NULL);
-        else
-            ffio_init_context(&pls->pb, pls->read_buffer, INITIAL_BUFFER_SIZE, 0, pls,
-                                        read_data_continuous, NULL, NULL);
+        ffio_init_context(&pls->pb, buf, buf_size, 0, pls,
+                          pls->is_subtitle ? NULL : read_data_continuous, NULL, NULL);
 
         /*
          * If encryption scheme is SAMPLE-AES, try to read  ID3 tags of
@@ -2374,7 +2920,8 @@ static int hls_read_header(AVFormatContext *s)
             return ret;
 
         if (pls->id3_deferred_extra && pls->ctx->nb_streams == 1) {
-            ff_id3v2_parse_apic(pls->ctx, pls->id3_deferred_extra);
+            if (av_match_name(pls->ctx->iformat->name, PACKED_AUDIO_FORMATS))
+                ff_id3v2_parse_apic(pls->ctx, pls->id3_deferred_extra);
             avformat_queue_attached_pictures(pls->ctx);
             ff_id3v2_parse_priv(pls->ctx, pls->id3_deferred_extra);
             ff_id3v2_free_extra_meta(&pls->id3_deferred_extra);
@@ -2451,10 +2998,12 @@ static int recheck_discard_flags(AVFormatContext *s, int first)
             pls->needed = 1;
             changed = 1;
             pls->cur_seq_no = select_cur_seq_no(c, pls);
+            pls->first_read_seq_no = -1;
             pls->pb.pub.eof_reached = 0;
             if (c->cur_timestamp != AV_NOPTS_VALUE) {
                 /* catch up */
-                pls->seek_timestamp = c->cur_timestamp;
+                pls->seek_timestamp = av_sat_add64(c->cur_timestamp,
+                    pls->ts_offset != AV_NOPTS_VALUE ? pls->ts_offset : 0);
                 pls->seek_flags = AVSEEK_FLAG_ANY;
                 pls->seek_stream_index = -1;
             }
@@ -2464,8 +3013,10 @@ static int recheck_discard_flags(AVFormatContext *s, int first)
             pls->input_read_done = 0;
             ff_format_io_close(pls->parent, &pls->input_next);
             pls->input_next_requested = 0;
-            if (pls->is_subtitle)
+            if (pls->is_subtitle) {
                 avformat_close_input(&pls->ctx);
+                free_subtitle_cues(pls);
+            }
             pls->needed = 0;
             changed = 1;
             av_log(s, AV_LOG_INFO, "No longer receiving playlist %d\n", i);
@@ -2477,12 +3028,12 @@ static int recheck_discard_flags(AVFormatContext *s, int first)
 static void fill_timing_for_id3_timestamped_stream(struct playlist *pls)
 {
     if (pls->id3_offset >= 0) {
-        pls->pkt->dts = pls->id3_mpegts_timestamp +
-                                 av_rescale_q(pls->id3_offset,
-                                              pls->ctx->streams[pls->pkt->stream_index]->time_base,
-                                              MPEG_TIME_BASE_Q);
+        pls->pkt->dts = av_sat_add64(pls->id3_mpegts_timestamp,
+                                     av_rescale_q(pls->id3_offset,
+                                                  pls->ctx->streams[pls->pkt->stream_index]->time_base,
+                                                  MPEG_TIME_BASE_Q));
         if (pls->pkt->duration)
-            pls->id3_offset += pls->pkt->duration;
+            pls->id3_offset = av_sat_add64(pls->id3_offset, pls->pkt->duration);
         else
             pls->id3_offset = -1;
     } else {
@@ -2516,19 +3067,50 @@ static int compare_ts_with_wrapdetect(int64_t ts_a, struct playlist *pls_a,
     return av_compare_mod(scaled_ts_a, scaled_ts_b, 1LL << 33);
 }
 
+/**
+ * Check whether any entry in @p update differs from the corresponding entry
+ * in @p current.
+ *
+ * HLS segments can repeat timed ID3 metadata in every segment so that
+ * listeners joining mid-stream immediately receive the current track
+ * information. Only signal a metadata change when values actually differ
+ * to avoid spurious updates on every segment boundary.
+ */
+static int metadata_has_changed(const AVDictionary *current,
+                                 const AVDictionary *update)
+{
+    if (av_dict_count(current) != av_dict_count(update))
+        return 1;
+    const AVDictionaryEntry *e = NULL;
+    while ((e = av_dict_iterate(update, e))) {
+        const AVDictionaryEntry *cur = av_dict_get(current, e->key, NULL, 0);
+        if (!cur || strcmp(cur->value, e->value))
+            return 1;
+    }
+    return 0;
+}
+
 static int hls_read_packet(AVFormatContext *s, AVPacket *pkt)
 {
     HLSContext *c = s->priv_data;
-    int ret, i, minplaylist = -1;
+    int ret, i, minplaylist = -1, deferred = 0, unanchored = 0;
 
     recheck_discard_flags(s, c->first_packet);
     c->first_packet = 0;
 
+retry:
     for (i = 0; i < c->n_playlists; i++) {
         struct playlist *pls = c->playlists[i];
         /* Make sure we've got one buffered packet from each open playlist
          * stream */
         if (pls->needed && !pls->pkt->data) {
+            /* a cue is placed relative to the media, so the media playlists
+             * buffer their packets first */
+            if (pls->is_subtitle && !unanchored &&
+                media_position(c) == AV_NOPTS_VALUE) {
+                deferred = 1;
+                continue;
+            }
             while (1) {
                 int64_t ts_diff;
                 AVRational tb;
@@ -2541,17 +3123,66 @@ static int hls_read_packet(AVFormatContext *s, AVPacket *pkt)
                     if (!avio_feof(&pls->pb.pub) && ret != AVERROR_EOF)
                         return ret;
                     break;
-                } else {
-                    /* stream_index check prevents matching picture attachments etc. */
-                    if (pls->is_id3_timestamped && pls->pkt->stream_index == 0) {
-                        /* audio elementary streams are id3 timestamped */
-                        fill_timing_for_id3_timestamped_stream(pls);
+                }
+
+                /* stream_index check prevents matching picture attachments etc. */
+                if (pls->is_id3_timestamped && pls->pkt->stream_index == 0) {
+                    /* audio elementary streams are id3 timestamped */
+                    fill_timing_for_id3_timestamped_stream(pls);
+                }
+
+                if (pls->is_subtitle) {
+                    /* the cues are on the shared timeline */
+                    if (pls->ts_offset == AV_NOPTS_VALUE)
+                        pls->ts_offset = 0;
+                } else if (pls->pkt->dts != AV_NOPTS_VALUE &&
+                    (pls->ts_offset == AV_NOPTS_VALUE ||
+                     (!c->first_timestamp_locked &&
+                      c->first_timestamp_pls == pls &&
+                      pls->cur_seq_no <= pls->first_read_seq_no + 1))) {
+                    int adjusted = 0;
+                    /* Packet timestamp rebased onto the start of the segment list. */
+                    int64_t seg_idx = pls->first_read_seq_no - pls->start_seq_no;
+                    int64_t ts = av_rescale_q(pls->pkt->pts != AV_NOPTS_VALUE ?
+                                              pls->pkt->pts : pls->pkt->dts,
+                                              get_timebase(pls), AV_TIME_BASE_Q);
+
+                    for (int64_t k = 0; k < seg_idx && k < pls->n_segments; k++)
+                        ts = av_sat_sub64(ts, pls->segments[k]->duration);
+
+                    if (c->first_timestamp == AV_NOPTS_VALUE) {
+                        c->first_timestamp = ts;
+                        c->first_timestamp_pls = pls;
+                        adjusted = 1;
+                    } else if (c->first_timestamp_pls == pls) {
+                        /* first_timestamp came from the first packet in mux
+                         * order, but another stream in the same segment may
+                         * start earlier. Lower the estimate while packets of
+                         * that segment are still arriving. */
+                        int64_t delta = av_sat_sub64(c->first_timestamp, ts);
+
+                        if (delta > 0 && delta <= pls->target_duration) {
+                            c->first_timestamp = ts;
+                            for (int k = 0; k < c->n_playlists; k++)
+                                if (c->playlists[k]->ts_offset != AV_NOPTS_VALUE &&
+                                    !c->playlists[k]->is_subtitle)
+                                    c->playlists[k]->ts_offset = av_sat_add64(c->playlists[k]->ts_offset, delta);
+                            adjusted = 1;
+                        }
                     }
 
-                    if (c->first_timestamp == AV_NOPTS_VALUE &&
-                        pls->pkt->dts       != AV_NOPTS_VALUE)
-                        c->first_timestamp = av_rescale_q(pls->pkt->dts,
-                            get_timebase(pls), AV_TIME_BASE_Q);
+                    if (pls->ts_offset == AV_NOPTS_VALUE)
+                        pls->ts_offset = av_sat_sub64(ts, c->first_timestamp);
+
+                    if (adjusted) {
+                        for (unsigned k = 0; k < s->nb_streams; k++)
+                            s->streams[k]->start_time =
+                                av_rescale_q(c->first_timestamp, AV_TIME_BASE_Q,
+                                             s->streams[k]->time_base);
+                        av_log(s, AV_LOG_DEBUG,
+                               "First timestamp %"PRId64" from playlist %d\n",
+                               c->first_timestamp, pls->index);
+                    }
                 }
 
                 seg = current_segment(pls);
@@ -2574,18 +3205,33 @@ static int hls_read_packet(AVFormatContext *s, AVPacket *pkt)
                     }
 
                     tb = get_timebase(pls);
-                    ts_diff = av_rescale_rnd(pls->pkt->dts, AV_TIME_BASE,
-                                            tb.den, AV_ROUND_DOWN) -
+                    ts_diff = av_rescale_q_rnd(pls->pkt->dts, tb,
+                                               AV_TIME_BASE_Q, AV_ROUND_DOWN) -
                             pls->seek_timestamp;
                     if (ts_diff >= 0 && (pls->seek_flags  & AVSEEK_FLAG_ANY ||
                                         pls->pkt->flags & AV_PKT_FLAG_KEY)) {
                         pls->seek_timestamp = AV_NOPTS_VALUE;
                         break;
                     }
+                    /* a cue still shown at the target is delivered, the cues
+                     * after it may still have ended before the target */
+                    if (pls->is_subtitle && pls->pkt->duration > 0 &&
+                        av_rescale_q_rnd(pls->pkt->dts + pls->pkt->duration, tb,
+                                         AV_TIME_BASE_Q, AV_ROUND_DOWN) >
+                        pls->seek_timestamp)
+                        break;
                 }
                 av_packet_unref(pls->pkt);
             }
         }
+    }
+
+    for (i = 0; i < c->n_playlists; i++) {
+        struct playlist *pls = c->playlists[i];
+
+        /* a cue buffered without media is placed once the media is */
+        if (pls->is_subtitle && pls->pkt->data)
+            unwrap_cue_pts(c, pls, pls->pkt);
         /* Check if this stream has the packet with the lowest dts */
         if (pls->pkt->data) {
             struct playlist *minpls = minplaylist < 0 ?
@@ -2601,6 +3247,13 @@ static int hls_read_packet(AVFormatContext *s, AVPacket *pkt)
                     minplaylist = i;
             }
         }
+    }
+
+    /* without media the cues are read as they are */
+    if (minplaylist < 0 && deferred) {
+        deferred   = 0;
+        unanchored = 1;
+        goto retry;
     }
 
     /* If we got a packet, return it */
@@ -2642,10 +3295,30 @@ static int hls_read_packet(AVFormatContext *s, AVPacket *pkt)
         ist = pls->ctx->streams[pls->pkt->stream_index];
         st = pls->main_streams[pls->pkt->stream_index];
 
+        // Propagate timed-ID3 metadata changes to the main stream, suppressing
+        // duplicate packets that repeat unchanged metadata at segment boundaries.
+        if (ist->codecpar->codec_id == AV_CODEC_ID_TIMED_ID3 &&
+            pls->pkt->stream_index == pls->timed_id3_stream_index &&
+            ist->event_flags & AVSTREAM_EVENT_FLAG_METADATA_UPDATED) {
+            ist->event_flags &= ~AVSTREAM_EVENT_FLAG_METADATA_UPDATED;
+            if (metadata_has_changed(pls->timed_id3_metadata, ist->metadata)) {
+                int ret = av_dict_copy(&st->metadata, ist->metadata, 0);
+                if (ret < 0)
+                    return ret;
+                av_dict_free(&pls->timed_id3_metadata);
+                ret = av_dict_copy(&pls->timed_id3_metadata, ist->metadata, 0);
+                if (ret < 0)
+                    return ret;
+                st->event_flags |= AVSTREAM_EVENT_FLAG_METADATA_UPDATED;
+            }
+        }
+
         av_packet_move_ref(pkt, pls->pkt);
         pkt->stream_index = st->index;
 
-        if (pkt->dts != AV_NOPTS_VALUE)
+        /* a cue read without media does not set the media position */
+        if (pkt->dts != AV_NOPTS_VALUE &&
+            (!pls->is_subtitle || c->first_timestamp != AV_NOPTS_VALUE))
             c->cur_timestamp = av_rescale_q(pkt->dts,
                                             ist->time_base,
                                             AV_TIME_BASE_Q);
@@ -2673,22 +3346,14 @@ static int hls_read_seek(AVFormatContext *s, int stream_index,
     int stream_subdemuxer_index;
     int64_t first_timestamp, seek_timestamp, duration;
     int64_t seq_no, seg_start_ts;
+    int snapped_to_segment = 0;
 
     if ((flags & AVSEEK_FLAG_BYTE) || (c->ctx->ctx_flags & AVFMTCTX_UNSEEKABLE))
         return AVERROR(ENOSYS);
 
-    first_timestamp = c->first_timestamp == AV_NOPTS_VALUE ?
-                      0 : c->first_timestamp;
-
-    seek_timestamp = av_rescale_rnd(timestamp, AV_TIME_BASE,
-                                    s->streams[stream_index]->time_base.den,
-                                    AV_ROUND_DOWN);
-
-    duration = s->duration == AV_NOPTS_VALUE ?
-               0 : s->duration;
-
-    if (0 < duration && duration < seek_timestamp - first_timestamp)
-        return AVERROR(EIO);
+    seek_timestamp = av_rescale_q_rnd(timestamp,
+                                      s->streams[stream_index]->time_base,
+                                      AV_TIME_BASE_Q, AV_ROUND_DOWN);
 
     /* find the playlist with the specified stream */
     for (i = 0; i < c->n_playlists; i++) {
@@ -2701,9 +3366,43 @@ static int hls_read_seek(AVFormatContext *s, int stream_index,
             }
         }
     }
+    if (!seek_pls)
+        return AVERROR(EIO);
+
+    /* Live and EVENT playlists may have gained segments since the last load,
+     * and sliding-window playlists may also have expired some. Refresh before
+     * resolving a seek that may fall outside the loaded window, rate limited
+     * to the minimum reload interval (RFC 8216 6.3.4). */
+    if (!seek_pls->finished) {
+        int64_t elapsed = av_gettime_relative() - seek_pls->last_load_time;
+        int64_t start = c->first_timestamp == AV_NOPTS_VALUE ?
+                        0 : c->first_timestamp;
+        int64_t end = start;
+        int need_refresh;
+        for (i = 0; i < seek_pls->n_segments; i++)
+            end += seek_pls->segments[i]->duration;
+        need_refresh = seek_timestamp >= end;
+        if (seek_pls->type == PLS_TYPE_UNSPECIFIED)
+            need_refresh |= seek_timestamp < start + elapsed +
+                                             seek_pls->target_duration;
+        if (need_refresh && elapsed >= default_reload_interval(seek_pls))
+            parse_playlist(c, seek_pls->url, seek_pls, NULL);
+    }
+
+    first_timestamp = c->first_timestamp == AV_NOPTS_VALUE ?
+                      0 : c->first_timestamp;
+
+    duration = s->duration == AV_NOPTS_VALUE ?
+               0 : s->duration;
+
+    /* Only finished playlists cannot grow past the known duration. */
+    if (seek_pls->finished &&
+        0 < duration && duration < seek_timestamp - first_timestamp)
+        return AVERROR(EIO);
+
     /* check if the timestamp is valid for the playlist with the
      * specified stream index */
-    if (!seek_pls || !find_timestamp_in_playlist(c, seek_pls, seek_timestamp, &seq_no, &seg_start_ts))
+    if (!find_timestamp_in_playlist(c, seek_pls, seek_timestamp, &seq_no, &seg_start_ts))
         return AVERROR(EIO);
 
     if (s->streams[stream_index]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO &&
@@ -2711,11 +3410,24 @@ static int hls_read_seek(AVFormatContext *s, int stream_index,
         /* Seeking to start of segment ensures we seek to a keyframe located
          * before the given timestamp. */
         seek_timestamp = seg_start_ts;
+        snapped_to_segment = 1;
     }
+
+    av_log(s, AV_LOG_DEBUG, "Seek to %"PRId64" mapped to segment %"PRId64
+           " of playlist %d (start %"PRId64")\n",
+           seek_timestamp, seq_no, seek_pls->index, seg_start_ts);
+
+    /* Keep timeline start fixed from now on. */
+    c->first_timestamp_locked = 1;
 
     /* set segment now so we do not need to search again below */
     seek_pls->cur_seq_no = seq_no;
     seek_pls->seek_stream_index = stream_subdemuxer_index;
+
+    /* Reset PTS wrap detection so backward seeks don't get misinterpreted
+     * as a forward PTS wrap. */
+    for (i = 0; i < (int)s->nb_streams; i++)
+        ffstream(s->streams[i])->pts_wrap_reference = AV_NOPTS_VALUE;
 
     for (i = 0; i < c->n_playlists; i++) {
         /* Reset reading */
@@ -2723,6 +3435,7 @@ static int hls_read_seek(AVFormatContext *s, int stream_index,
         AVIOContext *const pb = &pls->pb.pub;
         ff_format_io_close(pls->parent, &pls->input);
         pls->input_read_done = 0;
+        pls->first_read_seq_no = -1;
         ff_format_io_close(pls->parent, &pls->input_next);
         pls->input_next_requested = 0;
         av_packet_unref(pls->pkt);
@@ -2732,16 +3445,38 @@ static int hls_read_seek(AVFormatContext *s, int stream_index,
         /* Reset the pos, to let the mpegts/mov demuxer know we've seeked. */
         pb->pos = 0;
         /* Flush the packet queue of the subdemuxer. */
-        if (pls->ctx)
+        if (pls->ctx) {
             ff_read_frame_flush(pls->ctx);
-        if (pls->is_subtitle)
+            for (j = 0; j < (int)pls->ctx->nb_streams; j++)
+                ffstream(pls->ctx->streams[j])->pts_wrap_reference = AV_NOPTS_VALUE;
+        }
+        if (pls->is_subtitle) {
             avformat_close_input(&pls->ctx);
+            free_subtitle_cues(pls);
+        }
 
         /* Reset the init segment so it's re-fetched and served appropriately */
         pls->cur_init_section = NULL;
 
-        pls->seek_timestamp = seek_timestamp;
+        /* The discard in hls_read_packet compares this playlist's packet DTS
+         * against seek_timestamp, but seek_timestamp is on c->first_timestamp's
+         * baseline (whichever stream produced the first packet). Streams can
+         * have different DTS baselines, so translate the threshold onto this
+         * playlist's own baseline using its captured offset. */
+        if (pls->ts_offset != AV_NOPTS_VALUE)
+            pls->seek_timestamp = av_sat_add64(seek_timestamp, pls->ts_offset);
+        else
+            pls->seek_timestamp = seek_timestamp;
         pls->seek_flags = flags;
+
+        if (pls == seek_pls && snapped_to_segment) {
+            /* The first keyframe of the target segment may have a slightly
+             * lower DTS than the EXTINF-derived seg_start_ts. Relax the cutoff
+             * to not discard the keyframe and land one segment late. */
+            int64_t idx = seq_no - pls->start_seq_no;
+            if (idx >= 0 && idx < pls->n_segments)
+                pls->seek_timestamp = av_sat_sub64(pls->seek_timestamp, pls->segments[idx]->duration);
+        }
 
         if (pls != seek_pls) {
             /* set closest segment seq_no for playlists not handled above */
@@ -2752,6 +3487,8 @@ static int hls_read_seek(AVFormatContext *s, int stream_index,
             pls->seek_stream_index = -1;
             pls->seek_flags |= AVSEEK_FLAG_ANY;
         }
+
+        pls->last_seq_no = pls->cur_seq_no;
     }
 
     c->cur_timestamp = seek_timestamp;

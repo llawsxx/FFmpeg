@@ -47,9 +47,10 @@
 
 #include "libswresample/swresample.h"
 
-#include "avcodec.h"
-#include "codec_internal.h"
-#include "decode.h"
+#include "libavcodec/avcodec.h"
+#include "libavcodec/codec_internal.h"
+#include "libavcodec/decode.h"
+
 #include "opus.h"
 #include "tab.h"
 #include "celt.h"
@@ -182,8 +183,8 @@ static int opus_flush_resample(OpusStreamContext *s, int nb_samples)
         s->redundancy_idx = 0;
     }
 
-    s->cur_out[0]         += nb_samples;
-    s->cur_out[1]         += nb_samples;
+    for (i = 0; i < s->output_channels; i++)
+        s->cur_out[i]     += nb_samples;
     s->remaining_out_size -= nb_samples * sizeof(float);
 
     return 0;
@@ -341,10 +342,10 @@ static int opus_decode_frame(OpusStreamContext *s, const uint8_t *data, int size
 
         if (s->packet.mode == OPUS_MODE_HYBRID) {
             int celt_delay = s->packet.frame_duration - celt_output_samples;
-            void *delaybuf[2] = { s->celt_output[0] + celt_output_samples,
-                                  s->celt_output[1] + celt_output_samples };
+            void *delaybuf[2];
 
             for (i = 0; i < s->output_channels; i++) {
+                delaybuf[i] = s->celt_output[i] + celt_output_samples;
                 s->fdsp->vector_fmac_scalar(out_tmp[i],
                                             s->celt_output[i], 1.0,
                                             celt_output_samples);

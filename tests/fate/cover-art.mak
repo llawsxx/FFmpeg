@@ -46,6 +46,12 @@ FATE_COVER_ART_REMUX-$(call ALLYES, MP3_DEMUXER MJPEG_DECODER \
                        += fate-cover-art-mp3-id3v2-remux
 fate-cover-art-mp3-id3v2-remux: CMD = transcode mp3 $(TARGET_SAMPLES)/exif/embedded_small.mp3 mp3 "-map 0 -map 0:v -map 0:v -c:a copy -filter:v:0 scale -filter:v:2 scale -c:v:0 bmp -c:v:1 copy -c:v:2 png -metadata:s:v:0 comment=Band/Orchestra" "-map 0 -c copy -t 0.1" "-show_entries stream_tags:stream_disposition=attached_pic:stream=index,codec_name"
 
+FATE_COVER_ART_REMUX-$(call ALLYES, MP3_DEMUXER MP3_MUXER MD5_PROTOCOL) \
+                       += fate-cover-art-mp3-id3v2-nonseekable
+fate-cover-art-mp3-id3v2-nonseekable: CMD = md5pipe -i $(TARGET_SAMPLES)/exif/embedded_small.mp3 -map 0 -c copy -fflags +bitexact -write_xing 0 -f mp3
+fate-cover-art-mp3-id3v2-nonseekable: CMP = oneline
+fate-cover-art-mp3-id3v2-nonseekable: REF = 7d7fc4c0a5fe89a418bab6c74b6cda08
+
 # Also covers muxing and demuxing of nonstandard channel layouts into FLAC
 # as well as the unorthodox multi_dim_quant option of the FLAC encoder.
 FATE_COVER_ART_REMUX-$(call ALLYES, MOV_DEMUXER OGG_DEMUXER   \
@@ -56,6 +62,11 @@ FATE_COVER_ART_REMUX-$(call ALLYES, MOV_DEMUXER OGG_DEMUXER   \
                                     FRAMECRC_MUXER PIPE_PROTOCOL)           \
                        += fate-cover-art-flac-remux
 fate-cover-art-flac-remux: CMD = transcode mov $(TARGET_SAMPLES)/lossless-audio/inside.m4a flac "-map 0 -map 1:v -map 1:v -af channelmap=channel_layout=FL+FC,aresample -c:a flac -multi_dim_quant 1 -c:v:0 copy -metadata:s:v:0 comment=Illustration -metadata:s:v:0 title=OpenMusic  -filter:v:1 scale -c:v:1 png -metadata:s:v:1 title=landscape -c:v:2 copy -filter:v:3 scale -metadata:s:v:2 title=portrait -c:v:3 bmp  -metadata:s:v:3 comment=Conductor -c:v:4 copy -t 0.4" "-map 0 -map 0:a -c:a:0 copy -c:v copy" "-show_entries format_tags:stream_tags:stream_disposition=attached_pic:stream=index,codec_name" "-f ogg -i $(TARGET_SAMPLES)/cover_art/ogg_vorbiscomment_cover.opus"
+
+FATE_COVER_ART_REMUX-$(call ALLYES, MP3_DEMUXER MP3_MUXER \
+                                    JPEGXL_ANIM_DEMUXER PIPE_PROTOCOL)     \
+                       += fate-cover-art-mp3-jxl-remux
+fate-cover-art-mp3-jxl-remux: CMD = run_with_temp "$(FFMPEG) -nostdin -hide_banner -loglevel error -i $(TARGET_SAMPLES)/audiomatch/square3.mp3 -i $(TARGET_SAMPLES)/jxl/lenna-256.jxl -map 0:a -map 1:v -c copy -disposition:v:0 attached_pic -id3v2_version 3 -f mp3 -y" "ffprobe$(PROGSSUF)$(EXESUF) -bitexact -show_entries stream=codec_name,codec_type -show_entries stream_disposition=attached_pic -of compact=p=0:nk=1" mp3
 
 FCA_TEMP-$(call ALLYES, RAWVIDEO_MUXER) = $(FATE_COVER_ART-yes)
 FATE_COVER_ART = $(FCA_TEMP-yes)

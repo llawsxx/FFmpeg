@@ -18,6 +18,8 @@
  * 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
  */
 
+#include <string.h>
+
 #include "checkasm.h"
 #include "libavutil/aes.h"
 #include "libavutil/aes_internal.h"
@@ -46,13 +48,13 @@ void checkasm_check_aes(void)
                     iv[0][j] = iv[1][j] = rnd();
                 call_ref(&b, temp[0], pt, count, iv[0], b.rounds);
                 call_new(&b, temp[1], pt, count, iv[1], b.rounds);
-                if (memcmp(temp[0], temp[1], sizeof(16 * count)))
+                if (memcmp(temp[0], temp[1], 16 * count))
                     fail();
                 if (memcmp(iv[0], iv[1], sizeof(iv[0])))
                     fail();
                 call_ref(&b, temp[0], pt, count, NULL, b.rounds);
                 call_new(&b, temp[1], pt, count, NULL, b.rounds);
-                if (memcmp(temp[0], temp[1], sizeof(16 * count)))
+                if (memcmp(temp[0], temp[1], 16 * count))
                     fail();
                 if (memcmp(iv[0], iv[1], sizeof(iv[0])))
                     fail();

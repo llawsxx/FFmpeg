@@ -46,13 +46,14 @@ static void check_chroma_mc(void)
     DECLARE_ALIGNED_16(uint8_t, dst0)[16 * 18 * 2];
     DECLARE_ALIGNED_16(uint8_t, dst1)[16 * 18 * 2];
 
-    declare_func_emms(AV_CPU_FLAG_MMX, void, uint8_t *dst, const uint8_t *src,
-                      ptrdiff_t stride, int h, int x, int y);
+    declare_func(void, uint8_t *dst, const uint8_t *src,
+                 ptrdiff_t stride, int h, int x, int y);
 
     for (int bit_depth = 8; bit_depth <= 10; bit_depth++) {
         ff_h264chroma_init(&h, bit_depth);
         randomize_buffers(bit_depth);
         for (int size = 0; size < 3; size++) {
+            int block_size = 8 >> size;
 
 #define CHECK_CHROMA_MC(name)                                                                             \
             do {                                                                                          \
@@ -61,13 +62,13 @@ static void check_chroma_mc(void)
                         for (int y = 0; y < 2; y++) {                                                     \
                             memcpy(dst0, src, 16 * 18 * SIZEOF_PIXEL);                                    \
                             memcpy(dst1, src, 16 * 18 * SIZEOF_PIXEL);                                    \
-                            call_ref(dst0, src, 16 * SIZEOF_PIXEL, 16, x, y);                             \
-                            call_new(dst1, src, 16 * SIZEOF_PIXEL, 16, x, y);                             \
+                            call_ref(dst0, src, 16 * SIZEOF_PIXEL, block_size, x, y);                     \
+                            call_new(dst1, src, 16 * SIZEOF_PIXEL, block_size, x, y);                     \
                             if (memcmp(dst0, dst1, 16 * 16 * SIZEOF_PIXEL)) {                             \
                                 fprintf(stderr, #name "_%d: x:%i, y:%i\n", bit_depth, x, y);              \
                                 fail();                                                                   \
                             }                                                                             \
-                            bench_new(dst1, src, 16 * SIZEOF_PIXEL, 16, x, y);                            \
+                            bench_new(dst1, src, 16 * SIZEOF_PIXEL, block_size, x, y);                    \
                         }                                                                                 \
                     }                                                                                     \
                 }                                                                                         \

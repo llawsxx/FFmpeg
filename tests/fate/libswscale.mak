@@ -1,3 +1,11 @@
+FATE_LIBSWSCALE += fate-sws-range-convert
+fate-sws-range-convert: libswscale/tests/range_convert$(EXESUF)
+fate-sws-range-convert: CMD = run libswscale/tests/range_convert$(EXESUF)
+
+FATE_LIBSWSCALE += fate-sws-unscaled-threaded
+fate-sws-unscaled-threaded: libswscale/tests/unscaled_threaded$(EXESUF)
+fate-sws-unscaled-threaded: CMD = run libswscale/tests/unscaled_threaded$(EXESUF)
+
 FATE_LIBSWSCALE += fate-sws-pixdesc-query
 fate-sws-pixdesc-query: libswscale/tests/pixdesc_query$(EXESUF)
 fate-sws-pixdesc-query: CMD = run libswscale/tests/pixdesc_query$(EXESUF)
@@ -5,6 +13,11 @@ fate-sws-pixdesc-query: CMD = run libswscale/tests/pixdesc_query$(EXESUF)
 FATE_LIBSWSCALE += fate-sws-floatimg-cmp
 fate-sws-floatimg-cmp: libswscale/tests/floatimg_cmp$(EXESUF)
 fate-sws-floatimg-cmp: CMD = run libswscale/tests/floatimg_cmp$(EXESUF)
+
+FATE_LIBSWSCALE += fate-sws-rgb2rgb-bounds
+fate-sws-rgb2rgb-bounds: libswscale/tests/colorspace$(EXESUF)
+fate-sws-rgb2rgb-bounds: CMD = run libswscale/tests/colorspace$(EXESUF)
+fate-sws-rgb2rgb-bounds: CMP = null
 
 SWS_SLICE_TEST-$(call DEMDEC, MATROSKA, VP9) += fate-sws-slice-yuv422-12bit-rgb48
 fate-sws-slice-yuv422-12bit-rgb48: CMD = run tools/scale_slice_test$(EXESUF) $(TARGET_SAMPLES)/vp9-test-vectors/vp93-2-20-12bit-yuv422.webm 150 100 rgb48
@@ -31,18 +44,112 @@ fate-sws-yuv-range: CMD = framecrc \
   -frames 1 \
   -vf scale=in_color_matrix=bt601:in_range=limited:out_color_matrix=bt601:out_range=full:flags=+accurate_rnd+bitexact
 
-# This self-check currently fails for legacy swscale, so pass SWS_UNSTABLE to use the new code
-FATE_LIBSWSCALE-$(CONFIG_UNSTABLE) += fate-sws-unscaled
-fate-sws-unscaled: libswscale/tests/swscale$(EXESUF)
-fate-sws-unscaled: CMD = run libswscale/tests/swscale$(EXESUF) -unscaled 1 -flags unstable -v 16
+# Partial bytes in the one-tap and bilinear two-tap monochrome ED paths.
+FATE_LIBSWSCALE_FFMPEG-$(call FILTERFRAMECRC, COLOR SCALE FORMAT) += fate-sws-monob-ed-tail \
+                                                                 fate-sws-monow-ed-tail \
+                                                                 fate-sws-monob-ed-tail-bilinear \
+                                                                 fate-sws-monow-ed-tail-bilinear
+fate-sws-monob-ed-tail: CMD = framecrc -lavfi color=white:s=100x8:r=1,scale=flags=bilinear+bitexact:sws_dither=ed,format=monob -frames:v 1
+fate-sws-monow-ed-tail: CMD = framecrc -lavfi color=black:s=100x8:r=1,scale=flags=bilinear+bitexact:sws_dither=ed,format=monow -frames:v 1
+fate-sws-monob-ed-tail-bilinear: CMD = framecrc -lavfi color=white:s=102x8:r=1,scale=102:16:flags=bilinear+bitexact:sws_dither=ed,format=monob -frames:v 1
+fate-sws-monow-ed-tail-bilinear: CMD = framecrc -lavfi color=black:s=102x8:r=1,scale=102:16:flags=bilinear+bitexact:sws_dither=ed,format=monow -frames:v 1
+
+SWS_UNSTABLE_BACKENDS-yes                            += c memcpy
+ifeq ($(ARCH_X86_64),yes)
+SWS_UNSTABLE_BACKENDS-$(HAVE_X86ASM)                 += x86
+endif
+ifeq ($(ARCH_AARCH64),yes)
+SWS_UNSTABLE_BACKENDS-$(HAVE_NEON)                   += aarch64
+endif
+SWS_UNSTABLE_BACKENDS-$(CONFIG_SWSCALE_VULKAN)       += spirv
+
+# Set -hw default for Vulkan tests.
+fate-sws-unscaled-spirv fate-sws-unstable-spirv: SWS_HW = -hw default
+
+# Legacy swscale fails this self-check; test each available ops backend.
+FATE_SWS_UNSCALED := $(SWS_UNSTABLE_BACKENDS-yes:%=fate-sws-unscaled-%)
+$(FATE_SWS_UNSCALED): libswscale/tests/swscale$(EXESUF)
+$(FATE_SWS_UNSCALED): CMD = run libswscale/tests/swscale$(EXESUF) -v 16 $(SWS_HW) -scaler none -backends $(@:fate-sws-unscaled-%=%)
+$(FATE_SWS_UNSCALED): REF = /dev/null
+fate-sws-unscaled: $(FATE_SWS_UNSCALED)
+
+# Run only 2% of swscale tests to keep the run time short, and only check for failure
+FATE_SWS_UNSTABLE := $(SWS_UNSTABLE_BACKENDS-yes:%=fate-sws-unstable-%)
+$(FATE_SWS_UNSTABLE): libswscale/tests/swscale$(EXESUF)
+$(FATE_SWS_UNSTABLE): CMD = run libswscale/tests/swscale$(EXESUF) -v 16 $(SWS_HW) -backends $(@:fate-sws-unstable-%=%) -p 0.02
+$(FATE_SWS_UNSTABLE): REF = /dev/null
+fate-sws-unstable: $(FATE_SWS_UNSTABLE)
+
+# Also test unpadded and vertically flipped (negative stride) buffers
+SWS_CPU_BACKENDS := $(filter-out spirv,$(SWS_UNSTABLE_BACKENDS-yes))
+FATE_SWS_UNPADDED := $(SWS_CPU_BACKENDS:%=fate-sws-unpadded-%)
+$(FATE_SWS_UNPADDED): libswscale/tests/swscale$(EXESUF)
+$(FATE_SWS_UNPADDED): CMD = run libswscale/tests/swscale$(EXESUF) -v 16 -backends $(@:fate-sws-unpadded-%=%) -align_src 1 -align_dst 1 $(SWS_PROB) $(SWS_SCALER)
+$(FATE_SWS_UNPADDED): REF = /dev/null
+fate-sws-unpadded: $(FATE_SWS_UNPADDED)
+
+FATE_SWS_FLIPPED := $(SWS_CPU_BACKENDS:%=fate-sws-flipped-%)
+$(FATE_SWS_FLIPPED): libswscale/tests/swscale$(EXESUF)
+$(FATE_SWS_FLIPPED): CMD = run libswscale/tests/swscale$(EXESUF) -v 16 -backends $(@:fate-sws-flipped-%=%) -align_src -1 -align_dst -1 $(SWS_PROB) $(SWS_SCALER)
+$(FATE_SWS_FLIPPED): REF = /dev/null
+fate-sws-flipped: $(FATE_SWS_FLIPPED)
+
+# Run only 1% of the tests
+$(FATE_SWS_UNPADDED) $(FATE_SWS_FLIPPED): SWS_PROB = -p 0.01
+
+# The memcpy backend only supports unscaled conversions, so test all of
+# those instead
+fate-sws-unpadded-memcpy fate-sws-flipped-memcpy: SWS_PROB =
+fate-sws-unpadded-memcpy fate-sws-flipped-memcpy: SWS_SCALER = -scaler none
+
+FATE_LIBSWSCALE += $(FATE_SWS_UNSCALED) $(FATE_SWS_UNSTABLE) $(FATE_SWS_UNPADDED) $(FATE_SWS_FLIPPED)
 
 ifneq ($(HAVE_BIGENDIAN),yes)
+
 # Disable on big endian because big endian platforms generate different op
 # lists for le vs be formats; this breaks the checksum otherwise
-FATE_LIBSWSCALE-$(CONFIG_UNSTABLE) += fate-sws-ops-list
+FATE_LIBSWSCALE += fate-sws-ops-list
 fate-sws-ops-list: libswscale/tests/sws_ops$(EXESUF)
 fate-sws-ops-list: CMD = run libswscale/tests/sws_ops$(EXESUF) | do_md5sum | cut -d" " -f1
+
+FATE_SWS_UOPS_MACROS = fate-sws-uops-macros-c                          \
+                       fate-sws-uops-macros-x86                        \
+                       fate-sws-uops-macros-x86-nasm                   \
+
+ifeq ($(HAVE_INT128),yes)
+# Disable by default without int128 because it is too slow (several minutes)
+FATE_LIBSWSCALE += $(FATE_SWS_UOPS_MACROS)
 endif
+
+# Disable on bigendian because it would result in a different iteration order
+# (and thus output) due to sorting by memcmp() on the parameters struct.
+fate-sws-uops-macros-c: libswscale/uops_macros_gen$(EXESUF)
+fate-sws-uops-macros-c: REF = $(SRC_PATH)/libswscale/uops_macros.h
+fate-sws-uops-macros-c: CMD = run libswscale/uops_macros_gen$(EXESUF)
+
+fate-sws-uops-macros-x86: libswscale/uops_macros_gen$(EXESUF)
+fate-sws-uops-macros-x86: REF = $(SRC_PATH)/libswscale/x86/uops_macros.h
+fate-sws-uops-macros-x86: CMD = run libswscale/uops_macros_gen$(EXESUF) -backend x86 \
+                                -nasm $(TARGET_PATH)/tests/data/fate/sws-uops-macros-x86.asm
+
+# Generated together with fate-sws-uops-macros-x86, since enumeration is slow
+fate-sws-uops-macros-x86-nasm: fate-sws-uops-macros-x86
+fate-sws-uops-macros-x86-nasm: REF = $(SRC_PATH)/libswscale/x86/uops_macros.asm
+fate-sws-uops-macros-x86-nasm: CMD = cat tests/data/fate/sws-uops-macros-x86.asm
+
+fate-sws-uops-macros: $(FATE_SWS_UOPS_MACROS)
+
+endif
+
+FATE_LIBSWSCALE += fate-sws-rational64
+fate-sws-rational64: libswscale/tests/rational64$(EXESUF)
+fate-sws-rational64: CMD = run libswscale/tests/rational64$(EXESUF)
+fate-sws-rational64: CMP = null
+
+FATE_LIBSWSCALE += fate-sws-ops-entries-aarch64
+fate-sws-ops-entries-aarch64: libswscale/tests/sws_ops_aarch64$(EXESUF)
+fate-sws-ops-entries-aarch64: REF = $(SRC_PATH)/libswscale/aarch64/ops_entries.c
+fate-sws-ops-entries-aarch64: CMD = run libswscale/tests/sws_ops_aarch64$(EXESUF)
 
 FATE_LIBSWSCALE += $(FATE_LIBSWSCALE-yes)
 FATE_LIBSWSCALE_SAMPLES += $(FATE_LIBSWSCALE_SAMPLES-yes)

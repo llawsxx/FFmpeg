@@ -24,7 +24,7 @@
 #include "libavutil/attributes.h"
 #include "libavutil/common.h"
 
-#include "cabac_functions.h"
+#include "libavcodec/cabac_functions.h"
 #include "data.h"
 #include "hevc.h"
 #include "hevcdec.h"
@@ -407,84 +407,100 @@ void ff_hevc_save_states(HEVCLocalContext *lc, const HEVCPPS *pps,
         (ctb_addr_ts % sps->ctb_width == 2 ||
          (sps->ctb_width == 2 &&
           ctb_addr_ts % sps->ctb_width == 0))) {
-        memcpy(lc->common_cabac_state->state, lc->cabac_state, HEVC_CONTEXTS);
+        memcpy(lc->common_cabac_state->state, lc->sub.cabac_state, HEVC_CONTEXTS);
         if (sps->persistent_rice_adaptation_enabled) {
-            memcpy(lc->common_cabac_state->stat_coeff, lc->stat_coeff, HEVC_STAT_COEFFS);
+            memcpy(lc->common_cabac_state->stat_coeff, lc->sub.stat_coeff, HEVC_STAT_COEFFS);
         }
     }
 }
 
 static void load_states(HEVCLocalContext *lc, const HEVCSPS *sps)
 {
-    memcpy(lc->cabac_state, lc->common_cabac_state->state, HEVC_CONTEXTS);
+    memcpy(lc->sub.cabac_state, lc->common_cabac_state->state, HEVC_CONTEXTS);
     if (sps->persistent_rice_adaptation_enabled) {
-        memcpy(lc->stat_coeff, lc->common_cabac_state->stat_coeff, HEVC_STAT_COEFFS);
+        memcpy(lc->sub.stat_coeff, lc->common_cabac_state->stat_coeff, HEVC_STAT_COEFFS);
     }
 }
 
 static int cabac_reinit(HEVCLocalContext *lc)
 {
-    return skip_bytes(&lc->cc, 0) == NULL ? AVERROR_INVALIDDATA : 0;
+    return skip_bytes(&lc->sub.cc, 0) == NULL ? AVERROR_INVALIDDATA : 0;
 }
 
 static void cabac_init_state(HEVCLocalContext *lc, const HEVCContext *s)
 {
-    int init_type = 2 - s->sh.slice_type;
+    int init_type = 2 - lc->sh->slice_type;
     int i;
 
-    if (s->sh.cabac_init_flag && s->sh.slice_type != HEVC_SLICE_I)
+    if (lc->sh->cabac_init_flag && lc->sh->slice_type != HEVC_SLICE_I)
         init_type ^= 3;
 
     for (i = 0; i < HEVC_CONTEXTS; i++) {
         int init_value = init_values[init_type][i];
         int m = (init_value >> 4) * 5 - 45;
         int n = ((init_value & 15) << 3) - 16;
-        int pre = 2 * (((m * av_clip(s->sh.slice_qp, 0, 51)) >> 4) + n) - 127;
+        int pre = 2 * (((m * av_clip(lc->sh->slice_qp, 0, 51)) >> 4) + n) - 127;
 
         pre ^= pre >> 31;
         if (pre > 124)
             pre = 124 + (pre & 1);
-        lc->cabac_state[i] = pre;
+        lc->sub.cabac_state[i] = pre;
     }
 
     for (i = 0; i < 4; i++)
-        lc->stat_coeff[i] = 0;
+        lc->sub.stat_coeff[i] = 0;
+}
+
+/* Open CABAC on this substream's data, or continue byte-aligned in it if it
+ * is already open (one slice read from a single buffer). */
+static int substream_continue(HEVCLocalContext *lc)
+{
+    HEVCSubstream *const sub = &lc->sub;
+    int ret;
+
+    if (sub->opened)
+        return cabac_reinit(lc);
+
+    ret = ff_init_cabac_decoder(&sub->cc, sub->data, sub->size);
+    if (ret < 0)
+        return ret;
+    sub->opened = 1;
+
+    return 0;
 }
 
 int ff_hevc_cabac_init(HEVCLocalContext *lc, const HEVCPPS *pps,
-                       int ctb_addr_ts, const uint8_t *data, size_t size,
-                       int is_wpp)
+                       int ctb_addr_ts)
 {
     const HEVCContext *const s = lc->parent;
     const HEVCSPS   *const sps = pps->sps;
+    HEVCSubstream *const sub = &lc->sub;
 
-    if (ctb_addr_ts == pps->ctb_addr_rs_to_ts[s->sh.slice_ctb_addr_rs]) {
-        int ret = ff_init_cabac_decoder(&lc->cc, data, size);
+    if (ctb_addr_ts == pps->ctb_addr_rs_to_ts[lc->sh->slice_ctb_addr_rs]) {
+        /* First CTB of a slice segment. For a dependent slice segment the
+         * data still belongs to the new segment. */
+        int ret = ff_init_cabac_decoder(&sub->cc, sub->data, sub->size);
         if (ret < 0)
             return ret;
-        if (s->sh.dependent_slice_segment_flag == 0 ||
+        sub->opened = 1;
+        if (lc->sh->dependent_slice_segment_flag == 0 ||
             (pps->tiles_enabled_flag &&
              pps->tile_id[ctb_addr_ts] != pps->tile_id[ctb_addr_ts - 1]))
             cabac_init_state(lc, s);
 
-        if (!s->sh.first_slice_in_pic_flag &&
+        if (!lc->sh->first_slice_in_pic_flag &&
             pps->entropy_coding_sync_enabled_flag) {
             if (ctb_addr_ts % sps->ctb_width == 0) {
                 if (sps->ctb_width == 1)
                     cabac_init_state(lc, s);
-                else if (s->sh.dependent_slice_segment_flag == 1)
+                else if (lc->sh->dependent_slice_segment_flag == 1)
                     load_states(lc, sps);
             }
         }
     } else {
         if (pps->tiles_enabled_flag &&
             pps->tile_id[ctb_addr_ts] != pps->tile_id[ctb_addr_ts - 1]) {
-            int ret;
-            if (!is_wpp)
-                ret = cabac_reinit(lc);
-            else {
-                ret = ff_init_cabac_decoder(&lc->cc, data, size);
-            }
+            int ret = substream_continue(lc);
             if (ret < 0)
                 return ret;
             cabac_init_state(lc, s);
@@ -492,12 +508,10 @@ int ff_hevc_cabac_init(HEVCLocalContext *lc, const HEVCPPS *pps,
         if (pps->entropy_coding_sync_enabled_flag) {
             if (ctb_addr_ts % sps->ctb_width == 0) {
                 int ret;
-                get_cabac_terminate(&lc->cc);
-                if (!is_wpp)
-                    ret = cabac_reinit(lc);
-                else {
-                    ret = ff_init_cabac_decoder(&lc->cc, data, size);
-                }
+                /* The end of row terminate bit is read only when continuing */
+                if (sub->opened)
+                    get_cabac_terminate(&sub->cc);
+                ret = substream_continue(lc);
                 if (ret < 0)
                     return ret;
 
@@ -511,7 +525,7 @@ int ff_hevc_cabac_init(HEVCLocalContext *lc, const HEVCPPS *pps,
     return 0;
 }
 
-#define GET_CABAC(ctx)  get_cabac(&lc->cc, &lc->cabac_state[ctx])
+#define GET_CABAC(ctx)  get_cabac(&lc->sub.cc, &lc->sub.cabac_state[ctx])
 
 int ff_hevc_sao_merge_flag_decode(HEVCLocalContext *lc)
 {
@@ -523,7 +537,7 @@ int ff_hevc_sao_type_idx_decode(HEVCLocalContext *lc)
     if (!GET_CABAC(SAO_TYPE_IDX_OFFSET))
         return 0;
 
-    if (!get_cabac_bypass(&lc->cc))
+    if (!get_cabac_bypass(&lc->sub.cc))
         return SAO_BAND;
     return SAO_EDGE;
 }
@@ -531,10 +545,10 @@ int ff_hevc_sao_type_idx_decode(HEVCLocalContext *lc)
 int ff_hevc_sao_band_position_decode(HEVCLocalContext *lc)
 {
     int i;
-    int value = get_cabac_bypass(&lc->cc);
+    int value = get_cabac_bypass(&lc->sub.cc);
 
     for (i = 0; i < 4; i++)
-        value = (value << 1) | get_cabac_bypass(&lc->cc);
+        value = (value << 1) | get_cabac_bypass(&lc->sub.cc);
     return value;
 }
 
@@ -543,26 +557,26 @@ int ff_hevc_sao_offset_abs_decode(HEVCLocalContext *lc, int bit_depth)
     int i = 0;
     int length = (1 << (FFMIN(bit_depth, 10) - 5)) - 1;
 
-    while (i < length && get_cabac_bypass(&lc->cc))
+    while (i < length && get_cabac_bypass(&lc->sub.cc))
         i++;
     return i;
 }
 
 int ff_hevc_sao_offset_sign_decode(HEVCLocalContext *lc)
 {
-    return get_cabac_bypass(&lc->cc);
+    return get_cabac_bypass(&lc->sub.cc);
 }
 
 int ff_hevc_sao_eo_class_decode(HEVCLocalContext *lc)
 {
-    int ret = get_cabac_bypass(&lc->cc) << 1;
-    ret    |= get_cabac_bypass(&lc->cc);
+    int ret = get_cabac_bypass(&lc->sub.cc) << 1;
+    ret    |= get_cabac_bypass(&lc->sub.cc);
     return ret;
 }
 
 int ff_hevc_end_of_slice_flag_decode(HEVCLocalContext *lc)
 {
-    return get_cabac_terminate(&lc->cc);
+    return get_cabac_terminate(&lc->sub.cc);
 }
 
 int ff_hevc_cu_transquant_bypass_flag_decode(HEVCLocalContext *lc)
@@ -595,7 +609,7 @@ int ff_hevc_cu_qp_delta_abs(HEVCLocalContext *lc)
     }
     if (prefix_val >= 5) {
         int k = 0;
-        while (k < 7 && get_cabac_bypass(&lc->cc)) {
+        while (k < 7 && get_cabac_bypass(&lc->sub.cc)) {
             suffix_val += 1 << k;
             k++;
         }
@@ -605,14 +619,14 @@ int ff_hevc_cu_qp_delta_abs(HEVCLocalContext *lc)
         }
 
         while (k--)
-            suffix_val += get_cabac_bypass(&lc->cc) << k;
+            suffix_val += get_cabac_bypass(&lc->sub.cc) << k;
     }
     return prefix_val + suffix_val;
 }
 
 int ff_hevc_cu_qp_delta_sign_flag(HEVCLocalContext *lc)
 {
-    return get_cabac_bypass(&lc->cc);
+    return get_cabac_bypass(&lc->sub.cc);
 }
 
 int ff_hevc_cu_chroma_qp_offset_flag(HEVCLocalContext *lc)
@@ -682,21 +696,21 @@ int ff_hevc_part_mode_decode(HEVCLocalContext *lc, const HEVCSPS *sps, int log2_
     if (GET_CABAC(PART_MODE_OFFSET + 1)) { // 01X, 01XX
         if (GET_CABAC(PART_MODE_OFFSET + 3)) // 011
             return PART_2NxN;
-        if (get_cabac_bypass(&lc->cc)) // 0101
+        if (get_cabac_bypass(&lc->sub.cc)) // 0101
             return PART_2NxnD;
         return PART_2NxnU; // 0100
     }
 
     if (GET_CABAC(PART_MODE_OFFSET + 3)) // 001
         return PART_Nx2N;
-    if (get_cabac_bypass(&lc->cc)) // 0001
+    if (get_cabac_bypass(&lc->sub.cc)) // 0001
         return PART_nRx2N;
     return PART_nLx2N;  // 0000
 }
 
 int ff_hevc_pcm_flag_decode(HEVCLocalContext *lc)
 {
-    return get_cabac_terminate(&lc->cc);
+    return get_cabac_terminate(&lc->sub.cc);
 }
 
 int ff_hevc_prev_intra_luma_pred_flag_decode(HEVCLocalContext *lc)
@@ -707,7 +721,7 @@ int ff_hevc_prev_intra_luma_pred_flag_decode(HEVCLocalContext *lc)
 int ff_hevc_mpm_idx_decode(HEVCLocalContext *lc)
 {
     int i = 0;
-    while (i < 2 && get_cabac_bypass(&lc->cc))
+    while (i < 2 && get_cabac_bypass(&lc->sub.cc))
         i++;
     return i;
 }
@@ -715,10 +729,10 @@ int ff_hevc_mpm_idx_decode(HEVCLocalContext *lc)
 int ff_hevc_rem_intra_luma_pred_mode_decode(HEVCLocalContext *lc)
 {
     int i;
-    int value = get_cabac_bypass(&lc->cc);
+    int value = get_cabac_bypass(&lc->sub.cc);
 
     for (i = 0; i < 4; i++)
-        value = (value << 1) | get_cabac_bypass(&lc->cc);
+        value = (value << 1) | get_cabac_bypass(&lc->sub.cc);
     return value;
 }
 
@@ -728,8 +742,8 @@ int ff_hevc_intra_chroma_pred_mode_decode(HEVCLocalContext *lc)
     if (!GET_CABAC(INTRA_CHROMA_PRED_MODE_OFFSET))
         return 4;
 
-    ret  = get_cabac_bypass(&lc->cc) << 1;
-    ret |= get_cabac_bypass(&lc->cc);
+    ret  = get_cabac_bypass(&lc->sub.cc) << 1;
+    ret |= get_cabac_bypass(&lc->sub.cc);
     return ret;
 }
 
@@ -738,7 +752,7 @@ int ff_hevc_merge_idx_decode(HEVCLocalContext *lc)
     int i = GET_CABAC(MERGE_IDX_OFFSET);
 
     if (i != 0) {
-        while (i < lc->parent->sh.max_num_merge_cand-1 && get_cabac_bypass(&lc->cc))
+        while (i < lc->sh->max_num_merge_cand-1 && get_cabac_bypass(&lc->sub.cc))
             i++;
     }
     return i;
@@ -768,7 +782,7 @@ int ff_hevc_ref_idx_lx_decode(HEVCLocalContext *lc, int num_ref_idx_lx)
     while (i < max_ctx && GET_CABAC(REF_IDX_L0_OFFSET + i))
         i++;
     if (i == 2) {
-        while (i < max && get_cabac_bypass(&lc->cc))
+        while (i < max && get_cabac_bypass(&lc->sub.cc))
             i++;
     }
 
@@ -800,7 +814,7 @@ static av_always_inline int mvd_decode(HEVCLocalContext *lc)
     int ret = 2;
     int k = 1;
 
-    while (k < CABAC_MAX_BIN && get_cabac_bypass(&lc->cc)) {
+    while (k < CABAC_MAX_BIN && get_cabac_bypass(&lc->sub.cc)) {
         ret += 1U << k;
         k++;
     }
@@ -809,13 +823,13 @@ static av_always_inline int mvd_decode(HEVCLocalContext *lc)
         return 0;
     }
     while (k--)
-        ret += get_cabac_bypass(&lc->cc) << k;
-    return get_cabac_bypass_sign(&lc->cc, -ret);
+        ret += get_cabac_bypass(&lc->sub.cc) << k;
+    return get_cabac_bypass_sign(&lc->sub.cc, -ret);
 }
 
 static av_always_inline int mvd_sign_flag_decode(HEVCLocalContext *lc)
 {
-    return get_cabac_bypass_sign(&lc->cc, -1);
+    return get_cabac_bypass_sign(&lc->sub.cc, -1);
 }
 
 int ff_hevc_split_transform_flag_decode(HEVCLocalContext *lc, int log2_trafo_size)
@@ -894,10 +908,10 @@ static av_always_inline int last_significant_coeff_suffix_decode(HEVCLocalContex
 {
     int i;
     int length = (last_significant_coeff_prefix >> 1) - 1;
-    int value = get_cabac_bypass(&lc->cc);
+    int value = get_cabac_bypass(&lc->sub.cc);
 
     for (i = 1; i < length; i++)
-        value = (value << 1) | get_cabac_bypass(&lc->cc);
+        value = (value << 1) | get_cabac_bypass(&lc->sub.cc);
     return value;
 }
 
@@ -909,10 +923,10 @@ static av_always_inline int significant_coeff_group_flag_decode(HEVCLocalContext
 
     return GET_CABAC(SIGNIFICANT_COEFF_GROUP_FLAG_OFFSET + inc);
 }
-static av_always_inline int significant_coeff_flag_decode(HEVCLocalContext *lc, int x_c, int y_c,
+static av_always_inline int significant_coeff_flag_decode(HEVCLocalContext *lc, int n,
                                            int offset, const uint8_t *ctx_idx_map)
 {
-    int inc = ctx_idx_map[(y_c << 2) + x_c] + offset;
+    int inc = ctx_idx_map[n] + offset;
     return GET_CABAC(SIGNIFICANT_COEFF_FLAG_OFFSET + inc);
 }
 
@@ -938,30 +952,107 @@ static av_always_inline int coeff_abs_level_greater2_flag_decode(HEVCLocalContex
     return GET_CABAC(COEFF_ABS_LEVEL_GREATER2_FLAG_OFFSET + inc);
 }
 
-static av_always_inline int coeff_abs_level_remaining_decode(HEVCLocalContext *lc, int rc_rice_param)
+/* a run of bypass bins is the quotient of the offset by range << 17 */
+static int cabac_bypass_bits(CABACContext *c, int n)
+{
+    int avail = CABAC_BITS - ff_ctz(c->low);
+    uint64_t x, r = (uint64_t)c->range << (CABAC_BITS + 1);
+    const uint8_t *bytestream = c->bytestream;
+
+    if (n < avail) {
+        x = (uint64_t)c->low << n;
+    } else {
+        int fill = (bytestream[0] << 9) + (bytestream[1] << 1) - CABAC_MASK;
+
+        x = (uint64_t)((((int64_t)c->low << avail) + fill)) << (n - avail);
+#if !UNCHECKED_BITSTREAM_READER
+        if (bytestream < c->bytestream_end)
+#endif
+            bytestream += CABAC_BITS / 8;
+    }
+
+    if (x < r << n) {
+        c->low = x % r;
+        c->bytestream = bytestream;
+        return x / r;
+    } else {
+        int ret = 0;
+
+        for (int i = 0; i < n; i++)
+            ret = (ret << 1) | get_cabac_bypass(c);
+        return ret;
+    }
+}
+
+/* leading ones of the quotient, consumed only up to the first zero */
+static int cabac_unary_prefix(CABACContext *c, int max)
 {
     int prefix = 0;
+
+    while (prefix < max) {
+        int avail = CABAC_BITS - ff_ctz(c->low);
+        int n = FFMIN(avail - 1, max - prefix);
+        uint64_t r = (uint64_t)c->range << (CABAC_BITS + 1);
+        uint64_t x = (uint64_t)c->low << n;
+        int q, t;
+
+        if (n < 1 || x >= r << n) {
+            if (!get_cabac_bypass(c))
+                return prefix;
+            prefix++;
+            continue;
+        }
+
+        q = x / r;
+        t = ~q & ((1 << n) - 1);
+        if (t) {
+            int p = n - 1 - av_log2(t);
+            int k = n - (p + 1);
+
+            c->low = (x >> k) - ((uint64_t)(q >> k) * r);
+            return prefix + p;
+        }
+        c->low = x - (uint64_t)q * r;
+        prefix += n;
+    }
+    return prefix;
+}
+
+static av_always_inline int coeff_abs_level_remaining_decode(HEVCLocalContext *lc, int rc_rice_param)
+{
+    int prefix;
     int suffix = 0;
     int last_coeff_abs_level_remaining;
     int i;
 
-    while (prefix < CABAC_MAX_BIN && get_cabac_bypass(&lc->cc))
-        prefix++;
+    prefix = cabac_unary_prefix(&lc->sub.cc, CABAC_MAX_BIN);
 
     if (prefix < 3) {
-        for (i = 0; i < rc_rice_param; i++)
-            suffix = (suffix << 1) | get_cabac_bypass(&lc->cc);
+        if (rc_rice_param > 2)
+            suffix = cabac_bypass_bits(&lc->sub.cc, rc_rice_param);
+        else
+            for (i = 0; i < rc_rice_param; i++)
+                suffix = (suffix << 1) | get_cabac_bypass(&lc->sub.cc);
         last_coeff_abs_level_remaining = (prefix << rc_rice_param) + suffix;
     } else {
         int prefix_minus3 = prefix - 3;
+        int k;
 
         if (prefix == CABAC_MAX_BIN || prefix_minus3 + rc_rice_param > 16 + 6) {
             av_log(lc->logctx, AV_LOG_ERROR, "CABAC_MAX_BIN : %d\n", prefix);
             return 0;
         }
 
-        for (i = 0; i < prefix_minus3 + rc_rice_param; i++)
-            suffix = (suffix << 1) | get_cabac_bypass(&lc->cc);
+        k = prefix_minus3 + rc_rice_param;
+        if (k > 16) {
+            suffix  = cabac_bypass_bits(&lc->sub.cc, 16) << (k - 16);
+            suffix |= cabac_bypass_bits(&lc->sub.cc, k - 16);
+        } else if (k > 2) {
+            suffix = cabac_bypass_bits(&lc->sub.cc, k);
+        } else {
+            for (i = 0; i < k; i++)
+                suffix = (suffix << 1) | get_cabac_bypass(&lc->sub.cc);
+        }
         last_coeff_abs_level_remaining = (((1 << prefix_minus3) + 3 - 1)
                                               << rc_rice_param) + suffix;
     }
@@ -973,8 +1064,11 @@ static av_always_inline int coeff_sign_flag_decode(HEVCLocalContext *lc, uint8_t
     int i;
     int ret = 0;
 
+    if (nb > 2)
+        return cabac_bypass_bits(&lc->sub.cc, nb);
+
     for (i = 0; i < nb; i++)
-        ret = (ret << 1) | get_cabac_bypass(&lc->cc);
+        ret = (ret << 1) | get_cabac_bypass(&lc->sub.cc);
     return ret;
 }
 
@@ -999,6 +1093,7 @@ void ff_hevc_hls_residual_coding(HEVCLocalContext *lc, const HEVCPPS *pps,
     int greater1_ctx = 1;
 
     int num_last_subset;
+    int max_xy, col_limit, clear_rows;
     int x_cg_last_sig, y_cg_last_sig;
 
     const uint8_t *scan_x_cg, *scan_y_cg, *scan_x_off, *scan_y_off;
@@ -1022,8 +1117,6 @@ void ff_hevc_hls_residual_coding(HEVCLocalContext *lc, const HEVCPPS *pps,
     int pred_mode_intra = (c_idx == 0) ? lc->tu.intra_pred_mode :
                                          lc->tu.intra_pred_mode_c;
 
-    memset(coeffs, 0, trafo_size * trafo_size * sizeof(int16_t));
-
     // Derive QP for dequant
     if (!lc->cu.cu_transquant_bypass_flag) {
         static const int qp_c[] = { 29, 30, 31, 32, 33, 33, 34, 34, 35, 35, 36, 36, 37, 37 };
@@ -1040,7 +1133,7 @@ void ff_hevc_hls_residual_coding(HEVCLocalContext *lc, const HEVCPPS *pps,
             7, 7, 7, 7, 7, 7, 8, 8, 8, 8, 8, 8, 9, 9, 9, 9, 9, 9, 10, 10, 10, 10,
             10, 10, 11, 11, 11, 11, 11, 11, 12, 12
         };
-        int qp_y = lc->qp_y;
+        int qp_y = lc->sub.qp_y;
 
         if (pps->transform_skip_enabled_flag &&
             log2_trafo_size <= pps->log2_max_transform_skip_block_size) {
@@ -1053,11 +1146,11 @@ void ff_hevc_hls_residual_coding(HEVCLocalContext *lc, const HEVCPPS *pps,
             int qp_i, offset;
 
             if (c_idx == 1)
-                offset = pps->cb_qp_offset + s->sh.slice_cb_qp_offset +
-                         lc->tu.cu_qp_offset_cb;
+                offset = pps->cb_qp_offset + lc->sh->slice_cb_qp_offset +
+                         lc->sub.cu_qp_offset_cb;
             else
-                offset = pps->cr_qp_offset + s->sh.slice_cr_qp_offset +
-                         lc->tu.cu_qp_offset_cr;
+                offset = pps->cr_qp_offset + lc->sh->slice_cr_qp_offset +
+                         lc->sub.cu_qp_offset_cr;
 
             qp_i = av_clip(qp_y + offset, - sps->qp_bd_offset, 57);
             if (sps->chroma_format_idc == 1) {
@@ -1176,6 +1269,25 @@ void ff_hevc_hls_residual_coding(HEVCLocalContext *lc, const HEVCPPS *pps,
     num_coeff++;
     num_last_subset = (num_coeff - 1) >> 4;
 
+    max_xy = FFMAX(last_significant_coeff_x, last_significant_coeff_y);
+    col_limit = last_significant_coeff_x + last_significant_coeff_y + 4;
+    if (max_xy < 4)
+        col_limit = FFMIN(4, col_limit);
+    else if (max_xy < 8)
+        col_limit = FFMIN(8, col_limit);
+    else if (max_xy < 12)
+        col_limit = FFMIN(24, col_limit);
+
+    // idct_dc reads coeffs[0] only and writes the whole block: no clear needed
+    clear_rows = trafo_size;
+    if (!lc->cu.cu_transquant_bypass_flag && !transform_skip_flag &&
+        !(lc->cu.pred_mode == MODE_INTRA && c_idx == 0 && log2_trafo_size == 2)) {
+        if (max_xy == 0)
+            clear_rows = 0;
+    }
+    if (clear_rows)
+        memset(coeffs, 0, clear_rows * trafo_size * sizeof(int16_t));
+
     for (i = num_last_subset; i >= 0; i--) {
         int n, m;
         int x_cg, y_cg, x_c, y_c, pos;
@@ -1223,18 +1335,36 @@ void ff_hevc_hls_residual_coding(HEVCLocalContext *lc, const HEVCPPS *pps,
             prev_sig += (!!significant_coeff_group_flag[x_cg][y_cg + 1] << 1);
 
         if (significant_coeff_group_flag[x_cg][y_cg] && n_end >= 0) {
-            static const uint8_t ctx_idx_map[] = {
-                0, 1, 4, 5, 2, 3, 4, 5, 6, 6, 8, 8, 7, 7, 8, 8, // log2_trafo_size == 2
-                1, 1, 1, 0, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, // prev_sig == 0
-                2, 2, 2, 2, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, // prev_sig == 1
-                2, 1, 0, 0, 2, 1, 0, 0, 2, 1, 0, 0, 2, 1, 0, 0, // prev_sig == 2
-                2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2  // default
+            // ctx_idx_map composed with the intra-CG scan, indexed by scan position
+            static const uint8_t ctx_idx_map[3][5 * 16] = {
+                { // SCAN_DIAG
+                    0, 2, 1, 6, 3, 4, 7, 6, 4, 5, 7, 8, 5, 8, 8, 8, // log2_trafo_size == 2
+                    1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // prev_sig == 0
+                    2, 1, 2, 0, 1, 2, 0, 0, 1, 2, 0, 0, 1, 0, 0, 0, // prev_sig == 1
+                    2, 2, 1, 2, 1, 0, 2, 1, 0, 0, 1, 0, 0, 0, 0, 0, // prev_sig == 2
+                    2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, // default
+                },
+                { // SCAN_HORIZ
+                    0, 1, 4, 5, 2, 3, 4, 5, 6, 6, 8, 8, 7, 7, 8, 8,
+                    1, 1, 1, 0, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,
+                    2, 2, 2, 2, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0,
+                    2, 1, 0, 0, 2, 1, 0, 0, 2, 1, 0, 0, 2, 1, 0, 0,
+                    2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
+                },
+                { // SCAN_VERT
+                    0, 2, 6, 7, 1, 3, 6, 7, 4, 4, 8, 8, 5, 5, 8, 8,
+                    1, 1, 1, 0, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,
+                    2, 1, 0, 0, 2, 1, 0, 0, 2, 1, 0, 0, 2, 1, 0, 0,
+                    2, 2, 2, 2, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0,
+                    2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
+                },
             };
             const uint8_t *ctx_idx_map_p;
             int scf_offset = 0;
+            int nb0;
             if (sps->transform_skip_context_enabled &&
                 (transform_skip_flag || lc->cu.cu_transquant_bypass_flag)) {
-                ctx_idx_map_p = &ctx_idx_map[4 * 16];
+                ctx_idx_map_p = &ctx_idx_map[scan_idx][4 * 16];
                 if (c_idx == 0) {
                     scf_offset = 40;
                 } else {
@@ -1244,9 +1374,9 @@ void ff_hevc_hls_residual_coding(HEVCLocalContext *lc, const HEVCPPS *pps,
                 if (c_idx != 0)
                     scf_offset = 27;
                 if (log2_trafo_size == 2) {
-                    ctx_idx_map_p = &ctx_idx_map[0];
+                    ctx_idx_map_p = &ctx_idx_map[scan_idx][0];
                 } else {
-                    ctx_idx_map_p = &ctx_idx_map[(prev_sig + 1) << 4];
+                    ctx_idx_map_p = &ctx_idx_map[scan_idx][(prev_sig + 1) << 4];
                     if (c_idx == 0) {
                         if ((x_cg > 0 || y_cg > 0))
                             scf_offset += 3;
@@ -1263,15 +1393,15 @@ void ff_hevc_hls_residual_coding(HEVCLocalContext *lc, const HEVCPPS *pps,
                     }
                 }
             }
+            // the flag is a fresh bin: store always, advance conditionally
+            nb0 = nb_significant_coeff_flag;
             for (n = n_end; n > 0; n--) {
-                x_c = scan_x_off[n];
-                y_c = scan_y_off[n];
-                if (significant_coeff_flag_decode(lc, x_c, y_c, scf_offset, ctx_idx_map_p)) {
-                    significant_coeff_flag_idx[nb_significant_coeff_flag] = n;
-                    nb_significant_coeff_flag++;
-                    implicit_non_zero_coeff = 0;
-                }
+                int sig = significant_coeff_flag_decode(lc, n, scf_offset, ctx_idx_map_p);
+                significant_coeff_flag_idx[nb_significant_coeff_flag] = n;
+                nb_significant_coeff_flag += sig;
             }
+            if (nb_significant_coeff_flag != nb0)
+                implicit_non_zero_coeff = 0;
             if (implicit_non_zero_coeff == 0) {
                 if (sps->transform_skip_context_enabled &&
                     (transform_skip_flag || lc->cu.cu_transquant_bypass_flag)) {
@@ -1290,10 +1420,9 @@ void ff_hevc_hls_residual_coding(HEVCLocalContext *lc, const HEVCPPS *pps,
                         scf_offset = 2 + scf_offset;
                     }
                 }
-                if (significant_coeff_flag_decode_0(lc, c_idx, scf_offset) == 1) {
-                    significant_coeff_flag_idx[nb_significant_coeff_flag] = 0;
-                    nb_significant_coeff_flag++;
-                }
+                significant_coeff_flag_idx[nb_significant_coeff_flag] = 0;
+                nb_significant_coeff_flag +=
+                    significant_coeff_flag_decode_0(lc, c_idx, scf_offset);
             } else {
                 significant_coeff_flag_idx[nb_significant_coeff_flag] = 0;
                 nb_significant_coeff_flag++;
@@ -1313,6 +1442,7 @@ void ff_hevc_hls_residual_coding(HEVCLocalContext *lc, const HEVCPPS *pps,
             int sum_abs = 0;
             int sign_hidden;
             int sb_type;
+            int gt1_mask = 0;
 
 
             // initialize first elem of coeff_bas_level_greater1_flag
@@ -1323,7 +1453,7 @@ void ff_hevc_hls_residual_coding(HEVCLocalContext *lc, const HEVCPPS *pps,
                     sb_type = 2 * (c_idx == 0 ? 1 : 0);
                 else
                     sb_type = 2 * (c_idx == 0 ? 1 : 0) + 1;
-                c_rice_param = lc->stat_coeff[sb_type] / 4;
+                c_rice_param = lc->sub.stat_coeff[sb_type] / 4;
             }
 
             if (!(i == num_last_subset) && greater1_ctx == 0)
@@ -1331,18 +1461,16 @@ void ff_hevc_hls_residual_coding(HEVCLocalContext *lc, const HEVCPPS *pps,
             greater1_ctx = 1;
             last_nz_pos_in_cg = significant_coeff_flag_idx[0];
 
+            // fresh bins: branchless context update, first set index from the mask
             for (m = 0; m < (n_end > 8 ? 8 : n_end); m++) {
-                int inc = (ctx_set << 2) + greater1_ctx;
-                coeff_abs_level_greater1_flag[m] =
-                    coeff_abs_level_greater1_flag_decode(lc, c_idx, inc);
-                if (coeff_abs_level_greater1_flag[m]) {
-                    greater1_ctx = 0;
-                    if (first_greater1_coeff_idx == -1)
-                        first_greater1_coeff_idx = m;
-                } else if (greater1_ctx > 0 && greater1_ctx < 3) {
-                    greater1_ctx++;
-                }
+                int inc  = (ctx_set << 2) + greater1_ctx;
+                int flag = coeff_abs_level_greater1_flag_decode(lc, c_idx, inc);
+                coeff_abs_level_greater1_flag[m] = flag;
+                gt1_mask |= flag << m;
+                greater1_ctx = (greater1_ctx + (greater1_ctx - 1U < 2)) & (flag - 1);
             }
+            if (gt1_mask)
+                first_greater1_coeff_idx = ff_ctz(gt1_mask);
             first_nz_pos_in_cg = significant_coeff_flag_idx[n_end - 1];
 
             if (lc->cu.cu_transquant_bypass_flag ||
@@ -1364,6 +1492,8 @@ void ff_hevc_hls_residual_coding(HEVCLocalContext *lc, const HEVCPPS *pps,
             }
 
             for (m = 0; m < n_end; m++) {
+                int64_t sign;
+
                 n = significant_coeff_flag_idx[m];
                 GET_COORD(offset, n);
                 if (m < 8) {
@@ -1375,12 +1505,12 @@ void ff_hevc_hls_residual_coding(HEVCLocalContext *lc, const HEVCPPS *pps,
                         if (trans_coeff_level > (3 << c_rice_param))
                             c_rice_param = sps->persistent_rice_adaptation_enabled ? c_rice_param + 1 : FFMIN(c_rice_param + 1, 4);
                         if (sps->persistent_rice_adaptation_enabled && !rice_init) {
-                            int c_rice_p_init = lc->stat_coeff[sb_type] / 4;
+                            int c_rice_p_init = lc->sub.stat_coeff[sb_type] / 4;
                             if (last_coeff_abs_level_remaining >= (3 << c_rice_p_init))
-                                lc->stat_coeff[sb_type]++;
+                                lc->sub.stat_coeff[sb_type]++;
                             else if (2 * last_coeff_abs_level_remaining < (1 << c_rice_p_init))
-                                if (lc->stat_coeff[sb_type] > 0)
-                                    lc->stat_coeff[sb_type]--;
+                                if (lc->sub.stat_coeff[sb_type] > 0)
+                                    lc->sub.stat_coeff[sb_type]--;
                             rice_init = 1;
                         }
                     }
@@ -1391,12 +1521,12 @@ void ff_hevc_hls_residual_coding(HEVCLocalContext *lc, const HEVCPPS *pps,
                     if (trans_coeff_level > (3 << c_rice_param))
                         c_rice_param = sps->persistent_rice_adaptation_enabled ? c_rice_param + 1 : FFMIN(c_rice_param + 1, 4);
                     if (sps->persistent_rice_adaptation_enabled && !rice_init) {
-                        int c_rice_p_init = lc->stat_coeff[sb_type] / 4;
+                        int c_rice_p_init = lc->sub.stat_coeff[sb_type] / 4;
                         if (last_coeff_abs_level_remaining >= (3 << c_rice_p_init))
-                            lc->stat_coeff[sb_type]++;
+                            lc->sub.stat_coeff[sb_type]++;
                         else if (2 * last_coeff_abs_level_remaining < (1 << c_rice_p_init))
-                            if (lc->stat_coeff[sb_type] > 0)
-                                lc->stat_coeff[sb_type]--;
+                            if (lc->sub.stat_coeff[sb_type] > 0)
+                                lc->sub.stat_coeff[sb_type]--;
                         rice_init = 1;
                     }
                 }
@@ -1405,8 +1535,9 @@ void ff_hevc_hls_residual_coding(HEVCLocalContext *lc, const HEVCPPS *pps,
                     if (n == first_nz_pos_in_cg && (sum_abs&1))
                         trans_coeff_level = -trans_coeff_level;
                 }
-                if (coeff_sign_flag >> 15)
-                    trans_coeff_level = -trans_coeff_level;
+                // equiprobable sign: apply it branchless
+                sign = -(int64_t)(coeff_sign_flag >> 15);
+                trans_coeff_level = (trans_coeff_level ^ sign) - sign;
                 coeff_sign_flag <<= 1;
                 if(!lc->cu.cu_transquant_bypass_flag) {
                     if (sps->scaling_list_enabled && !(transform_skip_flag && log2_trafo_size > 2)) {
@@ -1423,13 +1554,7 @@ void ff_hevc_hls_residual_coding(HEVCLocalContext *lc, const HEVCPPS *pps,
                         }
                     }
                     trans_coeff_level = (trans_coeff_level * (int64_t)scale * (int64_t)scale_m + add) >> shift;
-                    if(trans_coeff_level < 0) {
-                        if((~trans_coeff_level) & 0xFffffffffff8000)
-                            trans_coeff_level = -32768;
-                    } else {
-                        if(trans_coeff_level & 0xffffffffffff8000)
-                            trans_coeff_level = 32767;
-                    }
+                    trans_coeff_level = FFMAX(FFMIN(trans_coeff_level, 32767), -32768);
                 }
                 coeffs[y_c * trafo_size + x_c] = trans_coeff_level;
             }
@@ -1465,19 +1590,10 @@ void ff_hevc_hls_residual_coding(HEVCLocalContext *lc, const HEVCPPS *pps,
         } else if (lc->cu.pred_mode == MODE_INTRA && c_idx == 0 && log2_trafo_size == 2) {
             s->hevcdsp.transform_4x4_luma(coeffs);
         } else {
-            int max_xy = FFMAX(last_significant_coeff_x, last_significant_coeff_y);
             if (max_xy == 0)
                 s->hevcdsp.idct_dc[log2_trafo_size - 2](coeffs);
-            else {
-                int col_limit = last_significant_coeff_x + last_significant_coeff_y + 4;
-                if (max_xy < 4)
-                    col_limit = FFMIN(4, col_limit);
-                else if (max_xy < 8)
-                    col_limit = FFMIN(8, col_limit);
-                else if (max_xy < 12)
-                    col_limit = FFMIN(24, col_limit);
+            else
                 s->hevcdsp.idct[log2_trafo_size - 2](coeffs, col_limit);
-            }
         }
     }
     if (lc->tu.cross_pf) {

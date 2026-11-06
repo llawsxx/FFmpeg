@@ -2145,6 +2145,30 @@ static const AVPixFmtDescriptor av_pix_fmt_descriptors[AV_PIX_FMT_NB] = {
        },
         .flags = AV_PIX_FMT_FLAG_XYZ | AV_PIX_FMT_FLAG_BE,
     },
+    [AV_PIX_FMT_XYZP12LE] = {
+        .name = "xyzp12le",
+        .nb_components = 3,
+        .log2_chroma_w = 0,
+        .log2_chroma_h = 0,
+        .comp = {
+            { 0, 2, 0, 4, 12 },       /* X */
+            { 1, 2, 0, 4, 12 },       /* Y */
+            { 2, 2, 0, 4, 12 },       /* Z */
+        },
+        .flags = AV_PIX_FMT_FLAG_PLANAR | AV_PIX_FMT_FLAG_XYZ,
+    },
+    [AV_PIX_FMT_XYZP12BE] = {
+        .name = "xyzp12be",
+        .nb_components = 3,
+        .log2_chroma_w = 0,
+        .log2_chroma_h = 0,
+        .comp = {
+            { 0, 2, 0, 4, 12 },       /* X */
+            { 1, 2, 0, 4, 12 },       /* Y */
+            { 2, 2, 0, 4, 12 },       /* Z */
+        },
+        .flags = AV_PIX_FMT_FLAG_PLANAR | AV_PIX_FMT_FLAG_XYZ | AV_PIX_FMT_FLAG_BE,
+    },
 
 #define BAYER8_DESC_COMMON \
         .nb_components= 3, \
@@ -2276,6 +2300,10 @@ static const AVPixFmtDescriptor av_pix_fmt_descriptors[AV_PIX_FMT_NB] = {
     },
     [AV_PIX_FMT_CUDA] = {
         .name = "cuda",
+        .flags = AV_PIX_FMT_FLAG_HWACCEL,
+    },
+    [AV_PIX_FMT_CUARRAY] = {
+        .name = "cuarray",
         .flags = AV_PIX_FMT_FLAG_HWACCEL,
     },
     [AV_PIX_FMT_AMF_SURFACE] = {
@@ -3780,7 +3808,7 @@ int av_color_range_from_name(const char *name)
     int i;
 
     for (i = 0; i < FF_ARRAY_ELEMS(color_range_names); i++) {
-        if (av_strstart(name, color_range_names[i], NULL))
+        if (!strcmp(name, color_range_names[i]))
             return i;
     }
 
@@ -3805,7 +3833,7 @@ int av_color_primaries_from_name(const char *name)
         if (!color_primaries_names[i])
             continue;
 
-        if (av_strstart(name, color_primaries_names[i], NULL))
+        if (!strcmp(name, color_primaries_names[i]))
             return i;
     }
 
@@ -3813,7 +3841,7 @@ int av_color_primaries_from_name(const char *name)
         if (!color_primaries_names_ext[i])
             continue;
 
-        if (av_strstart(name, color_primaries_names_ext[i], NULL))
+        if (!strcmp(name, color_primaries_names_ext[i]))
             return AVCOL_PRI_EXT_BASE + i;
     }
 
@@ -3838,7 +3866,7 @@ int av_color_transfer_from_name(const char *name)
         if (!color_transfer_names[i])
             continue;
 
-        if (av_strstart(name, color_transfer_names[i], NULL))
+        if (!strcmp(name, color_transfer_names[i]))
             return i;
     }
 
@@ -3846,7 +3874,7 @@ int av_color_transfer_from_name(const char *name)
         if (!color_transfer_names_ext[i])
             continue;
 
-        if (av_strstart(name, color_transfer_names_ext[i], NULL))
+        if (!strcmp(name, color_transfer_names_ext[i]))
             return AVCOL_TRC_EXT_BASE + i;
     }
 
@@ -3867,7 +3895,7 @@ int av_color_space_from_name(const char *name)
         if (!color_space_names[i])
             continue;
 
-        if (av_strstart(name, color_space_names[i], NULL))
+        if (!strcmp(name, color_space_names[i]))
             return i;
     }
 
@@ -3888,7 +3916,7 @@ int av_chroma_location_from_name(const char *name)
         if (!chroma_location_names[i])
             continue;
 
-        if (av_strstart(name, chroma_location_names[i], NULL))
+        if (!strcmp(name, chroma_location_names[i]))
             return i;
     }
 
@@ -3930,7 +3958,7 @@ enum AVAlphaMode av_alpha_mode_from_name(const char *name)
         if (!alpha_mode_names[i])
             continue;
 
-        if (av_strstart(name, alpha_mode_names[i], NULL))
+        if (!strcmp(name, alpha_mode_names[i]))
             return i;
     }
 

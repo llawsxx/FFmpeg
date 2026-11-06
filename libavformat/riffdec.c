@@ -59,17 +59,17 @@ enum AVCodecID ff_codec_guid_get_id(const AVCodecGuid *guids, ff_asf_guid guid)
  * an openended structure.
  */
 
-static void parse_waveformatex(void *logctx, AVIOContext *pb, AVCodecParameters *par)
+static void parse_waveformatex(void *logctx, AVIOContext *pb, AVCodecParameters *par, int big_endian)
 {
     ff_asf_guid subformat;
     int bps;
     uint64_t mask;
 
-    bps = avio_rl16(pb);
+    bps = big_endian ? avio_rb16(pb) :  avio_rl16(pb);
     if (bps)
         par->bits_per_coded_sample = bps;
 
-    mask = avio_rl32(pb); /* dwChannelMask */
+    mask = big_endian ? avio_rb32(pb) : avio_rl32(pb); /* dwChannelMask */
     av_channel_layout_from_mask(&par->ch_layout, mask);
 
     ff_get_guid(pb, &subformat);
@@ -79,7 +79,7 @@ static void parse_waveformatex(void *logctx, AVIOContext *pb, AVCodecParameters 
                 (const uint8_t[]){ FF_BROKEN_BASE_GUID }, 12) ||
         !memcmp(subformat + 4,
                 (const uint8_t[]){ FF_MEDIASUBTYPE_BASE_GUID }, 12)) {
-        par->codec_tag = AV_RL32(subformat);
+        par->codec_tag = big_endian ? AV_RB16(subformat) : AV_RL32(subformat);
         par->codec_id  = ff_wav_codec_get_id(par->codec_tag,
                                              par->bits_per_coded_sample);
     } else {
@@ -88,6 +88,52 @@ static void parse_waveformatex(void *logctx, AVIOContext *pb, AVCodecParameters 
             av_log(logctx, AV_LOG_WARNING,
                    "unknown subformat:"FF_PRI_GUID"\n",
                    FF_ARG_GUID(subformat));
+    }
+}
+
+/*
+ * Compute the expected bit_rate for codecs with a deterministic block
+ * structure. Returns 0 when the codec is not handled or the parameters
+ * are not sufficient to derive a reliable value.
+ */
+static int64_t compute_bitrate(const AVCodecParameters *par)
+{
+    if (par->sample_rate <= 0 || par->block_align <= 0 ||
+        par->ch_layout.nb_channels <= 0)
+        return 0;
+
+    switch (par->codec_id) {
+    case AV_CODEC_ID_PCM_S8:
+    case AV_CODEC_ID_PCM_U8:
+    case AV_CODEC_ID_PCM_S16LE:
+    case AV_CODEC_ID_PCM_S16BE:
+    case AV_CODEC_ID_PCM_U16LE:
+    case AV_CODEC_ID_PCM_U16BE:
+    case AV_CODEC_ID_PCM_S24LE:
+    case AV_CODEC_ID_PCM_S24BE:
+    case AV_CODEC_ID_PCM_S32LE:
+    case AV_CODEC_ID_PCM_S32BE:
+    case AV_CODEC_ID_PCM_S64LE:
+    case AV_CODEC_ID_PCM_F32LE:
+    case AV_CODEC_ID_PCM_F64LE:
+    case AV_CODEC_ID_PCM_ALAW:
+    case AV_CODEC_ID_PCM_MULAW: {
+        int block_align = ((par->bits_per_coded_sample + 7) / 8) *
+                         par->ch_layout.nb_channels;
+        if (par->block_align != block_align)
+            return 0;
+        return (int64_t)par->sample_rate * block_align * 8;
+    }
+    case AV_CODEC_ID_ADPCM_MS:
+    case AV_CODEC_ID_ADPCM_IMA_WAV: {
+        int frame_size = av_get_audio_frame_duration2((AVCodecParameters *)par,
+                                                      par->block_align);
+        if (frame_size <= 0)
+            return 0;
+        return 8LL * par->sample_rate * par->block_align / frame_size;
+    }
+    default:
+        return 0;
     }
 }
 
@@ -138,18 +184,18 @@ int ff_get_wav_header(AVFormatContext *s, AVIOContext *pb,
                                              par->bits_per_coded_sample);
     }
     if (size >= 18 && id != 0x0165) {  /* We're obviously dealing with WAVEFORMATEX */
-        int cbSize = avio_rl16(pb); /* cbSize */
-        if (big_endian) {
-            avpriv_report_missing_feature(s, "WAVEFORMATEX support for RIFX files");
-            return AVERROR_PATCHWELCOME;
-        }
+        int cbSize = big_endian ? avio_rb16(pb) : avio_rl16(pb); /* cbSize */
         size  -= 18;
         cbSize = FFMIN(size, cbSize);
         if (cbSize >= 22 && id == 0xfffe) { /* WAVEFORMATEXTENSIBLE */
-            parse_waveformatex(s, pb, par);
+            parse_waveformatex(s, pb, par, big_endian);
             cbSize -= 22;
             size   -= 22;
         } else if (cbSize >= 12 && id == 0x1610) { /* HEAACWAVEFORMAT */
+            if (big_endian) {
+                avpriv_report_missing_feature(s, "HEAACWAVEFORMAT support for RIFX files");
+                return AVERROR_PATCHWELCOME;
+            }
             int wPayloadType = avio_rl16(pb);
             if (wPayloadType == 3)
                 par->codec_id = AV_CODEC_ID_AAC_LATM;
@@ -198,6 +244,7 @@ int ff_get_wav_header(AVFormatContext *s, AVIOContext *pb,
                "Invalid sample rate: %d\n", par->sample_rate);
         return AVERROR_INVALIDDATA;
     }
+
     if (par->codec_id == AV_CODEC_ID_AAC_LATM) {
         /* Channels and sample_rate values are those prior to applying SBR
          * and/or PS. */
@@ -208,11 +255,35 @@ int ff_get_wav_header(AVFormatContext *s, AVIOContext *pb,
     if (par->codec_id == AV_CODEC_ID_ADPCM_G726 && par->sample_rate)
         par->bits_per_coded_sample = par->bit_rate / par->sample_rate;
 
+    if (par->codec_id == AV_CODEC_ID_ADPCM_RHETOREX && par->bits_per_coded_sample == 3)
+        par->sample_rate = par->sample_rate * 3LL / 4;
+
     /* ignore WAVEFORMATEXTENSIBLE layout if different from channel count */
     if (channels != par->ch_layout.nb_channels) {
         av_channel_layout_uninit(&par->ch_layout);
         par->ch_layout.order       = AV_CHANNEL_ORDER_UNSPEC;
         par->ch_layout.nb_channels = channels;
+    }
+
+    int64_t expected_bitrate = compute_bitrate(par);
+    if (expected_bitrate && par->bit_rate / 8 != expected_bitrate / 8) {
+        av_log(s, AV_LOG_WARNING,
+               "nAvgBytesPerSec %"PRId64" inconsistent with other fields"
+               " (expected %"PRId64"), overriding.\n",
+               par->bit_rate / 8, expected_bitrate / 8);
+        par->bit_rate = expected_bitrate;
+    }
+
+    if (big_endian) { /* RIFX */
+        switch (par->codec_id) {
+        case AV_CODEC_ID_PCM_S16LE: par->codec_id = AV_CODEC_ID_PCM_S16BE; break;
+        case AV_CODEC_ID_PCM_S24LE: par->codec_id = AV_CODEC_ID_PCM_S24BE; break;
+        case AV_CODEC_ID_PCM_S32LE: par->codec_id = AV_CODEC_ID_PCM_S32BE; break;
+        case AV_CODEC_ID_PCM_S64LE: par->codec_id = AV_CODEC_ID_PCM_S64BE; break;
+        case AV_CODEC_ID_PCM_F32LE: par->codec_id = AV_CODEC_ID_PCM_F32BE; break;
+        case AV_CODEC_ID_PCM_F64LE: par->codec_id = AV_CODEC_ID_PCM_F64BE; break;
+        default: break;
+        }
     }
 
     return 0;

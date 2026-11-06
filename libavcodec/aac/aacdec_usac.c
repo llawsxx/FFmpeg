@@ -49,7 +49,7 @@ static inline uint32_t get_escaped_value(GetBitContext *gb, int nb1, int nb2, in
     return val;
 }
 
-/* ISO/IEC 23003-3, Table 74 — bsOutputChannelPos */
+/* ISO/IEC 23003-3, Table 74: bsOutputChannelPos */
 static const enum AVChannel usac_ch_pos_to_av[64] = {
     [0] = AV_CHAN_FRONT_LEFT,
     [1] = AV_CHAN_FRONT_RIGHT,
@@ -85,10 +85,23 @@ static const enum AVChannel usac_ch_pos_to_av[64] = {
     [31] = AV_CHAN_TOP_SURROUND_RIGHT, ///< -110 degrees, Rvs, TpRS
 };
 
+/* ISO/IEC 23003-4, Table A.48: bit width of bsMethodValue depends on methodDef. */
+static int methodvalue_width(int method_def)
+{
+    switch (method_def) {
+    case 7: return 5; /* mixing level */
+    case 8: return 2; /* room type */
+    default: return 8; /* loudness (0..6, 9) + reserved */
+    }
+}
+
+/* ISO/IEC 23003-4, Table 58/60: loudnessInfo(), loudnessInfoV1().
+ * The only difference in V1 is the added eqSetId field. */
 static int decode_loudness_info(AACDecContext *ac, AACUSACLoudnessInfo *info,
-                                GetBitContext *gb)
+                                GetBitContext *gb, int v1)
 {
     info->drc_set_id = get_bits(gb, 6);
+    info->eq_set_id = v1 ? get_bits(gb, 6) : 0;
     info->downmix_id = get_bits(gb, 7);
 
     if ((info->sample_peak.present = get_bits1(gb))) /* samplePeakLevelPresent */
@@ -103,12 +116,63 @@ static int decode_loudness_info(AACDecContext *ac, AACUSACLoudnessInfo *info,
     info->nb_measurements = get_bits(gb, 4);
     for (int i = 0; i < info->nb_measurements; i++) {
         info->measurements[i].method_def = get_bits(gb, 4);
-        info->measurements[i].method_val = get_unary(gb, 0, 8);
+        info->measurements[i].method_val =
+            get_bits(gb, methodvalue_width(info->measurements[i].method_def));
         info->measurements[i].measurement = get_bits(gb, 4);
         info->measurements[i].reliability = get_bits(gb, 2);
     }
 
     return 0;
+}
+
+/* ISO/IEC 23003-4, Table 61: loudnessInfoSetExtension(), UNIDRCLOUDEXT_EQ */
+static int decode_loudness_set_v1(AACDecContext *ac, AACUSACConfig *usac,
+                                  GetBitContext *gb)
+{
+    int ret;
+    int nb_album = get_bits(gb, 6); /* loudnessInfoV1AlbumCount */
+    int nb_info = get_bits(gb, 6); /* loudnessInfoV1Count */
+
+    for (int i = 0; i < nb_album; i++) {
+        AACUSACLoudnessInfo tmp;
+        ret = decode_loudness_info(ac, &tmp, gb, 1);
+        if (ret < 0)
+            return ret;
+        if (usac->loudness.nb_album < FF_ARRAY_ELEMS(usac->loudness.album_info))
+            usac->loudness.album_info[usac->loudness.nb_album++] = tmp;
+    }
+
+    for (int i = 0; i < nb_info; i++) {
+        AACUSACLoudnessInfo tmp;
+        ret = decode_loudness_info(ac, &tmp, gb, 1);
+        if (ret < 0)
+            return ret;
+        if (usac->loudness.nb_info < FF_ARRAY_ELEMS(usac->loudness.info))
+            usac->loudness.info[usac->loudness.nb_info++] = tmp;
+    }
+
+    return 0;
+}
+
+/* Pick the bsMethodValue of a program- or anchor-loudness measurement.
+ * Per ISO/IEC 23003-4 6.1.2.5, downmixId, drcSetId and eqSetId identify the
+ * signal a loudnessInfo() applies to; only downmixId == 0 (base layout)
+ * together with drcSetId == 0 and eqSetId == 0 (no DRC/EQ) describes the
+ * unprocessed signal we output, so measurements for any other
+ * downmix/DRC/EQ set must not be used. */
+static int select_loudness_measurement(const AACUSACConfig *usac)
+{
+    for (int i = 0; i < usac->loudness.nb_info; i++) {
+        const AACUSACLoudnessInfo *info = &usac->loudness.info[i];
+        if (info->downmix_id != 0 || info->drc_set_id != 0 || info->eq_set_id != 0)
+            continue;
+        for (int j = 0; j < info->nb_measurements; j++) {
+            int method = info->measurements[j].method_def;
+            if (method == 1 || method == 2)
+                return info->measurements[j].method_val;
+        }
+    }
+    return -1;
 }
 
 static int decode_loudness_set(AACDecContext *ac, AACUSACConfig *usac,
@@ -120,13 +184,13 @@ static int decode_loudness_set(AACDecContext *ac, AACUSACConfig *usac,
     usac->loudness.nb_info = get_bits(gb, 6); /* loudnessInfoCount */
 
     for (int i = 0; i < usac->loudness.nb_album; i++) {
-        ret = decode_loudness_info(ac, &usac->loudness.album_info[i], gb);
+        ret = decode_loudness_info(ac, &usac->loudness.album_info[i], gb, 0);
         if (ret < 0)
             return ret;
     }
 
     for (int i = 0; i < usac->loudness.nb_info; i++) {
-        ret = decode_loudness_info(ac, &usac->loudness.info[i], gb);
+        ret = decode_loudness_info(ac, &usac->loudness.info[i], gb, 0);
         if (ret < 0)
             return ret;
     }
@@ -134,16 +198,25 @@ static int decode_loudness_set(AACDecContext *ac, AACUSACConfig *usac,
     if (get_bits1(gb)) { /* loudnessInfoSetExtPresent */
         enum AACUSACLoudnessExt type;
         while ((type = get_bits(gb, 4)) != UNIDRCLOUDEXT_TERM) {
-            uint8_t size_bits = get_bits(gb, 4) + 4;
-            uint8_t bit_size = get_bits(gb, size_bits) + 1;
+            uint8_t size_bits = get_bits(gb, 4) + 4; /* bitSizeLen */
+            uint32_t bit_size = get_bits_long(gb, size_bits) + 1; /* bitSize */
+            int start = get_bits_count(gb);
+            int skip;
             switch (type) {
             case UNIDRCLOUDEXT_EQ:
-                avpriv_report_missing_feature(ac->avctx, "loudnessInfoV1");
-                return AVERROR_PATCHWELCOME;
+                ret = decode_loudness_set_v1(ac, usac, gb);
+                if (ret < 0)
+                    return ret;
+                break;
             default:
-                for (int i = 0; i < bit_size; i++)
-                    skip_bits1(gb);
+                break;
             }
+            /* The extension size is explicit, so unparsed (or unknown)
+             * data can be skipped without desynchronizing. */
+            skip = bit_size - (get_bits_count(gb) - start);
+            if (skip < 0)
+                return AVERROR_INVALIDDATA;
+            skip_bits_long(gb, skip);
         }
     }
 
@@ -218,6 +291,8 @@ static int decode_usac_element_pair(AACDecContext *ac,
         if (!e->mps.freq_res)
             return AVERROR_INVALIDDATA; /* value 0 is reserved */
 
+        int numBands = ((int[]){0,28,20,14,10,7,5,4})[e->mps.freq_res]; // ISO/IEC 23003-1:2007, 5.2, Table 39
+
         e->mps.fixed_gain = get_bits(gb, 3); /* bsFixedGainDMX */
         e->mps.temp_shape_config = get_bits(gb, 2); /* bsTempShapeConfig */
         e->mps.decorr_config = get_bits(gb, 2); /* bsDecorrConfig */
@@ -225,18 +300,135 @@ static int decode_usac_element_pair(AACDecContext *ac,
         e->mps.phase_coding = get_bits1(gb); /* bsPhaseCoding */
 
         e->mps.otts_bands_phase_present = get_bits1(gb);
-        if (e->mps.otts_bands_phase_present) /* bsOttBandsPhasePresent */
-            e->mps.otts_bands_phase = get_bits(gb, 5); /* bsOttBandsPhase */
+        int otts_bands_phase = ((int[]){0,10,10,7,5,3,2,2})[e->mps.freq_res]; // Table 109:  Default value of bsOttBandsPhase
+        if (e->mps.otts_bands_phase_present) { /* bsOttBandsPhasePresent */
+            otts_bands_phase = get_bits(gb, 5); /* bsOttBandsPhase */
+            if (otts_bands_phase > numBands)
+                return AVERROR_INVALIDDATA;
+        }
+        e->mps.otts_bands_phase = otts_bands_phase;
 
         e->mps.residual_coding = e->stereo_config_index >= 2; /* bsResidualCoding */
         if (e->mps.residual_coding) {
-            e->mps.residual_bands = get_bits(gb, 5); /* bsResidualBands */
+            int residual_bands = get_bits(gb, 5); /* bsResidualBands */
+            if (residual_bands > numBands)
+                return AVERROR_INVALIDDATA;
+            e->mps.residual_bands = residual_bands;
+
             e->mps.otts_bands_phase = FFMAX(e->mps.otts_bands_phase,
                                             e->mps.residual_bands);
             e->mps.pseudo_lr = get_bits1(gb); /* bsPseudoLr */
         }
         if (e->mps.temp_shape_config == 2)
             e->mps.env_quant_mode = get_bits1(gb); /* bsEnvQuantMode */
+    }
+
+    return 0;
+}
+
+/* ISO/IEC 23003-4, Table 62: channelLayout() */
+static int decode_drc_channel_layout(GetBitContext *gb)
+{
+    int base_channel_count = get_bits(gb, 7); /* baseChannelCount */
+    if (get_bits1(gb)) { /* layoutSignallingPresent */
+        if (get_bits(gb, 8) == 0) /* definedLayout == 0 */
+            for (int i = 0; i < base_channel_count; i++)
+                skip_bits(gb, 7); /* speakerPosition */
+    }
+    return base_channel_count;
+}
+
+/* ISO/IEC 23003-4, Table 63: downmixInstructions() */
+static void skip_drc_downmix_instructions(GetBitContext *gb, int base_channel_count)
+{
+    int target_channel_count;
+    skip_bits(gb, 7); /* downmixId */
+    target_channel_count = get_bits(gb, 7); /* targetChannelCount */
+    skip_bits(gb, 8); /* targetLayout */
+    if (get_bits1(gb)) /* downmixCoefficientsPresent */
+        skip_bits_long(gb, 4 * target_channel_count * base_channel_count);
+}
+
+/* ISO/IEC 23003-4, Table 70: drcInstructionsBasic(), common with the
+ * uniDrc variant up to the loudness-target fields. */
+static void decode_drc_instructions_basic(AACUsacElemConfig *e, GetBitContext *gb)
+{
+    int set_effects;
+
+    skip_bits(gb, 6); /* drcSetId */
+    skip_bits(gb, 4); /* drcLocation */
+    skip_bits(gb, 7); /* downmixId */
+    if (get_bits1(gb)) { /* additionalDownmixIdPresent */
+        int add_downmix_cnt = get_bits(gb, 3); /* additionalDownmixIdCount */
+        for (int j = 0; j < add_downmix_cnt; j++)
+            skip_bits(gb, 7); /* additionalDownmixId */
+    }
+
+    set_effects = get_bits(gb, 16); /* drcSetEffect */
+    if ((set_effects & (3 << 10)) == 0) {
+        if (get_bits1(gb)) /* limiterPeakTargetPresent */
+            skip_bits(gb, 8); /* bsLimiterPeakTarget */
+    }
+
+    if (get_bits1(gb)) { /* drcSetTargetLoudnessPresent */
+        e->drc.loudness.upper = get_bits(gb, 6); /* bsDrcSetTargetLoudnessValueUpper */
+        if (get_bits1(gb)) /* drcSetTargetLoudnessValueLowerPresent */
+            e->drc.loudness.lower = get_bits(gb, 6); /* bsDrcSetTargetLoudnessValueLower */
+    }
+}
+
+/* ISO/IEC 23003-4, Table 57: uniDrcConfig() */
+static int decode_drc_config(AACDecContext *ac, AACUsacElemConfig *e,
+                             GetBitContext *gb)
+{
+    int nb_downmix_instr, nb_coeff_basic = 0, nb_instr_basic = 0;
+    int nb_coeff_uni, nb_instr_uni;
+    int base_channel_count;
+
+    e->drc.loudness.lower = -1;
+    e->drc.loudness.upper = -1;
+
+    if (get_bits1(gb)) /* sampleRatePresent */
+        skip_bits(gb, 18); /* bsSampleRate */
+
+    nb_downmix_instr = get_bits(gb, 7); /* downmixInstructionsCount */
+
+    if (get_bits1(gb)) { /* drcDescriptionBasicPresent */
+        nb_coeff_basic = get_bits(gb, 3); /* drcCoefficientsBasicCount */
+        nb_instr_basic = get_bits(gb, 4); /* drcInstructionsBasicCount */
+    }
+
+    nb_coeff_uni = get_bits(gb, 3); /* drcCoefficientsUniDrcCount */
+    nb_instr_uni = get_bits(gb, 6); /* drcInstructionsUniDrcCount */
+
+    if (nb_coeff_uni || nb_instr_uni) {
+        avpriv_report_missing_feature(ac->avctx,
+                                      "AAC USAC uniDrc DRC processing");
+        return AVERROR_PATCHWELCOME;
+    }
+
+    base_channel_count = decode_drc_channel_layout(gb);
+
+    for (int i = 0; i < nb_downmix_instr; i++)
+        skip_drc_downmix_instructions(gb, base_channel_count);
+
+    for (int i = 0; i < nb_coeff_basic; i++)
+        skip_bits(gb, 4 + 7); /* drcLocation, drcCharacteristic */
+
+    for (int i = 0; i < nb_instr_basic; i++)
+        decode_drc_instructions_basic(e, gb);
+
+    if (get_bits1(gb)) { /* uniDrcConfigExtPresent */
+        enum AACUSACDRCExt type;
+        while ((type = get_bits(gb, 4)) != UNIDRCCONFEXT_TERM) {
+            uint8_t size_bits = get_bits(gb, 4) + 4; /* bitSizeLen */
+            uint32_t bit_size = get_bits_long(gb, size_bits) + 1; /* extBitSize */
+            switch (type) {
+            default:
+                skip_bits_long(gb, bit_size);
+                break;
+            }
+        }
     }
 
     return 0;
@@ -265,9 +457,25 @@ static int decode_usac_extension(AACDecContext *ac, AACUsacElemConfig *e,
         break;
     case ID_EXT_ELE_SAOC:
         break;
-    case ID_EXT_ELE_UNI_DRC:
-        break;
 #endif
+    case ID_EXT_ELE_UNI_DRC: {
+        int start = get_bits_count(gb);
+        int ret = decode_drc_config(ac, e, gb);
+        int skip = 8*ext_config_len - (get_bits_count(gb) - start);
+        if (ret == AVERROR_PATCHWELCOME) {
+            /* Unsupported uniDrcConfig(): ignore the DRC metadata and treat
+             * the element as fill so the stream stays decodable. */
+            e->ext.type = ID_EXT_ELE_FILL;
+            ret = 0;
+        }
+        if (ret < 0)
+            return ret;
+        if (skip < 0)
+            return AVERROR_INVALIDDATA;
+        /* The config is byte-padded to usacExtElementConfigLength */
+        skip_bits_long(gb, skip);
+        break;
+    }
     case ID_EXT_ELE_FILL:
         break; /* This is what the spec does */
     case ID_EXT_ELE_AUDIOPREROLL:
@@ -354,18 +562,25 @@ int ff_aac_usac_config_decode(AACDecContext *ac, AVCodecContext *avctx,
     MPEG4AudioConfig *m4ac = &oc->m4ac;
     AACUSACConfig *usac = &oc->usac;
     int elem_id[3 /* SCE, CPE, LFE */];
+    int nb_elems;
 
     int map_pos_set = 0;
+    int nb_elements = 0;
     uint8_t layout_map[MAX_ELEM_ID*4][3] = { 0 };
 
     if (!ac)
         return AVERROR_PATCHWELCOME;
 
+    for (int i = 0; i < usac->nb_elems; i++)
+        av_refstruct_unref(&usac->elems[i].ext.pl_buf);
     memset(usac, 0, sizeof(*usac));
+    usac->loudness.input_method_val = -1;
 
     freq_idx = get_bits(gb, 5); /* usacSamplingFrequencyIndex */
     if (freq_idx == 0x1f) {
         samplerate = get_bits(gb, 24); /* usacSamplingFrequency */
+        if (samplerate == 0)
+            return AVERROR(EINVAL);
     } else {
         samplerate = ff_aac_usac_samplerate[freq_idx];
         if (samplerate < 0)
@@ -373,6 +588,10 @@ int ff_aac_usac_config_decode(AACDecContext *ac, AVCodecContext *avctx,
     }
 
     usac->core_sbr_frame_len_idx = get_bits(gb, 3); /* coreSbrFrameLengthIndex */
+    if (usac->core_sbr_frame_len_idx == 2 || usac->core_sbr_frame_len_idx == 4) {
+        avpriv_report_missing_feature(avctx, "USAC SBR with a ratio other than 2:1");
+        return AVERROR_PATCHWELCOME;
+    }
     m4ac->frame_length_short = usac->core_sbr_frame_len_idx == 0 ||
                                usac->core_sbr_frame_len_idx == 2;
 
@@ -404,6 +623,7 @@ int ff_aac_usac_config_decode(AACDecContext *ac, AVCodecContext *avctx,
 
     m4ac->sampling_index = ff_aac_sample_rate_idx(m4ac->sample_rate);
     m4ac->sbr = sbr_ratio > 0;
+    m4ac->chan_config = 0;
 
     channel_config_idx = get_bits(gb, 5); /* channelConfigurationIndex */
     if (!channel_config_idx) {
@@ -412,28 +632,25 @@ int ff_aac_usac_config_decode(AACDecContext *ac, AVCodecContext *avctx,
         if (nb_channels > 64)
             return AVERROR(EINVAL);
 
-        av_channel_layout_uninit(&ac->oc[1].ch_layout);
+        AVChannelLayout ch_layout = { 0 };
 
-        ret = av_channel_layout_custom_init(&ac->oc[1].ch_layout, nb_channels);
+        ret = av_channel_layout_custom_init(&ch_layout, nb_channels);
         if (ret < 0)
             return ret;
 
         for (int i = 0; i < nb_channels; i++) {
-            AVChannelCustom *cm = &ac->oc[1].ch_layout.u.map[i];
+            AVChannelCustom *cm = &ch_layout.u.map[i];
             cm->id = usac_ch_pos_to_av[get_bits(gb, 5)]; /* bsOutputChannelPos */
         }
 
-        ret = av_channel_layout_retype(&ac->oc[1].ch_layout,
-                                       AV_CHANNEL_ORDER_NATIVE,
+        ret = av_channel_layout_retype(&ch_layout, AV_CHANNEL_ORDER_NATIVE,
                                        AV_CHANNEL_LAYOUT_RETYPE_FLAG_CANONICAL);
-        if (ret < 0)
-            return ret;
-
-        ret = av_channel_layout_copy(&avctx->ch_layout, &ac->oc[1].ch_layout);
+        if (ret >= 0)
+            ret = av_channel_layout_copy(&avctx->ch_layout, &ch_layout);
+        av_channel_layout_uninit(&ch_layout);
         if (ret < 0)
             return ret;
     } else {
-        int nb_elements;
         if ((ret = ff_aac_set_default_channel_config(ac, avctx, layout_map,
                                                      &nb_elements, channel_config_idx)))
             return ret;
@@ -447,15 +664,14 @@ int ff_aac_usac_config_decode(AACDecContext *ac, AVCodecContext *avctx,
 
     /* UsacDecoderConfig */
     elem_id[0] = elem_id[1] = elem_id[2] = 0;
-    usac->nb_elems = get_escaped_value(gb, 4, 8, 16) + 1;
-    if (usac->nb_elems > 64) {
+    nb_elems = get_escaped_value(gb, 4, 8, 16) + 1;
+    if (nb_elems > 64) {
         av_log(ac->avctx, AV_LOG_ERROR, "Too many elements: %i\n",
-               usac->nb_elems);
-        usac->nb_elems = 0;
+               nb_elems);
         return AVERROR(EINVAL);
     }
 
-    for (int i = 0; i < usac->nb_elems; i++) {
+    for (int i = 0; i < nb_elems; i++) {
         int map_count = elem_id[0] + elem_id[1] + elem_id[2];
         AACUsacElemConfig *e = &usac->elems[i];
         memset(e, 0, sizeof(*e));
@@ -464,8 +680,15 @@ int ff_aac_usac_config_decode(AACDecContext *ac, AVCodecContext *avctx,
         if (e->type != ID_USAC_EXT && (map_count + 1) > nb_channels) {
             av_log(ac->avctx, AV_LOG_ERROR, "Too many channels for the channel "
                                             "configuration\n");
-            usac->nb_elems = 0;
             return AVERROR(EINVAL);
+        }
+        if (map_pos_set && e->type != ID_USAC_EXT &&
+            (map_count >= nb_elements ||
+             layout_map[map_count][0] != (e->type == ID_USAC_LFE ? TYPE_LFE : e->type))) {
+            av_log(ac->avctx, AV_LOG_ERROR, "Element %d does not match the "
+                                            "channel configuration\n", i);
+            usac->nb_elems = 0;
+            return AVERROR_INVALIDDATA;
         }
 
         av_log(ac->avctx, AV_LOG_DEBUG, "Element present: idx %i, type %i\n",
@@ -516,11 +739,17 @@ int ff_aac_usac_config_decode(AACDecContext *ac, AVCodecContext *avctx,
         };
     }
 
+    if (map_pos_set && elem_id[0] + elem_id[1] + elem_id[2] != nb_elements) {
+        av_log(ac->avctx, AV_LOG_ERROR, "Element count does not match the "
+                                        "channel configuration\n");
+        usac->nb_elems = 0;
+        return AVERROR_INVALIDDATA;
+    }
+
     ret = ff_aac_output_configure(ac, layout_map, elem_id[0] + elem_id[1] + elem_id[2],
                                   OC_GLOBAL_HDR, 0);
     if (ret < 0) {
         av_log(avctx, AV_LOG_ERROR, "Unable to parse channel config!\n");
-        usac->nb_elems = 0;
         return ret;
     }
 
@@ -559,6 +788,14 @@ int ff_aac_usac_config_decode(AACDecContext *ac, AVCodecContext *avctx,
 
     ac->avctx->profile = AV_PROFILE_AAC_USAC;
 
+    usac->loudness.input_method_val = select_loudness_measurement(usac);
+    if (usac->loudness.input_method_val >= 0)
+        av_log(avctx, AV_LOG_VERBOSE,
+               "USAC input loudness: %.2f LKFS (bsMethodValue=%d)\n",
+               -57.75f + 0.25f * usac->loudness.input_method_val,
+               usac->loudness.input_method_val);
+
+    usac->nb_elems = nb_elems;
     ret = ff_aac_usac_reset_state(ac, oc);
     if (ret < 0)
         return ret;
@@ -1377,11 +1614,10 @@ static void decode_tsd(GetBitContext *gb, int *data,
             break;
         }
         int64_t c = k - p + 1;
-        for (int h = 2; h <= p; h++) {
-            c *= k - p + h;
-            c /= h;
+        for (int h = 2; h <= p && c <= s; h++) {
+            c += c*(k-p)/h;
         }
-        if (s >= (int)c) { /* c is long long for up to 32 slots */
+        if (s >= c) {
             s -= c;
             data[k] = 1;
             p--;
@@ -1553,7 +1789,8 @@ static int decode_usac_core_coder(AACDecContext *ac, AACUSACConfig *usac,
             ret = ff_aac_ldp_parse_channel_stream(ac, usac, ue, gb);
             if (ret < 0)
                 return ret;
-            continue;
+            avpriv_report_missing_feature(ac->avctx, "AAC USAC LPD");
+            return AVERROR_PATCHWELCOME;
         }
 
         if ((core_nb_channels == 1) ||
@@ -1640,12 +1877,12 @@ static int decode_usac_core_coder(AACDecContext *ac, AACUSACConfig *usac,
         }
     }
 
-    if (ec->sbr.ratio) {
-        int sbr_ch = nb_channels;
-        if (nb_channels == 2 &&
-            !(ec->stereo_config_index == 0 || ec->stereo_config_index == 3))
-            sbr_ch = 1;
+    int sbr_ch = nb_channels;
+    if (nb_channels == 2 &&
+        !(ec->stereo_config_index == 0 || ec->stereo_config_index == 3))
+        sbr_ch = 1;
 
+    if (ec->sbr.ratio) {
         ret = ff_aac_sbr_decode_usac_data(ac, che, ec, gb, sbr_ch, indep_flag);
         if (ret < 0)
             return ret;
@@ -1660,10 +1897,15 @@ static int decode_usac_core_coder(AACDecContext *ac, AACUSACConfig *usac,
     spectrum_decode(ac, usac, che, core_nb_channels);
 
     if (ac->oc[1].m4ac.sbr > 0) {
-        ac->proc.sbr_apply(ac, che, nb_channels == 2 ? TYPE_CPE : TYPE_SCE,
+        ac->proc.sbr_apply(ac, che, sbr_ch == 2 ? TYPE_CPE : TYPE_SCE, 0,
                            che->ch[0].output,
                            che->ch[1].output);
     }
+
+    /* The MPS212 upmix is not implemented, output the downmix on both channels */
+    if (sbr_ch < nb_channels)
+        memcpy(che->ch[1].output, che->ch[0].output,
+               ac->frame->nb_samples * sizeof(*che->ch[0].output));
 
     return 0;
 }
@@ -1691,8 +1933,6 @@ static int parse_audio_preroll(AACDecContext *ac, GetBitContext *gb)
     if (ret < 0) {
         *m4ac = m4ac_bak;
         return ret;
-    } else {
-        ac->oc[1].m4ac.chan_config = 0;
     }
 
     /* 7.18.3.3 Bitrate adaption
@@ -1816,6 +2056,10 @@ static int parse_ext_ele(AACDecContext *ac, AACUsacElemConfig *e,
         case ID_EXT_ELE_AUDIOPREROLL:
             ret = parse_audio_preroll(ac, gb2);
             break;
+        case ID_EXT_ELE_UNI_DRC:
+            /* uniDrcGain() payload: DRC is not applied, just consume the
+             * bits via skip_bits_long below. */
+            break;
         default:
             /* This should never happen */
             av_assert0(0);
@@ -1860,8 +2104,10 @@ int ff_aac_usac_decode_frame(AVCodecContext *avctx, AACDecContext *ac,
         ratio_dec = 1;
     }
 
-    ff_aac_output_configure(ac, ac->oc[1].layout_map, ac->oc[1].layout_map_tags,
-                            ac->oc[1].status, 0);
+    ret = ff_aac_output_configure(ac, ac->oc[1].layout_map, ac->oc[1].layout_map_tags,
+                                  ac->oc[1].status, 0);
+    if (ret < 0)
+        return ret;
 
     ac->avctx->profile = AV_PROFILE_AAC_USAC;
 
@@ -1931,6 +2177,7 @@ int ff_aac_usac_decode_frame(AVCodecContext *avctx, AACDecContext *ac,
     if (ac->oc[1].status && audio_found) {
         avctx->sample_rate = ac->oc[1].m4ac.ext_sample_rate;
         avctx->frame_size = samples;
+        avctx->seek_preroll = FFMAX(avctx->seek_preroll, samples);
         ac->oc[1].status = OC_LOCKED;
     }
 
@@ -1948,6 +2195,28 @@ int ff_aac_usac_decode_frame(AVCodecContext *avctx, AACDecContext *ac,
         av_frame_unref(ac->frame);
         frame->flags = indep_flag ? AV_FRAME_FLAG_KEY : 0x0;
         *got_frame_ptr = 0;
+    }
+
+    if (samples && ac->target_level) {
+        int method_val = usac->loudness.input_method_val;
+        if (method_val < 0) {
+            if (!ac->warned_loudness_missing) {
+                av_log(avctx, AV_LOG_WARNING,
+                       "target_level set but no program/anchor loudness "
+                       "measurement available; normalization skipped\n");
+                ac->warned_loudness_missing = 1;
+            }
+        } else {
+            /* Per ISO/IEC 23003-4 Table A.48: L = -57.75 + 0.25 * μ */
+            float input_loudness = -57.75f + 0.25f * method_val;
+            float gain_dB = (float)ac->target_level - input_loudness;
+            float gain = powf(10.0f, gain_dB / 20.0f);
+
+            for (int ch = 0; ch < frame->ch_layout.nb_channels; ch++)
+                ac->fdsp->vector_fmul_scalar((float *)frame->extended_data[ch],
+                                             (float *)frame->extended_data[ch],
+                                             gain, frame->nb_samples);
+        }
     }
 
     /* for dual-mono audio (SCE + SCE) */

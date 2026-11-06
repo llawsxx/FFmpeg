@@ -25,13 +25,13 @@
 
 #include "libavutil/buffer.h"
 #include "libavutil/cpu.h"
+#include "libavutil/framepool.h"
 #include "libavutil/hwcontext.h"
 #include "libavutil/pixfmt.h"
 
 #include "avfilter.h"
 #include "avfilter_internal.h"
 #include "filters.h"
-#include "framepool.h"
 #include "video.h"
 
 const AVFilterPad ff_video_default_filterpad[1] = {
@@ -46,14 +46,19 @@ AVFrame *ff_null_get_video_buffer(AVFilterLink *link, int w, int h)
     return ff_get_video_buffer(link->dst->outputs[0], w, h);
 }
 
+static void set_link_props(AVFrame *frame, const AVFilterLink *link)
+{
+    frame->sample_aspect_ratio = link->sample_aspect_ratio;
+    frame->colorspace  = link->colorspace;
+    frame->color_range = link->color_range;
+    frame->alpha_mode  = link->alpha_mode;
+    frame->chroma_location = link->chroma_location;
+}
+
 AVFrame *ff_default_get_video_buffer2(AVFilterLink *link, int w, int h, int align)
 {
     FilterLinkInternal *const li = ff_link_internal(link);
     AVFrame *frame = NULL;
-    int pool_width = 0;
-    int pool_height = 0;
-    int pool_align = 0;
-    enum AVPixelFormat pool_format = AV_PIX_FMT_NONE;
 
     if (li->l.hw_frames_ctx &&
         ((AVHWFramesContext*)li->l.hw_frames_ctx->data)->format == link->format) {
@@ -70,42 +75,14 @@ AVFrame *ff_default_get_video_buffer2(AVFilterLink *link, int w, int h, int alig
         return frame;
     }
 
-    if (!li->frame_pool) {
-        li->frame_pool = ff_frame_pool_video_init(CONFIG_MEMORY_POISONING
-                                                     ? NULL
-                                                     : av_buffer_allocz,
-                                                  w, h, link->format, align);
-        if (!li->frame_pool)
-            return NULL;
-    } else {
-        if (ff_frame_pool_get_video_config(li->frame_pool,
-                                           &pool_width, &pool_height,
-                                           &pool_format, &pool_align) < 0) {
-            return NULL;
-        }
+    if (ff_frame_pool_video_reinit(&li->frame_pool, w, h, link->format, align) < 0)
+        return NULL;
 
-        if (FFALIGN(pool_width,  pool_align) != FFALIGN(w, align) ||
-            FFALIGN(pool_height, pool_align) != FFALIGN(h, align) ||
-            pool_format != link->format || pool_align != align) {
-
-            ff_frame_pool_uninit(&li->frame_pool);
-            li->frame_pool = ff_frame_pool_video_init(CONFIG_MEMORY_POISONING
-                                                         ? NULL
-                                                         : av_buffer_allocz,
-                                                      w, h, link->format, align);
-            if (!li->frame_pool)
-                return NULL;
-        }
-    }
-
-    frame = ff_frame_pool_get(li->frame_pool);
+    frame = ff_frame_pool_get(&li->frame_pool);
     if (!frame)
         return NULL;
 
-    frame->sample_aspect_ratio = link->sample_aspect_ratio;
-    frame->colorspace  = link->colorspace;
-    frame->color_range = link->color_range;
-    frame->alpha_mode  = link->alpha_mode;
+    set_link_props(frame, link);
 
     return frame;
 }
@@ -113,6 +90,31 @@ AVFrame *ff_default_get_video_buffer2(AVFilterLink *link, int w, int h, int alig
 AVFrame *ff_default_get_video_buffer(AVFilterLink *link, int w, int h)
 {
     return ff_default_get_video_buffer2(link, w, h, av_cpu_max_align());
+}
+
+AVFrame *ff_hwupload_get_video_buffer(AVFilterLink *link, int w, int h)
+{
+    AVBufferRef *hw_frames_ctx = ff_filter_link(link->dst->outputs[0])->hw_frames_ctx;
+    AVFrame *frame;
+
+    if (!hw_frames_ctx || ff_filter_link(link)->hw_frames_ctx)
+        return ff_default_get_video_buffer(link, w, h);
+
+    frame = av_frame_alloc();
+    if (!frame)
+        return NULL;
+
+    frame->format = link->format;
+    frame->width  = w;
+    frame->height = h;
+    if (av_hwframe_get_transfer_buffer(hw_frames_ctx, frame) < 0) {
+        av_frame_free(&frame);
+        return NULL;
+    }
+
+    set_link_props(frame, link);
+
+    return frame;
 }
 
 AVFrame *ff_get_video_buffer(AVFilterLink *link, int w, int h)

@@ -192,7 +192,7 @@ static void build_map(AVFilterContext *ctx)
         case 1:
             {
                 float div = fabsf(s->source[0][c]) < 1e-6f ? 1e-6f : s->source[0][c];
-                s->icoeff[c][1+c] = s->target[0][c] / div;
+                s->icoeff[1+c][c] = s->target[0][c] / div;
             }
             break;
         case 2:
@@ -309,8 +309,8 @@ static int colormap_slice(AVFilterContext *ctx, void *arg, int jobnr, int nb_job
     const int maps = s->nb_maps;
     const int width = out->width;
     const int height = out->height;
-    const int slice_start = (height * jobnr) / nb_jobs;
-    const int slice_end = (height * (jobnr + 1)) / nb_jobs;
+    const int slice_start = ff_slice_pos(height, jobnr, nb_jobs);
+    const int slice_end = ff_slice_pos(height, jobnr + 1, nb_jobs);
     const int sr_linesize = in->linesize[2] / 4;
     const int dr_linesize = out->linesize[2] / 4;
     const int sg_linesize = in->linesize[0] / 4;

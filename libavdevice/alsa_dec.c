@@ -73,13 +73,6 @@ static av_cold int audio_read_header(AVFormatContext *s1)
     }
     codec_id    = s1->audio_codec_id;
 
-#if FF_API_ALSA_CHANNELS
-    if (s->channels > 0) {
-        av_channel_layout_uninit(&s->ch_layout);
-        s->ch_layout.nb_channels = s->channels;
-    }
-#endif
-
     ret = ff_alsa_open(s1, SND_PCM_STREAM_CAPTURE, &s->sample_rate, &s->ch_layout,
         &codec_id);
     if (ret < 0) {
@@ -113,7 +106,7 @@ fail:
 static int audio_read_packet(AVFormatContext *s1, AVPacket *pkt)
 {
     AlsaData *s  = s1->priv_data;
-    int res;
+    int res, frames;
     int64_t dts;
     snd_pcm_sframes_t delay = 0;
 
@@ -141,11 +134,13 @@ static int audio_read_packet(AVFormatContext *s1, AVPacket *pkt)
     } while (s->pkt->size < s->period_size * s->frame_size);
 
     av_packet_move_ref(pkt, s->pkt);
+    /* A packet may have been assembled from multiple short reads. */
+    frames = pkt->size / s->frame_size;
     dts = av_gettime();
     snd_pcm_delay(s->h, &delay);
-    dts -= av_rescale(delay + res, 1000000, s->sample_rate);
+    dts -= av_rescale(delay + frames, 1000000, s->sample_rate);
     pkt->pts = ff_timefilter_update(s->timefilter, dts, s->last_period);
-    s->last_period = res;
+    s->last_period = frames;
 
     return 0;
 }
@@ -157,10 +152,7 @@ static int audio_get_device_list(AVFormatContext *h, AVDeviceInfoList *device_li
 
 static const AVOption options[] = {
     { "sample_rate", "", offsetof(AlsaData, sample_rate), AV_OPT_TYPE_INT, {.i64 = 48000}, 1, INT_MAX, AV_OPT_FLAG_DECODING_PARAM },
-#if FF_API_ALSA_CHANNELS
-    { "channels",    "", offsetof(AlsaData, channels),    AV_OPT_TYPE_INT, {.i64 = 0},     0, INT_MAX, AV_OPT_FLAG_DECODING_PARAM | AV_OPT_FLAG_DEPRECATED },
-#endif
-    { "ch_layout",   "", offsetof(AlsaData, ch_layout),   AV_OPT_TYPE_CHLAYOUT, {.str = "2C"}, INT_MIN, INT_MAX, AV_OPT_FLAG_DECODING_PARAM },
+    { "ch_layout",   "", offsetof(AlsaData, ch_layout),   AV_OPT_TYPE_CHLAYOUT, {.str = NULL}, INT_MIN, INT_MAX, AV_OPT_FLAG_DECODING_PARAM },
     { NULL },
 };
 

@@ -49,6 +49,7 @@
  * and almost certainly can be improved...
  */
 
+#include "libavutil/attributes.h"
 #include "libavutil/opt.h"
 #include "libavutil/mem.h"
 #include "libavcodec/avcodec.h"

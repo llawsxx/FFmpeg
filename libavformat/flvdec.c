@@ -24,6 +24,7 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include "libavutil/attributes.h"
 #include "libavutil/avassert.h"
 #include "libavutil/avstring.h"
 #include "libavutil/channel_layout.h"
@@ -35,6 +36,7 @@
 #include "libavutil/intreadwrite.h"
 #include "libavutil/mastering_display_metadata.h"
 #include "avformat.h"
+#include "avio_internal.h"
 #include "demux.h"
 #include "internal.h"
 #include "flv.h"
@@ -463,6 +465,7 @@ static int flv_set_video_codec(AVFormatContext *s, AVStream *vstream,
         break;
     case FLV_CODECID_VP6:
         par->codec_id = AV_CODEC_ID_VP6F;
+        av_fallthrough;
     case FLV_CODECID_VP6A:
         if (flv_codecid == FLV_CODECID_VP6A)
             par->codec_id = AV_CODEC_ID_VP6A;
@@ -549,7 +552,7 @@ static int parse_keyframes_index(AVFormatContext *s, AVIOContext *ioc, int64_t m
             break;
 
         arraylen = avio_rb32(ioc);
-        if (arraylen>>28)
+        if (arraylen>>28 || arraylen > (max_pos - avio_tell(ioc)) / 9)
             break;
 
         if       (!strcmp(KEYFRAMES_TIMESTAMP_TAG , str_val) && !times) {
@@ -1064,10 +1067,12 @@ static int amf_skip_tag(AVIOContext *pb, AMFDataType type, int depth)
         break;
     case AMF_DATA_TYPE_ARRAY:
         parse_name = 0;
+        av_fallthrough;
     case AMF_DATA_TYPE_MIXEDARRAY:
         nb = avio_rb32(pb);
         if (nb < 0)
             return AVERROR_INVALIDDATA;
+        av_fallthrough;
     case AMF_DATA_TYPE_OBJECT:
         while(!pb->eof_reached && (nb-- > 0 || type != AMF_DATA_TYPE_ARRAY)) {
             if (parse_name) {
@@ -1104,8 +1109,10 @@ static int flv_data_packet(AVFormatContext *s, AVPacket *pkt,
     switch (avio_r8(pb)) {
     case AMF_DATA_TYPE_ARRAY:
         array = 1;
+        av_fallthrough;
     case AMF_DATA_TYPE_MIXEDARRAY:
         avio_seek(pb, 4, SEEK_CUR);
+        av_fallthrough;
     case AMF_DATA_TYPE_OBJECT:
         break;
     default:
@@ -1336,7 +1343,7 @@ static int flv_parse_mod_ex_data(AVFormatContext *s, int *pkt_type, int *size, i
     if (!ex_data)
         return AVERROR(ENOMEM);
 
-    ret = avio_read(s->pb, ex_data, ex_size);
+    ret = ffio_read_size(s->pb, ex_data, ex_size);
     if (ret < 0) {
         av_free(ex_data);
         return ret;
@@ -1559,6 +1566,10 @@ skip:
 
     for (;;) {
         int track_size = size;
+        if (size < 0) {
+            ret = FFERROR_REDO;
+            goto leave;
+        }
 
         if (multitrack_type != MultitrackTypeOneTrack) {
             track_size = avio_rb24(s->pb);

@@ -534,7 +534,7 @@ static void RENAME(yuv2rgb555_X)(SwsInternal *c, const int16_t *lumFilter,
 #undef WRITEBGR24
 #define WRITEBGR24(dst, dstw, index)  WRITEBGR24MMXEXT(dst, dstw, index)
 
-#if HAVE_6REGS
+#if HAVE_X86_6REGS
 static void RENAME(yuv2bgr24_X_ar)(SwsInternal *c, const int16_t *lumFilter,
                                    const int16_t **lumSrc, int lumFilterSize,
                                    const int16_t *chrFilter, const int16_t **chrUSrc,
@@ -584,7 +584,7 @@ static void RENAME(yuv2bgr24_X)(SwsInternal *c, const int16_t *lumFilter,
     : "%"FF_REG_a, "%"FF_REG_c, "%"FF_REG_d, "%"FF_REG_S
     );
 }
-#endif /* HAVE_6REGS */
+#endif /* HAVE_X86_6REGS */
 
 #define REAL_WRITEYUY2(dst, dstw, index) \
     "packuswb  %%mm3, %%mm3     \n\t"\
@@ -1324,81 +1324,5 @@ static void RENAME(yuv2yuyv422_1)(SwsInternal *c, const int16_t *buf0,
             :: "c" (buf0), "d" (buf1), "S" (ubuf0), "D" (ubuf1), "m" (dest),
                "a" (&c->redDither)
         );
-    }
-}
-static av_cold void RENAME(sws_init_swscale)(SwsInternal *c)
-{
-    enum AVPixelFormat dstFormat = c->opts.dst_format;
-
-    c->use_mmx_vfilter= 0;
-    if (!is16BPS(dstFormat) && !isNBPS(dstFormat) && !isSemiPlanarYUV(dstFormat)
-        && dstFormat != AV_PIX_FMT_GRAYF32BE && dstFormat != AV_PIX_FMT_GRAYF32LE
-        && !(c->opts.flags & SWS_BITEXACT)) {
-            if (c->opts.flags & SWS_ACCURATE_RND) {
-                if (!(c->opts.flags & SWS_FULL_CHR_H_INT)) {
-                    switch (c->opts.dst_format) {
-                    case AV_PIX_FMT_RGB32:   c->yuv2packedX = RENAME(yuv2rgb32_X_ar);   break;
-#if HAVE_6REGS
-                    case AV_PIX_FMT_BGR24:   c->yuv2packedX = RENAME(yuv2bgr24_X_ar);   break;
-#endif
-                    case AV_PIX_FMT_RGB555:  c->yuv2packedX = RENAME(yuv2rgb555_X_ar);  break;
-                    case AV_PIX_FMT_RGB565:  c->yuv2packedX = RENAME(yuv2rgb565_X_ar);  break;
-                    case AV_PIX_FMT_YUYV422: c->yuv2packedX = RENAME(yuv2yuyv422_X_ar); break;
-                    default: break;
-                    }
-                }
-            } else {
-                c->use_mmx_vfilter= 1;
-                if (!(c->opts.flags & SWS_FULL_CHR_H_INT)) {
-                    switch (c->opts.dst_format) {
-                    case AV_PIX_FMT_RGB32:   c->yuv2packedX = RENAME(yuv2rgb32_X);   break;
-                    case AV_PIX_FMT_BGR32:   c->yuv2packedX = RENAME(yuv2bgr32_X);   break;
-#if HAVE_6REGS
-                    case AV_PIX_FMT_BGR24:   c->yuv2packedX = RENAME(yuv2bgr24_X);   break;
-#endif
-                    case AV_PIX_FMT_RGB555:  c->yuv2packedX = RENAME(yuv2rgb555_X);  break;
-                    case AV_PIX_FMT_RGB565:  c->yuv2packedX = RENAME(yuv2rgb565_X);  break;
-                    case AV_PIX_FMT_YUYV422: c->yuv2packedX = RENAME(yuv2yuyv422_X); break;
-                    default: break;
-                    }
-                }
-            }
-        if (!(c->opts.flags & SWS_FULL_CHR_H_INT)) {
-            switch (c->opts.dst_format) {
-            case AV_PIX_FMT_RGB32:
-                c->yuv2packed1 = RENAME(yuv2rgb32_1);
-                c->yuv2packed2 = RENAME(yuv2rgb32_2);
-                break;
-            case AV_PIX_FMT_BGR24:
-                c->yuv2packed1 = RENAME(yuv2bgr24_1);
-                c->yuv2packed2 = RENAME(yuv2bgr24_2);
-                break;
-            case AV_PIX_FMT_RGB555:
-                c->yuv2packed1 = RENAME(yuv2rgb555_1);
-                c->yuv2packed2 = RENAME(yuv2rgb555_2);
-                break;
-            case AV_PIX_FMT_RGB565:
-                c->yuv2packed1 = RENAME(yuv2rgb565_1);
-                c->yuv2packed2 = RENAME(yuv2rgb565_2);
-                break;
-            case AV_PIX_FMT_YUYV422:
-                c->yuv2packed1 = RENAME(yuv2yuyv422_1);
-                c->yuv2packed2 = RENAME(yuv2yuyv422_2);
-                break;
-            default:
-                break;
-            }
-        }
-    }
-
-    if (c->srcBpc == 8 && c->dstBpc <= 14) {
-        // Use the new MMX scaler if the MMXEXT one can't be used (it is faster than the x86 ASM one).
-        if (c->opts.flags & SWS_FAST_BILINEAR && c->canMMXEXTBeUsed) {
-            c->hyscale_fast = ff_hyscale_fast_mmxext;
-            c->hcscale_fast = ff_hcscale_fast_mmxext;
-        } else {
-            c->hyscale_fast = NULL;
-            c->hcscale_fast = NULL;
-        }
     }
 }

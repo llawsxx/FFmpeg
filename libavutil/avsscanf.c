@@ -32,7 +32,6 @@
 #include <float.h>
 
 #include "avstring.h"
-#include "libm.h"
 
 typedef struct FFFILE {
     size_t buf_size;
@@ -439,7 +438,7 @@ static double decfloat(FFFILE *f, int c, int bits, int emin, int sign, int pok)
 
     /* Assemble desired bits into floating point variable */
     for (y=i=0; i<LD_B1B_DIG; i++) {
-        if ((a+i & MASK)==z) x[(z=(z+1 & MASK))-1] = 0;
+        if ((a+i & MASK)==z) x[(z=(z+1 & MASK))-1 & MASK] = 0;
         y = 1000000000.0L * y + x[a+i & MASK];
     }
 
@@ -828,6 +827,7 @@ static int ff_vfscanf(FFFILE *f, const char *fmt, va_list ap)
         switch (t) {
             case 'c':
                 if (width < 1) width = 1;
+                break;
             case '[':
                 break;
             case 'n':

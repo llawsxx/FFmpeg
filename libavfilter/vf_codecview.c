@@ -190,7 +190,7 @@ static void draw_arrow(uint8_t *buf, int sx, int sy, int ex,
     if (dx * dx + dy * dy > 3 * 3) {
         int rx =  dx + dy;
         int ry = -dx + dy;
-        int length = sqrt((rx * rx + ry * ry) << 8);
+        int length = sqrt((rx * (int64_t)rx + ry * (int64_t)ry) << 8);
 
         // FIXME subpixel accuracy
         rx = ROUNDED_DIV(rx * (3 << 4), length);
@@ -266,9 +266,22 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *frame)
             if (par->nb_blocks) {
                 for (int block_idx = 0; block_idx < par->nb_blocks; block_idx++) {
                     AVVideoBlockParams *b = av_video_enc_params_block(par, block_idx);
-                    uint8_t *buf = frame->data[0] + b->src_y * stride;
 
-                    draw_block_rectangle(buf, b->src_x, b->src_y, b->w, b->h, stride, 100);
+                    int64_t x0 = b->src_x;
+                    int64_t y0 = b->src_y;
+                    int64_t x1 = x0 + b->w;
+                    int64_t y1 = y0 + b->h;
+
+                    x0 = FFMAX(x0, 0);
+                    y0 = FFMAX(y0, 0);
+                    x1 = FFMIN(x1, frame->width);
+                    y1 = FFMIN(y1, frame->height);
+
+                    if (x1 <= x0 || y1 <= y0)
+                        continue;
+
+                    uint8_t *buf = frame->data[0] + y0 * stride;
+                    draw_block_rectangle(buf, x0, y0, x1-x0, y1-y0, stride, 100);
                 }
             }
         }

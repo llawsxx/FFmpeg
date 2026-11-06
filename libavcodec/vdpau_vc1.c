@@ -27,6 +27,7 @@
 
 #include "avcodec.h"
 #include "hwaccel_internal.h"
+#include "libavutil/attributes.h"
 #include "vc1.h"
 #include "vdpau.h"
 #include "vdpau_internal.h"
@@ -53,7 +54,7 @@ static int vdpau_vc1_start_frame(AVCodecContext *avctx,
             assert(ref != VDP_INVALID_HANDLE);
             info->backward_reference = ref;
         }
-        /* fall-through */
+        av_fallthrough;
     case AV_PICTURE_TYPE_P:
         if (s->last_pic.ptr) {
             ref = ff_vdpau_get_surface_id(s->last_pic.ptr->f);
@@ -148,6 +149,7 @@ const FFHWAccel ff_wmv3_vdpau_hwaccel = {
     .end_frame      = ff_vdpau_mpeg_end_frame,
     .decode_slice   = vdpau_vc1_decode_slice,
     .frame_priv_data_size = sizeof(struct vdpau_picture_context),
+    .free_frame_priv = ff_vdpau_free_frame_priv,
     .init           = vdpau_vc1_init,
     .uninit         = ff_vdpau_common_uninit,
     .frame_params   = ff_vdpau_common_frame_params,
@@ -165,6 +167,7 @@ const FFHWAccel ff_vc1_vdpau_hwaccel = {
     .end_frame      = ff_vdpau_mpeg_end_frame,
     .decode_slice   = vdpau_vc1_decode_slice,
     .frame_priv_data_size = sizeof(struct vdpau_picture_context),
+    .free_frame_priv = ff_vdpau_free_frame_priv,
     .init           = vdpau_vc1_init,
     .uninit         = ff_vdpau_common_uninit,
     .frame_params   = ff_vdpau_common_frame_params,

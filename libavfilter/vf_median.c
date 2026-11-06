@@ -143,6 +143,11 @@ static int config_input(AVFilterLink *inlink)
 
     s->nb_threads = FFMAX(1, FFMIN(s->planeheight[1] / (s->radiusV + 1), ff_filter_get_nb_threads(inlink->dst)));
     s->bins   = 1 << ((s->depth + 1) / 2);
+    if (inlink->w > INT_MAX / (s->bins * s->bins)) {
+        av_log(inlink->dst, AV_LOG_ERROR, "Width %d is too large for depth %d\n",
+               inlink->w, s->depth);
+        return AVERROR(EINVAL);
+    }
     s->fine_size = s->bins * s->bins * inlink->w;
     s->coarse_size = s->bins * inlink->w;
     s->coarse = av_calloc(s->nb_threads, sizeof(*s->coarse));
@@ -186,8 +191,8 @@ static int filter_slice(AVFilterContext *ctx, void *arg, int jobnr, int nb_jobs)
     for (int plane = 0; plane < s->nb_planes; plane++) {
         const int h = s->planeheight[plane];
         const int w = s->planewidth[plane];
-        const int slice_h_start = (h * jobnr) / nb_jobs;
-        const int slice_h_end = (h * (jobnr+1)) / nb_jobs;
+        const int slice_h_start = ff_slice_pos(h, jobnr, nb_jobs);
+        const int slice_h_end = ff_slice_pos(h, jobnr + 1, nb_jobs);
 
         if (!(s->planes & (1 << plane))) {
             av_image_copy_plane(out->data[plane] + slice_h_start * out->linesize[plane],

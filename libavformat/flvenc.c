@@ -19,6 +19,7 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include "libavutil/attributes.h"
 #include "libavutil/intreadwrite.h"
 #include "libavutil/dict.h"
 #include "libavutil/intfloat.h"
@@ -185,6 +186,7 @@ static int get_audio_flags(AVFormatContext *s, AVCodecParameters *par)
                 flags |= FLV_SAMPLERATE_SPECIAL;
                 break;
             }
+            av_fallthrough;
         default:
 error:
             av_log(s, AV_LOG_ERROR,
@@ -1277,6 +1279,12 @@ static int flv_write_packet(AVFormatContext *s, AVPacket *pkt)
             av_log(s, AV_LOG_ERROR, "Packet is missing PTS\n");
             return AVERROR(EINVAL);
         }
+    }
+    /* the text is written as an AMF0 string with a 16-bit length */
+    if (par->codec_id == AV_CODEC_ID_TEXT &&
+        strlen((const char *)pkt->data) > UINT16_MAX) {
+        av_log(s, AV_LOG_ERROR, "Text packet is too long for FLV\n");
+        return AVERROR(EINVAL);
     }
 
     ts = pkt->dts;

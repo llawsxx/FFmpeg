@@ -21,6 +21,7 @@
  */
 
 #include "config_components.h"
+#include "libavutil/attributes.h"
 
 #define _DEFAULT_SOURCE
 #define _BSD_SOURCE
@@ -42,6 +43,7 @@
 #include "os_support.h"
 #include "libavcodec/jpegxl_parse.h"
 #include "libavcodec/mjpeg.h"
+#include "libavcodec/png.h"
 #include "libavcodec/vbn.h"
 #include "libavcodec/xwd.h"
 #include "subtitles.h"
@@ -419,10 +421,11 @@ int ff_img_read_packet(AVFormatContext *s1, AVPacket *pkt)
 
         if (par->codec_id == AV_CODEC_ID_NONE) {
             AVProbeData pd = { 0 };
-            const FFInputFormat *ifmt;
+            const AVInputFormat *fmt;
+            void *opaque = NULL;
             uint8_t header[PROBE_BUF_MIN + AVPROBE_PADDING_SIZE];
             int ret;
-            int score = 0;
+            int score_max = 0;
 
             ret = avio_read(f[0], header, PROBE_BUF_MIN);
             if (ret < 0) {
@@ -435,9 +438,20 @@ int ff_img_read_packet(AVFormatContext *s1, AVPacket *pkt)
             pd.buf_size = ret;
             pd.filename = filename.str;
 
-            ifmt = ffifmt(av_probe_input_format3(&pd, 1, &score));
-            if (ifmt && ifmt->read_packet == ff_img_read_packet && ifmt->raw_codec_id)
-                par->codec_id = ifmt->raw_codec_id;
+            /* Only consider image demuxers, so that other formats claiming
+             * the same file don't shadow them */
+            while ((fmt = av_demuxer_iterate(&opaque))) {
+                const FFInputFormat *ifmt = ffifmt(fmt);
+                if (ifmt->read_packet != ff_img_read_packet || !ifmt->raw_codec_id)
+                    continue;
+                int score = ifmt->read_probe(&pd);
+                if (score > score_max) {
+                    score_max = score;
+                    par->codec_id = ifmt->raw_codec_id;
+                } else if (score == score_max) {
+                    par->codec_id = AV_CODEC_ID_NONE;
+                }
+            }
         }
 
         if (par->codec_id == AV_CODEC_ID_RAWVIDEO && !par->width)
@@ -601,7 +615,7 @@ const AVOption ff_img_options[] = {
     { "ts_from_file", "set frame timestamp from file's one", OFFSET(ts_from_file), AV_OPT_TYPE_INT,    {.i64 = 0   }, 0, 2,       DEC, .unit = "ts_type" },
     { "none", "none",                   0, AV_OPT_TYPE_CONST,    {.i64 = 0   }, 0, 2,       DEC, .unit = "ts_type" },
     { "sec",  "second precision",       0, AV_OPT_TYPE_CONST,    {.i64 = 1   }, 0, 2,       DEC, .unit = "ts_type" },
-    { "ns",   "nano second precision",  0, AV_OPT_TYPE_CONST,    {.i64 = 2   }, 0, 2,       DEC, .unit = "ts_type" },
+    { "ns",   "nanosecond precision",   0, AV_OPT_TYPE_CONST,    {.i64 = 2   }, 0, 2,       DEC, .unit = "ts_type" },
     { "export_path_metadata", "enable metadata containing input path information", OFFSET(export_path_metadata), AV_OPT_TYPE_BOOL,   {.i64 = 0   }, 0, 1,       DEC }, \
     COMMON_OPTIONS
 };
@@ -769,11 +783,11 @@ static int jpeg_probe(const AVProbeData *p)
         case APP0:
             if (c == APP0 && AV_RL32(&b[i + 4]) == MKTAG('J','F','I','F'))
                 got_header = 1;
-            /* fallthrough */
+            av_fallthrough;
         case APP1:
             if (c == APP1 && AV_RL32(&b[i + 4]) == MKTAG('E','x','i','f'))
                 got_header = 1;
-            /* fallthrough */
+            av_fallthrough;
         case APP2:
         case APP3:
         case APP4:
@@ -891,10 +905,33 @@ static int pictor_probe(const AVProbeData *p)
 static int png_probe(const AVProbeData *p)
 {
     const uint8_t *b = p->buf;
+    int size = p->buf_size;
+    int pos = 8;
 
-    if (AV_RB64(b) == 0x89504e470d0a1a0a)
-        return AVPROBE_SCORE_MAX - 1;
-    return 0;
+    if (AV_RB64(b) != PNGSIG)
+        return 0;
+
+    /* png_pipe demuxes a sequence of images, so the bytes after a whole
+     * image in the buffer have to match another signature as far as the
+     * buffer goes. Anything else is an unrelated payload behind a PNG,
+     * like the 1x1 image some CDNs prepend to MPEG-TS segments, and the
+     * signature alone must not outscore the demuxer of that payload. */
+    while (size - pos >= 12) {
+        uint32_t len = AV_RB32(b + pos);
+        uint32_t tag = AV_RB32(b + pos + 4);
+
+        if (len > size - pos - 12)
+            break;
+        pos += 12 + len;
+        if (tag == MKBETAG('I', 'E', 'N', 'D')) {
+            int n = FFMIN(size - pos, 8);
+            if (n && (AV_RB64(b + pos) ^ PNGSIG) >> (64 - 8 * n))
+                return AVPROBE_SCORE_RETRY;
+            pos += n;
+        }
+    }
+
+    return AVPROBE_SCORE_MAX - 1;
 }
 
 static int psd_probe(const AVProbeData *p)
@@ -981,6 +1018,13 @@ static int tiff_probe(const AVProbeData *p)
     return 0;
 }
 
+static int rw2_probe(const AVProbeData *p)
+{
+    if (AV_RB32(p->buf) == 0x49495500 && AV_RL32(p->buf + 4) >= 8)
+        return AVPROBE_SCORE_MAX;
+    return 0;
+}
+
 static int webp_probe(const AVProbeData *p)
 {
     const uint8_t *b = p->buf;
@@ -1063,7 +1107,7 @@ static int pam_probe(const AVProbeData *p)
 
 static int hdr_probe(const AVProbeData *p)
 {
-    if (!memcmp(p->buf, "#?RADIANCE\n", 11))
+    if (!memcmp(p->buf, "#?RADIANCE\n", 11) || !memcmp(p->buf, "#?RGBE\n", 7))
         return AVPROBE_SCORE_MAX;
     return 0;
 }
@@ -1240,6 +1284,7 @@ IMAGEAUTO_DEMUXER(ppm,       PPM)
 IMAGEAUTO_DEMUXER(psd,       PSD)
 IMAGEAUTO_DEMUXER(qdraw,     QDRAW)
 IMAGEAUTO_DEMUXER(qoi,       QOI)
+IMAGEAUTO_DEMUXER(rw2,       RW2)
 IMAGEAUTO_DEMUXER(sgi,       SGI)
 IMAGEAUTO_DEMUXER(sunrast,   SUNRAST)
 IMAGEAUTO_DEMUXER(svg,       SVG)

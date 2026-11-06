@@ -314,6 +314,7 @@ static int parse_dsd_prop(AVFormatContext *s, AVStream *st, uint64_t eof)
                        av_fourcc2str(tag));
                 return AVERROR_PATCHWELCOME;
             }
+            st->codecpar->format = AV_SAMPLE_FMT_DSD;
             break;
 
         case MKTAG('F','S',' ',' '):
@@ -567,7 +568,7 @@ static int iff_read_header(AVFormatContext *s)
                                      data_size + IFF_EXTRA_VIDEO_SIZE);
             if (res < 0)
                 return res;
-            if ((res = avio_read(pb, stv->codecpar->extradata + IFF_EXTRA_VIDEO_SIZE, data_size)) < 0) {
+            if ((res = ffio_read_size(pb, stv->codecpar->extradata + IFF_EXTRA_VIDEO_SIZE, data_size)) < 0) {
                 av_freep(&stv->codecpar->extradata);
                 stv->codecpar->extradata_size = 0;
                 return res;
@@ -612,7 +613,7 @@ static int iff_read_header(AVFormatContext *s)
                 return AVERROR_INVALIDDATA;
             if (!stv)
                 return AVERROR_INVALIDDATA;
-            if ((fmt_size = avio_read(pb, fmt, sizeof(fmt))) < 0)
+            if ((fmt_size = ffio_read_size(pb, fmt, sizeof(fmt))) < 0)
                 return fmt_size;
             if (fmt_size == sizeof(deep_rgb24) && !memcmp(fmt, deep_rgb24, sizeof(deep_rgb24)))
                 stv->codecpar->format = AV_PIX_FMT_RGB24;
@@ -992,7 +993,11 @@ static int iff_read_packet(AVFormatContext *s,
         if (pb->eof_reached)
             return AVERROR_EOF;
 
+        if (!data_size || data_size > INT_MAX)
+            return AVERROR_INVALIDDATA;
         ret = av_get_packet(pb, pkt, data_size);
+        if (ret < 0)
+            return ret;
         pkt->stream_index = iff->video_stream_index;
         pkt->pos = orig_pos;
         pkt->duration = get_anim_duration(pkt->data, pkt->size);
