@@ -878,6 +878,9 @@ static int libx265_encode_frame(AVCodecContext *avctx, AVPacket *pkt,
     for (i = 0; i < sei->numPayloads; i++)
         av_free(sei->payloads[i].payload);
     av_freep(&x265pic.quantOffsets);
+#if X265_BUILD >= 167
+    av_freep(&x265pic.rpu.payload);
+#endif
 
     if (ret < 0)
         return AVERROR_EXTERNAL;
@@ -1081,7 +1084,7 @@ static const FFCodecDefault x265_defaults[] = {
     { NULL },
 };
 
-FFCodec ff_libx265_encoder = {
+const FFCodec ff_libx265_encoder = {
     .p.name           = "libx265",
     CODEC_LONG_NAME("libx265 H.265 / HEVC"),
     .p.type           = AVMEDIA_TYPE_VIDEO,

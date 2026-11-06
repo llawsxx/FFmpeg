@@ -43,7 +43,6 @@
 #include "huffyuvdsp.h"
 #include "lossless_videodsp.h"
 #include "thread.h"
-#include "libavutil/emms.h"
 #include "libavutil/imgutils.h"
 #include "libavutil/mem.h"
 #include "libavutil/pixdesc.h"
@@ -351,7 +350,7 @@ static av_cold int decode_init(AVCodecContext *avctx)
     s->flags = avctx->flags;
 
     ff_bswapdsp_init(&s->bdsp);
-    ff_huffyuvdsp_init(&s->hdsp, avctx->pix_fmt);
+    ff_huffyuvdsp_init(&s->hdsp);
     ff_llviddsp_init(&s->llviddsp);
 
     s->interlaced = avctx->height > 288;
@@ -722,6 +721,7 @@ static void decode_plane_bitstream(HYuvDecContext *s, int width, int plane)
             for (i = 0; i < count && BITS_LEFT(re, &s->gb) > 0; i++) {
                 READ_2PIX_PLANE(s->temp[0][2 * i], s->temp[0][2 * i + 1], plane, OP8bits);
             }
+            memset(s->temp[0] + 2 * i, 0, 2 * (count - i));
         } else {
             for(i=0; i<count; i++){
                 READ_2PIX_PLANE(s->temp[0][2 * i], s->temp[0][2 * i + 1], plane, OP8bits);
@@ -734,7 +734,8 @@ static void decode_plane_bitstream(HYuvDecContext *s, int width, int plane)
             index = SHOW_UBITS(re, &s->gb, VLC_BITS);
             VLC_INTERN(s->temp[0][width-1], s->vlc[plane].table,
                        &s->gb, re, VLC_BITS, 3);
-        }
+        } else if (width & 1)
+            s->temp[0][width - 1] = 0;
         CLOSE_READER(re, &s->gb);
     } else if (s->bps <= 14) {
         OPEN_READER(re, &s->gb);
@@ -742,6 +743,7 @@ static void decode_plane_bitstream(HYuvDecContext *s, int width, int plane)
             for (i = 0; i < count && BITS_LEFT(re, &s->gb) > 0; i++) {
                 READ_2PIX_PLANE(s->temp16[0][2 * i], s->temp16[0][2 * i + 1], plane, OP14bits);
             }
+            memset(s->temp16[0] + 2 * i, 0, 4 * (count - i));
         } else {
             for(i=0; i<count; i++){
                 READ_2PIX_PLANE(s->temp16[0][2 * i], s->temp16[0][2 * i + 1], plane, OP14bits);
@@ -754,13 +756,15 @@ static void decode_plane_bitstream(HYuvDecContext *s, int width, int plane)
             index = SHOW_UBITS(re, &s->gb, VLC_BITS);
             VLC_INTERN(s->temp16[0][width-1], s->vlc[plane].table,
                        &s->gb, re, VLC_BITS, 3);
-        }
+        } else if (width & 1)
+            s->temp16[0][width - 1] = 0;
         CLOSE_READER(re, &s->gb);
     } else {
-        if (count >= (get_bits_left(&s->gb)) / (32 * 2)) {
+        if (count >= (get_bits_left(&s->gb)) / (33 * 2)) {
             for (i = 0; i < count && get_bits_left(&s->gb) > 0; i++) {
                 READ_2PIX_PLANE16(s->temp16[0][2 * i], s->temp16[0][2 * i + 1], plane);
             }
+            memset(s->temp16[0] + 2 * i, 0, 4 * (count - i));
         } else {
             for(i=0; i<count; i++){
                 READ_2PIX_PLANE16(s->temp16[0][2 * i], s->temp16[0][2 * i + 1], plane);
@@ -769,7 +773,8 @@ static void decode_plane_bitstream(HYuvDecContext *s, int width, int plane)
         if( width&1 && get_bits_left(&s->gb)>0 ) {
             int dst = (unsigned)get_vlc2(&s->gb, s->vlc[plane].table, VLC_BITS, 3)<<2;
             s->temp16[0][width-1] = dst + get_bits(&s->gb, 2);
-        }
+        } else if (width & 1)
+            s->temp16[0][width - 1] = 0;
     }
 }
 
@@ -849,6 +854,7 @@ static av_always_inline void decode_bgr_1(HYuvDecContext *s, int count,
             s->temp[0][4 * i + A] = 0;
     }
     CLOSE_READER(re, &s->gb);
+    memset(s->temp[0] + 4 * i, 0, 4 * (count - i));
 }
 
 static void decode_bgr_bitstream(HYuvDecContext *s, int count)
@@ -887,7 +893,6 @@ static void draw_slice(HYuvDecContext *s, AVCodecContext *avctx, AVFrame *frame,
     offset[2] = frame->linesize[2] * cy;
     for (i = 3; i < AV_NUM_DATA_POINTERS; i++)
         offset[i] = 0;
-    emms_c();
 
     avctx->draw_horiz_band(avctx, frame, offset, y, 3, h);
 
@@ -987,7 +992,7 @@ static int decode_slice(AVCodecContext *avctx, AVFrame *p, int height,
                         break;
                 }
 
-                lefttop = p->data[plane][0];
+                lefttop = READ_LOWBYTE(p->data[plane], s->bps);
                 decode_plane_bitstream(s, w, plane);
                 add_median_prediction(s, p->data[plane] + fake_stride, p->data[plane], s->temp[0], w, &left, &lefttop);
                 y++;
@@ -1305,7 +1310,6 @@ static int decode_frame(AVCodecContext *avctx, AVFrame *p,
         }
 
         ret = decode_slice(avctx, p, slice_height, slice_size, y_offset, table_size);
-        emms_c();
         if (ret < 0)
             return ret;
     }

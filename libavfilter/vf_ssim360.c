@@ -113,7 +113,7 @@ typedef struct HeatmapList {
 } HeatmapList;
 
 typedef struct SampleParams {
-    int stride;
+    int sample_stride;
     int planewidth;
     int planeheight;
     int x_image_offset;
@@ -733,10 +733,10 @@ static void compute_bilinear_map(SampleParams *p, BilinearMap *m, float x, float
     float y_inv_diff = 1.0f - y_diff;
 
     // Indices of the 4 samples from source frame
-    m->tli = x_floor    + y_floor   * p->stride;
-    m->tri = x_ceil     + y_floor   * p->stride;
-    m->bli = x_floor    + y_ceil    * p->stride;
-    m->bri = x_ceil     + y_ceil    * p->stride;
+    m->tli = x_floor    + y_floor   * p->sample_stride;
+    m->tri = x_ceil     + y_floor   * p->sample_stride;
+    m->bli = x_floor    + y_ceil    * p->sample_stride;
+    m->bri = x_ceil     + y_ceil    * p->sample_stride;
 
     // Scale to be applied to each of the 4 samples from source frame
     m->tlf = x_inv_diff * y_inv_diff * fixed_point_scale;
@@ -1034,10 +1034,16 @@ generate_eye_tape_map(SSIM360Context *s,
     float x_range = end_x - start_x;
 
     // Ensure tape length is a multiple of 4, for full SSIM block coverage
-    int tape_length = s->tape_length[plane] = ((int)ROUNDED_DIV(x_range, 4)) << 2;
+    float tape_length_f = ROUNDED_DIV(x_range, 4);
+    int tape_length;
 
-    s->ref_tape_map[plane][eye]  = av_malloc_array(tape_length * 8, sizeof(BilinearMap));
-    s->main_tape_map[plane][eye] = av_malloc_array(tape_length * 8, sizeof(BilinearMap));
+    if (!(tape_length_f > 0.f) || tape_length_f > INT_MAX / 4.0f)
+        return AVERROR(EINVAL);
+
+    tape_length = s->tape_length[plane] = (int)tape_length_f << 2;
+
+    s->ref_tape_map[plane][eye]  = av_malloc_array(tape_length, 8 * sizeof(BilinearMap));
+    s->main_tape_map[plane][eye] = av_malloc_array(tape_length, 8 * sizeof(BilinearMap));
     if (!s->ref_tape_map[plane][eye] || !s->main_tape_map[plane][eye])
         return AVERROR(ENOMEM);
 
@@ -1073,6 +1079,7 @@ static int generate_tape_maps(SSIM360Context *s, AVFrame *main, const AVFrame *r
     int main_stereo_format = s->main_stereo_format;
     int are_both_stereo = (main_stereo_format != STEREO_FORMAT_MONO) && (ref_stereo_format != STEREO_FORMAT_MONO);
     int min_eye_count = 1 + are_both_stereo;
+    int bytes_per_sample = 1 + (s->max > 255);
     int ret;
 
     for (int i = 0; i < s->nb_components; i ++) {
@@ -1093,7 +1100,7 @@ static int generate_tape_maps(SSIM360Context *s, AVFrame *main, const AVFrame *r
 
         for (int eye = 0; eye < min_eye_count; eye ++) {
             SampleParams ref_sample_params = {
-                .stride         = ref->linesize[i],
+                .sample_stride  = ref->linesize[i] / bytes_per_sample,
                 .planewidth     = ref_width,
                 .planeheight    = ref_height,
                 .x_image_range  = ref_image_width - 1,
@@ -1105,7 +1112,7 @@ static int generate_tape_maps(SSIM360Context *s, AVFrame *main, const AVFrame *r
             };
 
             SampleParams main_sample_params = {
-                .stride         = main->linesize[i],
+                .sample_stride  = main->linesize[i] / bytes_per_sample,
                 .planewidth     = main_width,
                 .planeheight    = main_height,
                 .x_image_range  = main_image_width - 1,
@@ -1491,8 +1498,8 @@ static int generate_density_map(SSIM360Context *s, int w, int h)
     case PROJECTION_BARREL:
         // side face
         for (int i = 0; i < h; i++) {
+            d = cos(((0.5 + i) / h - 0.5) * DEFAULT_EXPANSION_COEF * M_PI_2);
             for (int j = 0; j < w * 4 / 5; j++) {
-                d = cos(((0.5 + i) / h - 0.5) * DEFAULT_EXPANSION_COEF * M_PI_2);
                 s->density.value[i * w + j] = d * d * d;
             }
         }

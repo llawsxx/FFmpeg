@@ -16,6 +16,7 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include "lcevc.h"
 #include "lcevctab.h"
 
 const struct FFLCEVCDim ff_lcevc_resolution_type[63] = {
@@ -25,11 +26,24 @@ const struct FFLCEVCDim ff_lcevc_resolution_type[63] = {
     { 854,  480 },  { 856,  480 },  { 960,  540 },  { 960,  640 },
     { 1024, 576 },  { 1024, 600 },  { 1024, 768 },  { 1152, 864 },
     { 1280, 720 },  { 1280, 800 },  { 1280, 1024 }, { 1360, 768 },
-    { 1366, 768 },  { 1920, 1200 }, { 2048, 1080 }, { 2048, 1152 },
+    { 1366, 768 },  { 1400, 1050 }, { 1440, 900 },  { 1600, 1200 },
+    { 1680, 1050 }, { 1920, 1080 }, { 1920, 1200 }, { 2048, 1080 },
+    { 2048, 1152 },
     { 2048, 1536 }, { 2160, 1440 }, { 2560, 1440 }, { 2560, 1600 },
     { 2560, 2048 }, { 3200, 1800 }, { 3200, 2048 }, { 3200, 2400 },
     { 3440, 1440 }, { 3840, 1600 }, { 3840, 2160 }, { 3840, 2400 },
     { 4096, 2160 }, { 4096, 3072 }, { 5120, 2880 }, { 5120, 3200 },
     { 5120, 4096 }, { 6400, 4096 }, { 6400, 4800 }, { 7680, 4320 },
     { 7680, 4800 },
+};
+
+const enum AVPixelFormat ff_lcevc_depth_type[4][4] = {
+    [LCEVC_BASE_DEPTH_TYPE_8]  = { AV_PIX_FMT_GRAY8,     AV_PIX_FMT_YUV420P,
+                                   AV_PIX_FMT_YUV422P,   AV_PIX_FMT_YUV444P },
+    [LCEVC_BASE_DEPTH_TYPE_10] = { AV_PIX_FMT_GRAY10,    AV_PIX_FMT_YUV420P10,
+                                   AV_PIX_FMT_YUV422P10, AV_PIX_FMT_YUV444P10 },
+    [LCEVC_BASE_DEPTH_TYPE_12] = { AV_PIX_FMT_GRAY12,    AV_PIX_FMT_YUV420P12,
+                                   AV_PIX_FMT_YUV422P12, AV_PIX_FMT_YUV444P12 },
+    [LCEVC_BASE_DEPTH_TYPE_14] = { AV_PIX_FMT_GRAY14,    AV_PIX_FMT_YUV420P14,
+                                   AV_PIX_FMT_YUV422P14, AV_PIX_FMT_YUV444P14 },
 };

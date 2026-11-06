@@ -37,10 +37,18 @@ fate-dss-lp: CMD = framecrc -i $(TARGET_SAMPLES)/dss/lp.dss -frames 30 -af aresa
 FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSS, DSS_SP) += fate-dss-sp
 fate-dss-sp: CMD = framecrc -i $(TARGET_SAMPLES)/dss/sp.dss -frames 30
 
-FATE_SAMPLES_AUDIO-$(call PCM, DSF, DST, ARESAMPLE_FILTER) += fate-dsf-dst
+FATE_SAMPLES_AUDIO-$(call PCM, DSF, DST, ARESAMPLE_FILTER SWRESAMPLE) += fate-dsf-dst
 fate-dsf-dst: CMD = pcm -i $(TARGET_SAMPLES)/dst/dst-64fs44-2ch.dff
 fate-dsf-dst: CMP = oneoff
 fate-dsf-dst: REF = $(SAMPLES)/dst/dst-64fs44-2ch.pcm
+
+FATE_SAMPLES_AUDIO-$(call FRAMECRC, DSF, DST, DSD_MSBF_ENCODER) += fate-dsf-dst-dsd
+fate-dsf-dst-dsd: CMD = framecrc -request_sample_fmt dsd -i $(TARGET_SAMPLES)/dst/dst-64fs44-2ch.dff -c:a dsd_msbf
+
+FATE_SAMPLES_AUDIO-$(call PCM, DSF, DST, ARESAMPLE_FILTER) += fate-dsf-dst-dsd-pcm
+fate-dsf-dst-dsd-pcm: CMD = pcm -request_sample_fmt dsd -i $(TARGET_SAMPLES)/dst/dst-64fs44-2ch.dff
+fate-dsf-dst-dsd-pcm: CMP = oneoff
+fate-dsf-dst-dsd-pcm: REF = $(SAMPLES)/dst/dst-64fs44-2ch.pcm
 
 FATE_SAMPLES_AUDIO-$(call PCM, G728, G728, ARESAMPLE_FILTER) += fate-g728
 fate-g728: CMD = pcm -i $(TARGET_SAMPLES)/g728/CW3.g728
@@ -64,7 +72,7 @@ fate-nellymoser: CMD = pcm -i $(TARGET_SAMPLES)/nellymoser/nellymoser.flv
 fate-nellymoser: CMP = oneoff
 fate-nellymoser: REF = $(SAMPLES)/nellymoser/nellymoser.pcm
 
-FATE_SAMPLES_AUDIO-$(call ENCMUX, NELLYMOSER, FLV, ARESAMPLE_FILTER PIPE_PROTOCOL) += fate-nellymoser-aref-encode
+FATE_SAMPLES_AUDIO-$(call ENCDEC, NELLYMOSER, FLV, WAV_MUXER WAV_DEMUXER PCM_S16LE_ENCODER PCM_S16LE_DECODER ARESAMPLE_FILTER PIPE_PROTOCOL) += fate-nellymoser-aref-encode
 fate-nellymoser-aref-encode: $(AREF) ./tests/data/asynth-16000-1.wav
 fate-nellymoser-aref-encode: CMD = enc_dec_pcm flv wav s16le $(REF) -c:a nellymoser
 fate-nellymoser-aref-encode: CMP = stddev
@@ -73,11 +81,23 @@ fate-nellymoser-aref-encode: CMP_SHIFT = -256
 fate-nellymoser-aref-encode: CMP_TARGET = 3863
 fate-nellymoser-aref-encode: SIZE_TOLERANCE = 268
 
+FATE_SAMPLES_AUDIO-$(call ENCDEC, NELLYMOSER, FLV, WAV_MUXER WAV_DEMUXER PCM_S16LE_ENCODER PCM_S16LE_DECODER ARESAMPLE_FILTER PIPE_PROTOCOL) += fate-nellymoser-aref-encode-trellis
+fate-nellymoser-aref-encode-trellis: tests/data/asynth-16000-1.wav
+fate-nellymoser-aref-encode-trellis: CMD = enc_dec_pcm flv wav s16le $(REF) -c:a nellymoser -trellis 1
+fate-nellymoser-aref-encode-trellis: CMP = stddev
+fate-nellymoser-aref-encode-trellis: REF = tests/data/asynth-16000-1.wav
+fate-nellymoser-aref-encode-trellis: CMP_SHIFT = -256
+fate-nellymoser-aref-encode-trellis: CMP_TARGET = 4222
+fate-nellymoser-aref-encode-trellis: SIZE_TOLERANCE = 268
+
 FATE_SAMPLES_AUDIO-$(call FRAMECRC, AVI, ON2AVC, ARESAMPLE_FILTER) += fate-on2avc
 fate-on2avc: CMD = framecrc -i $(TARGET_SAMPLES)/vp7/potter-40.vp7 -frames 30 -vn -af aresample
 
 FATE_SAMPLES_AUDIO-$(call FRAMECRC, PAF, PAF_AUDIO) += fate-paf-audio
 fate-paf-audio: CMD = framecrc -i $(TARGET_SAMPLES)/paf/hod1-partial.paf -vn
+
+FATE_SAMPLES_AUDIO-$(call FRAMECRC, WAV, ADPCM_RHETOREX) += fate-rhetorex
+fate-rhetorex: CMD = framecrc -i $(TARGET_SAMPLES)/rhetorex/rhetorex-mono-4bit-8000.wav
 
 FATE_SAMPLES_AUDIO-$(call FRAMECRC, VMD, VMDAUDIO, ARESAMPLE_FILTER) += fate-sierra-vmd-audio
 fate-sierra-vmd-audio: CMD = framecrc -i $(TARGET_SAMPLES)/vmd/12.vmd -vn -af aresample
@@ -87,6 +107,11 @@ fate-smacker-audio: CMD = framecrc -i $(TARGET_SAMPLES)/smacker/wetlogo.smk -vn 
 
 FATE_SAMPLES_AUDIO-$(call DEMDEC, WSVQA, WS_SND1, ARESAMPLE_FILTER) += fate-ws_snd
 fate-ws_snd: CMD = md5 -i $(TARGET_SAMPLES)/vqa/ws_snd.vqa -f s16le -af aresample
+
+FATE_SAMPLES_AUDIO_FFPROBE-$(call DEMDEC, BINKA, BINKAUDIO_DCT) += fate-binkaudio-ueba-trimming
+fate-binkaudio-ueba-trimming: CMD = run ffprobe$(PROGSSUF)$(EXESUF) -bitexact \
+    -show_entries packet=pts,duration:packet_side_data:frame=pts,nb_samples:stream=duration_ts \
+    -of compact $(TARGET_SAMPLES)/bink/SW_Limon_01.binka
 
 FATE_SAMPLES_AUDIO_FFPROBE-$(call DEMDEC, WAV, WMAV2, FILE_PROTOCOL) += fate-flcl1905
 fate-flcl1905: CMD = run ffprobe$(PROGSSUF)$(EXESUF) -show_frames -show_packets -print_format compact $(TARGET_SAMPLES)/wav/FLCL_Ending_My-short.wav

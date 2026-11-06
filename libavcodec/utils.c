@@ -315,6 +315,21 @@ void avcodec_align_dimensions2(AVCodecContext *s, int *width, int *height,
             h_align = 8;
         }
         break;
+    case AV_PIX_FMT_BAYER_BGGR8:
+    case AV_PIX_FMT_BAYER_RGGB8:
+    case AV_PIX_FMT_BAYER_GBRG8:
+    case AV_PIX_FMT_BAYER_GRBG8:
+    case AV_PIX_FMT_BAYER_BGGR16LE:
+    case AV_PIX_FMT_BAYER_BGGR16BE:
+    case AV_PIX_FMT_BAYER_RGGB16LE:
+    case AV_PIX_FMT_BAYER_RGGB16BE:
+    case AV_PIX_FMT_BAYER_GBRG16LE:
+    case AV_PIX_FMT_BAYER_GBRG16BE:
+    case AV_PIX_FMT_BAYER_GRBG16LE:
+    case AV_PIX_FMT_BAYER_GRBG16BE:
+        w_align = FFMAX(w_align, 2);
+        h_align = FFMAX(h_align, 2);
+        break;
     default:
         break;
     }
@@ -406,20 +421,12 @@ int avpriv_codec_get_cap_skip_frame_fill_param(const AVCodec *codec){
 const char *avcodec_get_name(enum AVCodecID id)
 {
     const AVCodecDescriptor *cd;
-    const AVCodec *codec;
 
     if (id == AV_CODEC_ID_NONE)
         return "none";
     cd = avcodec_descriptor_get(id);
     if (cd)
         return cd->name;
-    av_log(NULL, AV_LOG_WARNING, "Codec 0x%x is not in the full list.\n", id);
-    codec = avcodec_find_decoder(id);
-    if (codec)
-        return codec->name;
-    codec = avcodec_find_encoder(id);
-    if (codec)
-        return codec->name;
     return "unknown_codec";
 }
 
@@ -472,6 +479,7 @@ int av_get_exact_bits_per_sample(enum AVCodecID codec_id)
     case AV_CODEC_ID_ADPCM_G722:
     case AV_CODEC_ID_ADPCM_YAMAHA:
     case AV_CODEC_ID_ADPCM_AICA:
+    case AV_CODEC_ID_ADPCM_RHETOREX:
         return 4;
     case AV_CODEC_ID_DSD_LSBF:
     case AV_CODEC_ID_DSD_MSBF:
@@ -551,6 +559,7 @@ int av_get_bits_per_sample(enum AVCodecID codec_id)
     switch (codec_id) {
     case AV_CODEC_ID_DFPWM:
         return 1;
+    case AV_CODEC_ID_ADPCM_IMA_CITRIX:
     case AV_CODEC_ID_ADPCM_SBPRO_2:
     case AV_CODEC_ID_G728:
         return 2;
@@ -759,6 +768,11 @@ static int get_audio_frame_duration(enum AVCodecID id, int sr, int ch, int ba,
                     break;
                 case AV_CODEC_ID_ADPCM_XMD:
                     tmp = blocks * 32;
+                    break;
+                case AV_CODEC_ID_ADPCM_IMA_CITRIX:
+                    if (bps != 2 || ch > 2 || ba < 4 * ch || (ch == 2 && ba % 8))
+                        return 0;
+                    tmp = blocks * (1LL + (ba / ch - 4) * 4LL);
                     break;
                 }
                 if (tmp) {
@@ -979,6 +993,22 @@ AVCPBProperties *av_cpb_properties_alloc(size_t *size)
     return props;
 }
 
+static void put_timecode_fields(PutBitContext *pb, AVRational rate, uint32_t tc)
+{
+    unsigned hours, minutes, seconds, frames, drop;
+
+    ff_timecode_set_smpte(&drop, &hours, &minutes, &seconds, &frames, rate, tc, 0, 0);
+
+    put_bits(pb, 5, 0);      // counting_type
+    put_bits(pb, 1, 1);      // full_timestamp_flag
+    put_bits(pb, 1, 0);      // discontinuity_flag
+    put_bits(pb, 1, drop);   // cnt_dropped_flag
+    put_bits(pb, 9, frames);
+    put_bits(pb, 6, seconds);
+    put_bits(pb, 6, minutes);
+    put_bits(pb, 5, hours);
+}
+
 int ff_alloc_timecode_sei(const AVFrame *frame, AVRational rate, size_t prefix_len,
                      void **data, size_t *sei_size)
 {
@@ -1008,21 +1038,42 @@ int ff_alloc_timecode_sei(const AVFrame *frame, AVRational rate, size_t prefix_l
     put_bits(&pb, 2, m); // num_clock_ts
 
     for (int j = 1; j <= m; j++) {
-        unsigned hh, mm, ss, ff, drop;
-        ff_timecode_set_smpte(&drop, &hh, &mm, &ss, &ff, rate, tc[j], 0, 0);
-
         put_bits(&pb, 1, 1); // clock_timestamp_flag
         put_bits(&pb, 1, 1); // units_field_based_flag
-        put_bits(&pb, 5, 0); // counting_type
-        put_bits(&pb, 1, 1); // full_timestamp_flag
-        put_bits(&pb, 1, 0); // discontinuity_flag
-        put_bits(&pb, 1, drop);
-        put_bits(&pb, 9, ff);
-        put_bits(&pb, 6, ss);
-        put_bits(&pb, 6, mm);
-        put_bits(&pb, 5, hh);
-        put_bits(&pb, 5, 0);
+        put_timecode_fields(&pb, rate, tc[j]);
+        put_bits(&pb, 5, 0); // time_offset_length
     }
+    flush_put_bits(&pb);
+
+    return 0;
+}
+
+int ff_alloc_timecode_metadata_av1(const AVFrame *frame, AVRational rate,
+                                   void **data, size_t *size)
+{
+    AVFrameSideData *sd = NULL;
+    PutBitContext pb;
+    uint32_t *tc;
+
+    if (frame)
+        sd = av_frame_get_side_data(frame, AV_FRAME_DATA_S12M_TIMECODE);
+
+    *data = NULL;
+    if (!sd)
+        return 0;
+    tc = (uint32_t*)sd->data;
+    if (!(tc[0] & 3)) // num_clock_ts
+        return 0;
+
+    *size = 5;
+    *data = av_mallocz(*size);
+    if (!*data)
+        return AVERROR(ENOMEM);
+
+    init_put_bits(&pb, *data, *size);
+    put_timecode_fields(&pb, rate, tc[1]);
+    put_bits(&pb, 5, 1); // time_offset_length
+    put_bits(&pb, 1, 0); // time_offset_value
     flush_put_bits(&pb);
 
     return 0;

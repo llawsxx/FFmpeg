@@ -193,6 +193,10 @@ FATE_H264_REINIT_TESTS := large_420_8-to-small_420_8                    \
                           small_422_9-to-small_420_9                    \
 
 FATE_H264  := $(FATE_H264:%=fate-h264-conformance-%)                    \
+              fate-h264-data-partitioning                               \
+              fate-h264-data-partitioning-ab                            \
+              fate-h264-data-partitioning-cip                           \
+              fate-h264-data-partitioning-cip-strict                    \
               fate-h264-intra-refresh-recovery                          \
               fate-h264-lossless                                        \
               fate-h264-3386                                            \
@@ -247,7 +251,12 @@ FATE_H264-$(call FRAMECRC, MOV, H264) += fate-h264-attachment-631
 FATE_H264-$(call FRAMECRC, MPEGTS, H264, H264_PARSER MP3_DECODER SCALE_FILTER ARESAMPLE_FILTER) += fate-h264-skip-nokey
 FATE_H264-$(call FRAMECRC, MPEGTS, H264, H264_PARSER MP3_DECODER SCALE_FILTER ARESAMPLE_FILTER EXTRACT_EXTRADATA_BSF) += fate-h264-skip-nointra
 FATE_H264_FFPROBE-$(call DEMDEC, MATROSKA, H264) += fate-h264-dts_5frames
+FATE_H264_FFPROBE-$(call DEMDEC, MATROSKA, H264) += fate-h264-skip-pred-pts
+FATE_H264_FFPROBE-$(call DEMDEC, MOV, H264) += fate-h264-late-sei
 FATE_H264_FFPROBE-$(call PARSERDEMDEC, H264, H264, H264) += fate-h264-afd
+FATE_H264_FFPROBE-$(call PARSERDEMDEC, H264, H264, H264) += fate-h264-timecode-probe
+FATE_H264_FFPROBE-$(call PARSERDEMDEC, H264, H264, H264) += fate-h264-skip-pred \
+                                                            fate-h264-skip-pred-fields
 
 FATE_SAMPLES_AVCONV += $(FATE_H264-yes)
 FATE_SAMPLES_FFPROBE += $(FATE_H264_FFPROBE-yes)
@@ -465,6 +474,14 @@ fate-h264-xavc-4389:                              CMD = framecrc -i $(TARGET_SAM
 fate-h264-attachment-631:                         CMD = framecrc -i $(TARGET_SAMPLES)/h264/attachment631-small.mp4 -an -max_error_rate 0.96
 fate-h264-skip-nokey:                             CMD = framecrc -skip_frame nokey -i $(TARGET_SAMPLES)/h264/h264_intra_first-small.ts -vf scale -af aresample
 fate-h264-skip-nointra:                           CMD = framecrc -skip_frame nointra -i $(TARGET_SAMPLES)/h264/h264_intra_first-small.ts -vf scale -af aresample
+# slice data partitioning: A+B+C, and with partition C legitimately absent
+fate-h264-data-partitioning:                      CMD = framecrc -i $(TARGET_SAMPLES)/h264/data_partitioning.h264
+fate-h264-data-partitioning-ab:                   CMD = framecrc -i $(TARGET_SAMPLES)/h264/data_partitioning_ab.h264
+# constrained_intra_pred_flag=1, which changes the nC derivation (9.2.1)
+fate-h264-data-partitioning-cip:                  CMD = framecrc -bug h264_dp_nnz -i $(TARGET_SAMPLES)/h264/data_partitioning_cip.h264
+# same stream read the way 9.2.1 is written instead of the way JM does it; that
+# desynchronises the residual, so pin the threads to keep concealment stable
+fate-h264-data-partitioning-cip-strict:           CMD = threads=1 framecrc -bug 0 -i $(TARGET_SAMPLES)/h264/data_partitioning_cip.h264
 fate-h264-intra-refresh-recovery:                 CMD = framecrc -i $(TARGET_SAMPLES)/h264/intra_refresh.h264 -frames:v 10
 fate-h264-invalid-ref-mod:                        CMD = framecrc -i $(TARGET_SAMPLES)/h264/h264refframeregression.mp4 -an -frames 10 -pix_fmt yuv420p10le -vf scale
 fate-h264-lossless:                               CMD = framecrc -i $(TARGET_SAMPLES)/h264/lossless.h264
@@ -479,6 +496,15 @@ fate-h264-timecode:                               CMD = framecrc -i $(TARGET_SAM
 fate-h264-reinit-%:                               CMD = framecrc -i $(TARGET_SAMPLES)/h264/$(@:fate-h264-%=%).h264 -vf scale,format=yuv444p10le,scale=w=352:h=288
 
 fate-h264-dts_5frames:                            CMD = probeframes $(TARGET_SAMPLES)/h264/dts_5frames.mkv
+fate-h264-skip-pred:                              CMD = probeframes -show_entries frame=key_frame,pts,pict_type,interlaced_frame,top_field_first \
+                                                        -skip_pred all -skip_idct all $(TARGET_SAMPLES)/h264-conformance/CABA3_SVA_B.264
+fate-h264-skip-pred-fields:                       CMD = probeframes -show_entries frame=key_frame,pts,pict_type,interlaced_frame,top_field_first \
+                                                        -skip_pred all -skip_idct all $(TARGET_SAMPLES)/h264-conformance/CVNLFI2_Sony_H.jsv
+fate-h264-skip-pred-pts:                          CMD = probeframes -show_entries frame=key_frame,pts,pict_type \
+                                                        -skip_pred all -skip_idct all $(TARGET_SAMPLES)/h264/dts_5frames.mkv
+fate-h264-late-sei:                               CMD = probeframes -of compact -show_entries frame=color_transfer $(TARGET_SAMPLES)/h264/late-sei.mp4
+fate-h264-timecode-probe:                         CMD = probe -of compact -show_entries frame=key_frame,pict_type:frame_side_data_list \
+                                                        -read_intervals "%+\#2" $(TARGET_SAMPLES)/h264/crew_cif_timecode-2.h264
 fate-h264-afd:                                    CMD = run ffprobe$(PROGSSUF)$(EXESUF) -bitexact -apply_cropping 0 \
                                                         -show_entries frame=width,height,crop_top,crop_bottom,crop_left,crop_right:frame_side_data_list:stream=width,height,coded_width,coded_height \
                                                         $(TARGET_SAMPLES)/h264/bbc2.sample.h264

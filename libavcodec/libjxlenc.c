@@ -24,6 +24,7 @@
  * JPEG XL encoder using libjxl
  */
 
+#include <math.h>
 #include <string.h>
 
 #include "libavutil/avutil.h"
@@ -31,7 +32,6 @@
 #include "libavutil/display.h"
 #include "libavutil/error.h"
 #include "libavutil/frame.h"
-#include "libavutil/libm.h"
 #include "libavutil/mem.h"
 #include "libavutil/opt.h"
 #include "libavutil/pixdesc.h"
@@ -229,6 +229,10 @@ static int libjxl_populate_primaries(void *avctx, JxlColorEncoding *jxl_color, e
         jxl_color->primaries = JXL_PRIMARIES_SRGB;
         jxl_color->white_point = JXL_WHITE_POINT_D65;
         return 0;
+    case AVCOL_PRI_SMPTE428:
+        av_log(avctx, AV_LOG_ERROR, "SMPTE ST 428-1 XYZ cannot be described by "
+                                    "a JXL color encoding, use an ICC profile instead.\n");
+        return AVERROR(EINVAL);
     }
 
     desc = av_csp_primaries_desc_from_id(prm);
@@ -434,7 +438,8 @@ static int libjxl_preprocess_stream(AVCodecContext *avctx, const AVFrame *frame,
         if (ret >= 0)
             ret = av_exif_get_entry(avctx, &ifd, tag, 0, &orient);
         if (ret >= 0 && orient) {
-            if (!have_matrix && orient->value.uint[0] >= 1 && orient->value.uint[0] <= 8) {
+            if (!have_matrix && orient->type == AV_TIFF_SHORT && orient->count
+                    && orient->value.uint[0] >= 1 && orient->value.uint[0] <= 8) {
                 av_exif_orientation_to_matrix(matrix, orient->value.uint[0]);
                 have_matrix = 1;
             }
@@ -455,7 +460,7 @@ static int libjxl_preprocess_stream(AVCodecContext *avctx, const AVFrame *frame,
 
     /* av_display_matrix_flip is a right-multipilcation */
     /* i.e. flip is applied before the previous matrix */
-    if (frame->linesize < 0)
+    if (frame->linesize[0] < 0)
         av_display_matrix_flip(matrix, 0, 1);
 
     orientation = av_exif_matrix_to_orientation(matrix);
@@ -468,7 +473,7 @@ static int libjxl_preprocess_stream(AVCodecContext *avctx, const AVFrame *frame,
     }
 
     /* restore the previous value */
-    if (frame->linesize < 0)
+    if (frame->linesize[0] < 0)
         av_display_matrix_flip(matrix, 0, 1);
 
     if (animated) {
@@ -509,8 +514,11 @@ static int libjxl_preprocess_stream(AVCodecContext *avctx, const AVFrame *frame,
     }
 
     /* jret != JXL_ENC_SUCCESS means fallthrough from above */
-    if (!sd || !sd->size || jret != JXL_ENC_SUCCESS)
-        libjxl_populate_colorspace(avctx, frame, pix_desc, &info);
+    if (!sd || !sd->size || jret != JXL_ENC_SUCCESS) {
+        ret = libjxl_populate_colorspace(avctx, frame, pix_desc, &info);
+        if (ret < 0)
+            goto end;
+    }
 
 #if JPEGXL_NUMERIC_VERSION >= JPEGXL_COMPUTE_NUMERIC_VERSION(0, 8, 0)
     jret = JxlEncoderSetFrameBitDepth(ctx->options, &jxl_bit_depth);

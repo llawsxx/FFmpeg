@@ -26,13 +26,12 @@
  */
 
 #include <inttypes.h>
-#include <time.h>
 
 #include "libavutil/channel_layout.h"
 #include "libavutil/intreadwrite.h"
 #include "libavutil/intfloat.h"
 #include "libavutil/mem.h"
-#include "libavutil/time_internal.h"
+#include "libavutil/qsort.h"
 #include "avformat.h"
 #include "avio_internal.h"
 #include "demux.h"
@@ -128,6 +127,11 @@ static int64_t wtvfile_seek(void *opaque, int64_t offset, int whence)
     return offset;
 }
 
+static int cmp_sector(const uint32_t *a, const uint32_t *b)
+{
+    return (*a > *b) - (*a < *b);
+}
+
 /**
  * read non-zero integers (le32) from input stream
  * @param pb
@@ -195,7 +199,7 @@ static AVIOContext * wtvfile_open_sector(unsigned first_sector, uint64_t length,
         for (i = 0; i < nb_sectors1; i++) {
             if (seek_by_sector(s->pb, sectors1[i], 0) < 0)
                 break;
-            wf->nb_sectors += read_ints(s->pb, wf->sectors + i * WTV_SECTOR_SIZE / 4, WTV_SECTOR_SIZE / 4);
+            wf->nb_sectors += read_ints(s->pb, wf->sectors + wf->nb_sectors, WTV_SECTOR_SIZE / 4);
         }
     } else {
         av_log(s, AV_LOG_ERROR, "unsupported file allocation table depth (0x%x)\n", depth);
@@ -205,6 +209,24 @@ static AVIOContext * wtvfile_open_sector(unsigned first_sector, uint64_t length,
     wf->sector_bits = length & (1ULL<<63) ? WTV_SECTOR_BITS : WTV_BIGSECTOR_BITS;
 
     if (!wf->nb_sectors) {
+        av_freep(&wf->sectors);
+        av_freep(&wf);
+        return NULL;
+    }
+
+    uint32_t *sorted = av_memdup(wf->sectors, wf->nb_sectors * sizeof(*wf->sectors));
+    uint32_t *tmp    = av_malloc_array(wf->nb_sectors, sizeof(*tmp));
+    int i = 0;
+    if (sorted && tmp) {
+        AV_MSORT(sorted, tmp, wf->nb_sectors, uint32_t, cmp_sector);
+        for (i = 1; i < wf->nb_sectors && sorted[i] != sorted[i - 1]; i++)
+            ;
+        if (i < wf->nb_sectors)
+            av_log(s, AV_LOG_ERROR, "file allocation table lists sector %"PRIu32" more than once\n", sorted[i]);
+    }
+    av_free(sorted);
+    av_free(tmp);
+    if (i < wf->nb_sectors) {
         av_freep(&wf->sectors);
         av_freep(&wf);
         return NULL;
@@ -385,51 +407,19 @@ static int read_probe(const AVProbeData *p)
 }
 
 /**
- * Convert win32 FILETIME to ISO-8601 string
- * @return <0 on error
+ * Convert crazy time (100ns since 1 Jan 0001) to av time (unix timestamp in microseconds)
  */
-static int filetime_to_iso8601(char *buf, int buf_size, int64_t value)
+static int64_t crazytime_to_avtime(int64_t value)
 {
-    time_t t = (value / 10000000LL) - 11644473600LL;
-    struct tm tmbuf;
-    struct tm *tm = gmtime_r(&t, &tmbuf);
-    if (!tm)
-        return -1;
-    if (!strftime(buf, buf_size, "%Y-%m-%d %H:%M:%S", tm))
-        return -1;
-    return 0;
+    return (value / 10LL) - 719162LL*86400000000LL;
 }
 
 /**
- * Convert crazy time (100ns since 1 Jan 0001) to ISO-8601 string
- * @return <0 on error
+ * Convert OLE DATE to av time (unix timestamp in microseconds)
  */
-static int crazytime_to_iso8601(char *buf, int buf_size, int64_t value)
+static int64_t oledate_to_avtime(int64_t value)
 {
-    time_t t = (value / 10000000LL) - 719162LL*86400LL;
-    struct tm tmbuf;
-    struct tm *tm = gmtime_r(&t, &tmbuf);
-    if (!tm)
-        return -1;
-    if (!strftime(buf, buf_size, "%Y-%m-%d %H:%M:%S", tm))
-        return -1;
-    return 0;
-}
-
-/**
- * Convert OLE DATE to ISO-8601 string
- * @return <0 on error
- */
-static int oledate_to_iso8601(char *buf, int buf_size, int64_t value)
-{
-    time_t t = (av_int2double(value) - 25569.0) * 86400;
-    struct tm tmbuf;
-    struct tm *tm= gmtime_r(&t, &tmbuf);
-    if (!tm)
-        return -1;
-    if (!strftime(buf, buf_size, "%Y-%m-%d %H:%M:%S", tm))
-        return -1;
-    return 0;
+    return (av_int2double(value) - 25569.0) * 86400000000;
 }
 
 static void get_attachment(AVFormatContext *s, AVIOContext *pb, int length)
@@ -489,15 +479,15 @@ static void get_tag(AVFormatContext *s, AVIOContext *pb, const char *key, int ty
         int64_t num = avio_rl64(pb);
         if (!strcmp(key, "WM/EncodingTime") ||
             !strcmp(key, "WM/MediaOriginalBroadcastDateTime")) {
-            if (filetime_to_iso8601(buf, sizeof(buf), num) < 0)
-                return;
+            ff_dict_set_timestamp(&s->metadata, key, ff_asf_filetime_to_avtime(num));
+            return;
         } else if (!strcmp(key, "WM/WMRVEncodeTime") ||
                    !strcmp(key, "WM/WMRVEndTime")) {
-            if (crazytime_to_iso8601(buf, sizeof(buf), num) < 0)
-                return;
+            ff_dict_set_timestamp(&s->metadata, key, crazytime_to_avtime(num));
+            return;
         } else if (!strcmp(key, "WM/WMRVExpirationDate")) {
-            if (oledate_to_iso8601(buf, sizeof(buf), num) < 0)
-                return;
+            ff_dict_set_timestamp(&s->metadata, key, oledate_to_avtime(num));
+            return;
         } else if (!strcmp(key, "WM/WMRVBitrate"))
             snprintf(buf, sizeof(buf), "%f", av_int2double(num));
         else
@@ -506,7 +496,8 @@ static void get_tag(AVFormatContext *s, AVIOContext *pb, const char *key, int ty
         snprintf(buf, sizeof(buf), "%u", avio_rl16(pb));
     } else if (type == 6 && length == 16) {
         ff_asf_guid guid;
-        avio_read(pb, guid, 16);
+        if (ff_get_guid(pb, &guid) < 0)
+            return;
         snprintf(buf, sizeof(buf), PRI_PRETTY_GUID, ARG_PRETTY_GUID(guid));
     } else if (type == 2 && !strcmp(key, "WM/Picture")) {
         get_attachment(s, pb, length);

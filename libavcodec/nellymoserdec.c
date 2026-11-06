@@ -121,6 +121,11 @@ static av_cold int decode_init(AVCodecContext * avctx)
     float scale = 1.0f;
     NellyMoserDecodeContext *s = avctx->priv_data;
 
+    if (avctx->sample_rate <= 0) {
+        av_log(avctx, AV_LOG_ERROR, "Sample rate %d is invalid\n", avctx->sample_rate);
+        return AVERROR(EINVAL);
+    }
+
     s->avctx = avctx;
     s->imdct_out = s->imdct_buf[0];
     s->imdct_prev = s->imdct_buf[1];
@@ -156,8 +161,8 @@ static int decode_tag(AVCodecContext *avctx, AVFrame *frame,
 
     blocks     = buf_size / NELLY_BLOCK_LEN;
 
-    if (blocks <= 0) {
-        av_log(avctx, AV_LOG_ERROR, "Packet is too small\n");
+    if (blocks <= 0 || blocks > INT_MAX / NELLY_SAMPLES) {
+        av_log(avctx, AV_LOG_ERROR, "Packet is too small or too large\n");
         return AVERROR_INVALIDDATA;
     }
 

@@ -19,12 +19,12 @@
 #include "libavutil/common.h"
 #include "libavutil/opt.h"
 
-#include "bsf.h"
-#include "bsf_internal.h"
-#include "cbs.h"
-#include "cbs_bsf.h"
-#include "cbs_lcevc.h"
-#include "lcevc.h"
+#include "libavcodec/bsf.h"
+#include "libavcodec/bsf_internal.h"
+#include "libavcodec/cbs.h"
+#include "libavcodec/cbs_bsf.h"
+#include "libavcodec/cbs_lcevc.h"
+#include "libavcodec/lcevc.h"
 
 typedef struct LCEVCMetadataContext {
     CBSBSFContext common;
@@ -51,11 +51,12 @@ static int lcevc_metadata_handle_vui(AVBSFContext *bsf,
     LCEVCRawProcessBlock *block = NULL;
     LCEVCRawAdditionalInfo *ai = &ctx->ai;
     LCEVCRawVUI *vui = &ai->vui;
+    CodedBitstreamUnit *unit;
     int position, err;
 
     position = ff_cbs_lcevc_find_process_block(ctx->common.output, au,
                                                LCEVC_PAYLOAD_TYPE_GLOBAL_CONFIG,
-                                               &block);
+                                               &unit, &block);
     if (position < 0)
         return 0;
 
@@ -97,10 +98,10 @@ static int lcevc_metadata_handle_vui(AVBSFContext *bsf,
     if (ctx->chroma_sample_loc_type >= 0) {
         vui->chroma_loc_info_present_flag = 1;
         vui->chroma_sample_loc_type_top_field = ctx->chroma_sample_loc_type;
-        vui->chroma_sample_loc_type_top_field = ctx->chroma_sample_loc_type;
+        vui->chroma_sample_loc_type_bottom_field = ctx->chroma_sample_loc_type;
     }
 
-    err = ff_cbs_lcevc_add_process_block(ctx->common.output, au, position,
+    err = ff_cbs_lcevc_add_process_block(ctx->common.output, unit, position + 1,
                                          LCEVC_PAYLOAD_TYPE_ADDITIONAL_INFO,
                                          ai, NULL);
     if (err < 0)

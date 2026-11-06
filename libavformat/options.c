@@ -26,6 +26,7 @@
 #include "libavcodec/avcodec.h"
 #include "libavcodec/codec_par.h"
 
+#include "libavutil/attributes.h"
 #include "libavutil/avassert.h"
 #include "libavutil/iamf.h"
 #include "libavutil/internal.h"
@@ -152,7 +153,8 @@ static int io_open_default(AVFormatContext *s, AVIOContext **pb,
 
     av_log(s, loglevel, "Opening \'%s\' for %s\n", url, flags & AVIO_FLAG_WRITE ? "writing" : "reading");
 
-    return ffio_open_whitelist(pb, url, flags, &s->interrupt_callback, options, s->protocol_whitelist, s->protocol_blacklist);
+    return ffio_open_whitelist2(pb, url, flags, &s->interrupt_callback, options,
+                                s->protocol_whitelist, s->protocol_blacklist, s);
 }
 
 static int io_close2_default(AVFormatContext *s, AVIOContext *pb)
@@ -315,9 +317,6 @@ AVStream *avformat_new_stream(AVFormatContext *s, const AVCodec *c)
         sti->pts_buffer[i] = AV_NOPTS_VALUE;
 
     st->sample_aspect_ratio = (AVRational) { 0, 1 };
-#if FF_API_INTERNAL_TIMING
-    sti->transferred_mux_tb = (AVRational) { 0, 1 };;
-#endif
 
     sti->need_context_update = 1;
 
@@ -349,20 +348,44 @@ static const AVClass tile_grid_class = {
     .option     = tile_grid_options,
 };
 
-#define OFFSET(x) offsetof(AVStreamGroupLCEVC, x)
-static const AVOption lcevc_options[] = {
-    { "lcevc_index", "Index of the LCEVC stream within the group", OFFSET(lcevc_index),
-        AV_OPT_TYPE_INT, { .i64 = 0 }, 0, INT_MAX, FLAGS },
-    { "video_size", "size of video after LCEVC enhancement has been applied", OFFSET(width),
-        AV_OPT_TYPE_IMAGE_SIZE, { .str = NULL }, 0, INT_MAX, FLAGS },
+#define OFFSET(x) offsetof(AVStreamGroupTREF, x)
+static const AVOption tref_options[] = {
+    { "metadata_index", "Index of the data stream within the group", OFFSET(metadata_index),
+        AV_OPT_TYPE_UINT, { .i64 = 0 }, 0, UINT_MAX, FLAGS },
     { NULL },
 };
 #undef OFFSET
 
-static const AVClass lcevc_class = {
-    .class_name = "AVStreamGroupLCEVC",
+static const AVClass tref_class = {
+    .class_name = "AVStreamGroupTREF",
     .version    = LIBAVUTIL_VERSION_INT,
-    .option     = lcevc_options,
+    .option     = tref_options,
+};
+
+#if FF_API_LCEVC_STRUCT
+FF_DISABLE_DEPRECATION_WARNINGS
+#endif
+#define OFFSET(x) offsetof(AVStreamGroupLayeredVideo, x)
+static const AVOption layered_video_options[] = {
+#if FF_API_LCEVC_STRUCT
+    { "lcevc_index", "Index of the LCEVC stream within the group", OFFSET(lcevc_index),
+        AV_OPT_TYPE_INT, { .i64 = 0 }, 0, INT_MAX, FLAGS | AV_OPT_FLAG_DEPRECATED },
+#endif
+    { "el_index", "Index of the enhancement layer stream within the group", OFFSET(el_index),
+        AV_OPT_TYPE_INT, { .i64 = 0 }, 0, INT_MAX, FLAGS },
+    { "video_size", "size of the final layered video presentation", OFFSET(width),
+        AV_OPT_TYPE_IMAGE_SIZE, { .str = NULL }, 0, INT_MAX, FLAGS },
+    { NULL },
+};
+#if FF_API_LCEVC_STRUCT
+FF_ENABLE_DEPRECATION_WARNINGS
+#endif
+#undef OFFSET
+
+static const AVClass layered_video_class = {
+    .class_name = "AVStreamGroupLayeredVideo",
+    .version    = LIBAVUTIL_VERSION_INT,
+    .option     = layered_video_options,
 };
 
 static void *stream_group_child_next(void *obj, void *prev)
@@ -376,8 +399,13 @@ static void *stream_group_child_next(void *obj, void *prev)
             return stg->params.iamf_mix_presentation;
         case AV_STREAM_GROUP_PARAMS_TILE_GRID:
             return stg->params.tile_grid;
+        case AV_STREAM_GROUP_PARAMS_TREF:
+            return stg->params.tref;
         case AV_STREAM_GROUP_PARAMS_LCEVC:
-            return stg->params.lcevc;
+        case AV_STREAM_GROUP_PARAMS_DOLBY_VISION:
+        case AV_STREAM_GROUP_PARAMS_GAIN_MAP:
+        case AV_STREAM_GROUP_PARAMS_ALPHA:
+            return stg->params.layered_video;
         default:
             break;
         }
@@ -395,7 +423,7 @@ static const AVClass *stream_group_child_iterate(void **opaque)
     switch(i) {
     case AV_STREAM_GROUP_PARAMS_NONE:
         i++;
-    // fall-through
+        av_fallthrough;
     case AV_STREAM_GROUP_PARAMS_IAMF_AUDIO_ELEMENT:
         ret = av_iamf_audio_element_get_class();
         break;
@@ -405,8 +433,14 @@ static const AVClass *stream_group_child_iterate(void **opaque)
     case AV_STREAM_GROUP_PARAMS_TILE_GRID:
         ret = &tile_grid_class;
         break;
+    case AV_STREAM_GROUP_PARAMS_TREF:
+        ret = &tref_class;
+        break;
     case AV_STREAM_GROUP_PARAMS_LCEVC:
-        ret = &lcevc_class;
+    case AV_STREAM_GROUP_PARAMS_DOLBY_VISION:
+    case AV_STREAM_GROUP_PARAMS_GAIN_MAP:
+    case AV_STREAM_GROUP_PARAMS_ALPHA:
+        ret = &layered_video_class;
         break;
     default:
         break;
@@ -458,7 +492,6 @@ AVStreamGroup *avformat_stream_group_create(AVFormatContext *s,
 
     stg->av_class = &stream_group_class;
     av_opt_set_defaults(stg);
-    stg->type = type;
     switch (type) {
     case AV_STREAM_GROUP_PARAMS_IAMF_AUDIO_ELEMENT:
         stg->params.iamf_audio_element = av_iamf_audio_element_alloc();
@@ -477,16 +510,27 @@ AVStreamGroup *avformat_stream_group_create(AVFormatContext *s,
         stg->params.tile_grid->av_class = &tile_grid_class;
         av_opt_set_defaults(stg->params.tile_grid);
         break;
-    case AV_STREAM_GROUP_PARAMS_LCEVC:
-        stg->params.lcevc = av_mallocz(sizeof(*stg->params.lcevc));
-        if (!stg->params.lcevc)
+    case AV_STREAM_GROUP_PARAMS_TREF:
+        stg->params.tref = av_mallocz(sizeof(*stg->params.tref));
+        if (!stg->params.tref)
             goto fail;
-        stg->params.lcevc->av_class = &lcevc_class;
-        av_opt_set_defaults(stg->params.lcevc);
+        stg->params.tref->av_class = &tref_class;
+        av_opt_set_defaults(stg->params.tref);
+        break;
+    case AV_STREAM_GROUP_PARAMS_LCEVC:
+    case AV_STREAM_GROUP_PARAMS_DOLBY_VISION:
+    case AV_STREAM_GROUP_PARAMS_GAIN_MAP:
+    case AV_STREAM_GROUP_PARAMS_ALPHA:
+        stg->params.layered_video = av_mallocz(sizeof(*stg->params.layered_video));
+        if (!stg->params.layered_video)
+            goto fail;
+        stg->params.layered_video->av_class = &layered_video_class;
+        av_opt_set_defaults(stg->params.layered_video);
         break;
     default:
         goto fail;
     }
+    stg->type = type;
 
     if (options) {
         if (av_opt_set_dict2(stg, options, AV_OPT_SEARCH_CHILDREN))
@@ -506,13 +550,38 @@ fail:
 
 static int stream_group_add_stream(AVStreamGroup *stg, AVStream *st)
 {
+#if FF_API_STREAM_GROUP_ENTRIES
+FF_DISABLE_DEPRECATION_WARNINGS
     AVStream **streams = av_realloc_array(stg->streams, stg->nb_streams + 1,
                                           sizeof(*stg->streams));
     if (!streams)
         return AVERROR(ENOMEM);
 
     stg->streams = streams;
-    stg->streams[stg->nb_streams++] = st;
+FF_ENABLE_DEPRECATION_WARNINGS
+#endif
+
+    AVStreamGroupEntry **entries = av_realloc_array(stg->entries, stg->nb_entries + 1,
+                                                    sizeof(*stg->entries));
+    if (!entries)
+        return AVERROR(ENOMEM);
+
+    stg->entries = entries;
+    stg->entries[stg->nb_entries] = av_mallocz(sizeof(*stg->entries[stg->nb_entries]));
+    if (!stg->entries[stg->nb_entries])
+        return AVERROR(ENOMEM);
+
+    stg->entries[stg->nb_entries]->type = AV_STREAM_GROUP_ENTRY_STREAM;
+    stg->entries[stg->nb_entries++]->stream = st;
+
+#if FF_API_STREAM_GROUP_ENTRIES
+FF_DISABLE_DEPRECATION_WARNINGS
+    if (stg->nb_streams == (stg->nb_entries - 1))
+        stg->streams[stg->nb_streams++] = st;
+    else
+        stg->nb_streams = 0;
+FF_ENABLE_DEPRECATION_WARNINGS
+#endif
 
     return 0;
 }
@@ -525,11 +594,57 @@ int avformat_stream_group_add_stream(AVStreamGroup *stg, AVStream *st)
     if (stgi->fmtctx != sti->fmtctx)
         return AVERROR(EINVAL);
 
-    for (int i = 0; i < stg->nb_streams; i++)
-        if (stg->streams[i]->index == st->index)
+    for (int i = 0; i < stg->nb_entries; i++) {
+        const AVStreamGroupEntry *entry = stg->entries[i];
+        if (entry->type != AV_STREAM_GROUP_ENTRY_STREAM)
+            continue;
+        if (entry->stream->index == st->index)
             return AVERROR(EEXIST);
+    }
 
     return stream_group_add_stream(stg, st);
+}
+
+static int stream_group_add_stream_group(AVStreamGroup *stg, AVStreamGroup *group)
+{
+    AVStreamGroupEntry **entries = av_realloc_array(stg->entries, stg->nb_entries + 1,
+                                                    sizeof(*stg->entries));
+    if (!entries)
+        return AVERROR(ENOMEM);
+
+    stg->entries = entries;
+    stg->entries[stg->nb_entries] = av_mallocz(sizeof(*stg->entries[stg->nb_entries]));
+    if (!stg->entries[stg->nb_entries])
+        return AVERROR(ENOMEM);
+
+    stg->entries[stg->nb_entries]->type = AV_STREAM_GROUP_ENTRY_STREAM_GROUP;
+    stg->entries[stg->nb_entries++]->stream_group = group;
+#if FF_API_STREAM_GROUP_ENTRIES
+FF_DISABLE_DEPRECATION_WARNINGS
+    stg->nb_streams = 0;
+FF_ENABLE_DEPRECATION_WARNINGS
+#endif
+
+    return 0;
+}
+
+int avformat_stream_group_add_stream_group(AVStreamGroup *stg, AVStreamGroup *group)
+{
+    const FFStreamGroup *stgi = cffstreamgroup(stg);
+    const FFStreamGroup *groupi = cffstreamgroup(group);
+
+    if (stgi->fmtctx != groupi->fmtctx)
+        return AVERROR(EINVAL);
+
+    for (int i = 0; i < stg->nb_entries; i++) {
+        const AVStreamGroupEntry *entry = stg->entries[i];
+        if (entry->type != AV_STREAM_GROUP_ENTRY_STREAM_GROUP)
+            continue;
+        if (entry->stream_group->index == group->index)
+            return AVERROR(EEXIST);
+    }
+
+    return stream_group_add_stream_group(stg, group);
 }
 
 static int option_is_disposition(const AVOption *opt)

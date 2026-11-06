@@ -131,7 +131,7 @@ static void xor_block(void *p1, void *p2, unsigned size, int key, unsigned *key_
     size >>= 2;
 
     while (size > 0) {
-        *d2 = *d1 ^ (HAVE_BIGENDIAN ? av_bswap32(k) : k);
+        AV_WN32(d2, AV_RN32(d1) ^ (HAVE_BIGENDIAN ? av_bswap32(k) : k));
         k += key;
         d1++;
         d2++;
@@ -440,7 +440,6 @@ static int track_index(VividasDemuxContext *viv, AVFormatContext *s,
 {
     int64_t off;
     int64_t poff;
-    int maxnp=0;
     FFIOContext pb0;
     AVIOContext *const pb = &pb0.pub;
     int i;
@@ -478,25 +477,18 @@ static int track_index(VividasDemuxContext *viv, AVFormatContext *s,
 
         off += viv->sb_blocks[i].size;
         poff += viv->sb_blocks[i].n_packets;
-
-        if (maxnp < viv->sb_blocks[i].n_packets)
-            maxnp = viv->sb_blocks[i].n_packets;
     }
 
     if (filesize > 0 && poff > filesize)
         return AVERROR_INVALIDDATA;
 
-    viv->sb_entries = av_calloc(maxnp, sizeof(VIV_SB_entry));
-    if (!viv->sb_entries)
-        return AVERROR(ENOMEM);
-
     return 0;
 }
 
-static void load_sb_block(AVFormatContext *s, VividasDemuxContext *viv, unsigned expected_size)
+static int load_sb_block(AVFormatContext *s, VividasDemuxContext *viv, unsigned expected_size)
 {
     uint32_t size = 0;
-    int i;
+    int i, ret;
     AVIOContext *pb = 0;
 
     if (viv->sb_pb) {
@@ -509,12 +501,12 @@ static void load_sb_block(AVFormatContext *s, VividasDemuxContext *viv, unsigned
 
     viv->sb_buf = read_sb_block(s->pb, &size, &viv->sb_key, expected_size);
     if (!viv->sb_buf) {
-        return;
+        return AVERROR_INVALIDDATA;
     }
 
     pb = avio_alloc_context(viv->sb_buf, size, 0, NULL, NULL, NULL, NULL);
     if (!pb)
-        return;
+        return AVERROR(ENOMEM);
 
     viv->sb_pb = pb;
 
@@ -526,6 +518,18 @@ static void load_sb_block(AVFormatContext *s, VividasDemuxContext *viv, unsigned
 
     viv->n_sb_entries = viv->sb_blocks[viv->current_sb].n_packets;
 
+    // Each entry takes at least two bytes of the block.
+    if (viv->n_sb_entries > size / 2) {
+        viv->n_sb_entries = 0;
+        return 0;
+    }
+    ret = av_reallocp_array(&viv->sb_entries, viv->n_sb_entries,
+                           sizeof(*viv->sb_entries));
+    if (ret < 0) {
+        viv->n_sb_entries = 0;
+        return ret;
+    }
+
     for (i = 0; i < viv->n_sb_entries; i++) {
         viv->sb_entries[i].size = ffio_read_varlen(pb);
         viv->sb_entries[i].flag = avio_r8(pb);
@@ -535,6 +539,8 @@ static void load_sb_block(AVFormatContext *s, VividasDemuxContext *viv, unsigned
     avio_r8(pb);
 
     viv->current_sb_entry = 0;
+
+    return 0;
 }
 
 static int viv_read_header(AVFormatContext *s)
@@ -589,7 +595,9 @@ static int viv_read_header(AVFormatContext *s)
         block_type = avio_r8(pb);
 
         if (block_type == 22) {
-            avio_read(pb, keybuffer, 187);
+            ret = ffio_read_size(pb, keybuffer, 187);
+            if (ret < 0)
+                return ret;
             b22_key = decode_key(keybuffer);
             b22_size = avio_rl32(pb);
         }
@@ -626,7 +634,9 @@ static int viv_read_header(AVFormatContext *s)
     viv->sb_offset = avio_tell(pb);
     if (viv->n_sb_blocks > 0) {
         viv->current_sb = 0;
-        load_sb_block(s, viv, viv->sb_blocks[0].size);
+        ret = load_sb_block(s, viv, viv->sb_blocks[0].size);
+        if (ret < 0)
+            return ret;
     } else {
         viv->current_sb = -1;
     }
@@ -673,7 +683,9 @@ static int viv_read_packet(AVFormatContext *s,
             return AVERROR_INVALIDDATA;
         viv->current_sb++;
 
-        load_sb_block(s, viv, 0);
+        ret = load_sb_block(s, viv, 0);
+        if (ret < 0)
+            return ret;
         viv->current_sb_entry = 0;
     }
 
@@ -764,6 +776,7 @@ static int viv_read_seek(AVFormatContext *s, int stream_index, int64_t timestamp
 {
     VividasDemuxContext *viv = s->priv_data;
     int64_t frame;
+    int ret;
 
     if (stream_index == 0)
         frame = timestamp;
@@ -776,7 +789,9 @@ static int viv_read_seek(AVFormatContext *s, int stream_index, int64_t timestamp
             // seek to ith sb block
             avio_seek(s->pb, viv->sb_offset + viv->sb_blocks[i].byte_offset, SEEK_SET);
             // load the block
-            load_sb_block(s, viv, 0);
+            ret = load_sb_block(s, viv, 0);
+            if (ret < 0)
+                return ret;
             if (viv->num_audio) {
                 const AVCodecParameters *par = s->streams[1]->codecpar;
                 // flush audio packet queue

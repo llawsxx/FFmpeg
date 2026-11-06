@@ -110,8 +110,8 @@ static int name##_##nbits(AVFilterContext *ctx, void *arg, int jobnr, int nb_job
     const int height = td->height;                                                                    \
     const int sc_offset = jobnr * 2 * steps_y;                                                        \
     const int sr_offset = jobnr * (MAX_MATRIX_SIZE - 1);                                              \
-    const int slice_start = (height * jobnr) / nb_jobs;                                               \
-    const int slice_end = (height * (jobnr+1)) / nb_jobs;                                             \
+    const int slice_start = ff_slice_pos(height, jobnr, nb_jobs);                                     \
+    const int slice_end = ff_slice_pos(height, jobnr + 1, nb_jobs);                                   \
                                                                                                       \
     int32_t res;                                                                                      \
     int x, y, z;                                                                                      \
@@ -157,9 +157,9 @@ static int name##_##nbits(AVFilterContext *ctx, void *arg, int jobnr, int nb_job
                 const uint##nbits##_t *srx = src - steps_y * src_stride + x - steps_x;                \
                 uint##nbits##_t *dsx       = dst - steps_y * dst_stride + x - steps_x;                \
                                                                                                       \
-                res = (int32_t)*srx + ((((int32_t) * srx -                                            \
-                      (int32_t)((tmp1 + halfscale) >> scalebits)) * amount) >> (8+nbits));            \
-                *dsx = av_clip_uint##nbits(res);                                                      \
+                res = (int32_t)*srx + (int32_t)(((int64_t)((int32_t)*srx -                            \
+                      (int32_t)((tmp1 + halfscale) >> scalebits)) * amount) >> 16);                   \
+                *dsx = av_clip_uintp2(res, s->bitdepth);                                              \
             }                                                                                         \
         }                                                                                             \
         if (y >= 0) {                                                                                 \
@@ -310,7 +310,7 @@ static int config_input(AVFilterLink *inlink)
     if (ret < 0)
         return ret;
 
-    return 0;
+    return init_filter_param(inlink->dst, &s->alpha, "alpha", inlink->w);
 }
 
 static void free_filter_param(UnsharpFilterParam *fp, int nb_threads)
@@ -331,6 +331,7 @@ static av_cold void uninit(AVFilterContext *ctx)
 
     free_filter_param(&s->luma, s->nb_threads);
     free_filter_param(&s->chroma, s->nb_threads);
+    free_filter_param(&s->alpha, s->nb_threads);
 }
 
 static int filter_frame(AVFilterLink *link, AVFrame *in)

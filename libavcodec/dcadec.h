@@ -72,6 +72,7 @@ typedef struct DCAContext {
     int     core_only;              ///< Core only decoding flag
     int     output_channel_order;
     AVChannelLayout downmix_layout;
+    int     x_bed_only;             ///< Keep a DTS:X 7.1 bed as coded, without its heights
 } DCAContext;
 
 int ff_dca_set_channel_layout(AVCodecContext *avctx, int *ch_remap, int dca_mask);
@@ -80,6 +81,9 @@ void ff_dca_downmix_to_stereo_fixed(DCADSPContext *dcadsp, int32_t **samples,
                                     int *coeff_l, int nsamples, int ch_mask);
 void ff_dca_downmix_to_stereo_float(AVFloatDSPContext *fdsp, float **samples,
                                     int *coeff_l, int nsamples, int ch_mask);
+int ff_dca_export_downmix_matrix(AVCodecContext *avctx, AVFrame *frame,
+                                 enum DCADownMixType downmix_type,
+                                 int output_mask, const int *coeff_l);
 
 static inline int ff_dca_check_crc(AVCodecContext *avctx, GetBitContext *s,
                                    int p1, int p2)

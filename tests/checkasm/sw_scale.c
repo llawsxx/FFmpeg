@@ -113,20 +113,32 @@ static void check_yuv2yuv1(int accurate)
     int osi, isi;
     int dstW, offset;
     size_t fail_offset;
-    const int input_sizes[] = {8, 24, 128, 144, 256, 512};
-    #define LARGEST_INPUT_SIZE 512
+    /* Add short widths that split across the SIMD vector tail paths, so that
+     * a single residual vector iteration is exercised on every platform;
+     * such residuals can underflow/overflow the destination buffer. */
+    enum {
+        LARGEST_INPUT_SIZE = 512,
+        /* Leading guard before dst: wide enough to catch a whole-vector
+         * underflow, i.e. the widest single write a current yuv2plane1 may
+         * make while tail-looping. That is the LoongArch LASX 256-bit (32B)
+         * store; LSX, NEON and x86 sse2/avx all write 16B or less. */
+        DEST_GUARD         = 32,
+        DEST_SIZE          = LARGEST_INPUT_SIZE + 2 * DEST_GUARD,
+    };
+    const int input_sizes[] = {5, 8, 9, 15, 17, 24, 128, 144, 256, 512};
 
     const int offsets[] = {0, 3, 8, 11, 16, 19};
     const int OFFSET_SIZES = sizeof(offsets)/sizeof(offsets[0]);
     const char *accurate_str = (accurate) ? "accurate" : "approximate";
+    uint8_t *dst_ref, *dst_new;
 
     declare_func(void,
                  const int16_t *src, uint8_t *dest,
                  int dstW, const uint8_t *dither, int offset);
 
     LOCAL_ALIGNED_16(int16_t, src_pixels, [LARGEST_INPUT_SIZE]);
-    LOCAL_ALIGNED_16(uint8_t, dst0, [LARGEST_INPUT_SIZE]);
-    LOCAL_ALIGNED_16(uint8_t, dst1, [LARGEST_INPUT_SIZE]);
+    LOCAL_ALIGNED_16(uint8_t, dst0, [DEST_SIZE]);
+    LOCAL_ALIGNED_16(uint8_t, dst1, [DEST_SIZE]);
     LOCAL_ALIGNED_8(uint8_t, dither, [8]);
 
     randomize_buffers((uint8_t*)dither, 8);
@@ -144,23 +156,46 @@ static void check_yuv2yuv1(int accurate)
         for (osi = 0; osi < OFFSET_SIZES; osi++) {
             offset = offsets[osi];
             if (check_func(c->yuv2plane1, "yuv2yuv1_%d_%d_%s", offset, dstW, accurate_str)){
-                memset(dst0, 0, LARGEST_INPUT_SIZE * sizeof(dst0[0]));
-                memset(dst1, 0, LARGEST_INPUT_SIZE * sizeof(dst1[0]));
+                /* dst0 and dst1 start bit-identical so that any write outside
+                 * of the dstW output window shows up as a guard mismatch. */
+                randomize_buffers(dst0, DEST_SIZE);
+                memcpy(dst1, dst0, DEST_SIZE);
+                dst_ref = dst0 + DEST_GUARD;
+                dst_new = dst1 + DEST_GUARD;
 
-                call_ref(src_pixels, dst0, dstW, dither, offset);
-                call_new(src_pixels, dst1, dstW, dither, offset);
-                if (cmp_off_by_n_8(dst0, dst1, dstW * sizeof(dst0[0]), accurate ? 0 : 2)) {
+                call_ref(src_pixels, dst_ref, dstW, dither, offset);
+                call_new(src_pixels, dst_new, dstW, dither, offset);
+
+                if (cmp_off_by_n_8(dst_ref, dst_new, dstW, accurate ? 0 : 2)) {
                     fail();
                     printf("failed: yuv2yuv1_%d_%di_%s\n", offset, dstW, accurate_str);
-                    fail_offset = show_differences_8(dst0, dst1, LARGEST_INPUT_SIZE * sizeof(dst0[0]));
+                    fail_offset = show_differences_8(dst_ref, dst_new, dstW);
                     printf("failing values: src: 0x%04x dither: 0x%02x dst-c: %02x dst-asm: %02x\n",
                             (int) src_pixels[fail_offset],
-                            (int) dither[(fail_offset + fail_offset) & 7],
-                            (int) dst0[fail_offset],
-                            (int) dst1[fail_offset]);
+                            (int) dither[(fail_offset + offset) & 7],
+                            (int) dst_ref[fail_offset],
+                            (int) dst_new[fail_offset]);
                 }
+
+                /* The guard regions on either side of the output window must
+                 * remain identical between the reference and the tested
+                 * implementation from the project-wide 16-byte alignment above
+                 * dstW, the longest whole-vector write any current yuv2plane1
+                 * may make: x86 sse2/avx store a 16-byte XMM per iteration
+                 * and do not round down the tail, so the legal output window
+                 * is dstW rounded up to 16, while LoongArch lsx/lasx write
+                 * exactly dstW bytes. */
+                const int guard_off = (dstW + 15) & ~15;
+                if (memcmp(dst0, dst1, DEST_GUARD) ||
+                    memcmp(dst_ref + guard_off, dst_new + guard_off,
+                           DEST_SIZE - DEST_GUARD - guard_off)) {
+                    fail();
+                    printf("failed: yuv2yuv1_%d_%d_%s wrote outside destination\n",
+                           offset, dstW, accurate_str);
+                }
+
                 if (dstW == LARGEST_INPUT_SIZE)
-                    bench_new(src_pixels, dst1, dstW, dither, offset);
+                    bench_new(src_pixels, dst_new, dstW, dither, offset);
             }
         }
     }
@@ -181,9 +216,9 @@ static void check_yuv2yuvX(int accurate, int bit_depth, int dst_pix_format)
     static const int input_sizes[] = {8, 24, 128, 144, 256, 512};
     const char *accurate_str = (accurate) ? "accurate" : "approximate";
 
-    declare_func_emms(AV_CPU_FLAG_MMX, void, const int16_t *filter,
-                      int filterSize, const int16_t **src, uint8_t *dest,
-                      int dstW, const uint8_t *dither, int offset);
+    declare_func(void, const int16_t *filter,
+                       int filterSize, const int16_t **src, uint8_t *dest,
+                       int dstW, const uint8_t *dither, int offset);
 
     const int16_t **src;
     LOCAL_ALIGNED_16(int16_t, src_pixels, [LARGEST_FILTER * LARGEST_INPUT_SIZE]);
@@ -289,10 +324,10 @@ static void check_yuv2nv12cX(int accurate)
     static const int input_sizes[] = {8, 24, 128, 144, 256, 512};
     const char *accurate_str = (accurate) ? "accurate" : "approximate";
 
-    declare_func_emms(AV_CPU_FLAG_MMX, void, enum AVPixelFormat dstFormat,
-                      const uint8_t *chrDither, const int16_t *chrFilter,
-                      int chrFilterSize, const int16_t **chrUSrc,
-                      const int16_t **chrVSrc, uint8_t *dest, int dstW);
+    declare_func(void, enum AVPixelFormat dstFormat,
+                       const uint8_t *chrDither, const int16_t *chrFilter,
+                       int chrFilterSize, const int16_t **chrUSrc,
+                       const int16_t **chrVSrc, uint8_t *dest, int dstW);
 
     const int16_t *srcU[LARGEST_FILTER], *srcV[LARGEST_FILTER];
     LOCAL_ALIGNED_16(int16_t, srcU_pixels, [LARGEST_FILTER * LARGEST_INPUT_SIZE]);
@@ -457,10 +492,130 @@ static void check_hscale(void)
     sws_freeContext(sws);
 }
 
+/* Fast-bilinear horizontal scaling (SWS_FAST_BILINEAR, c->hyscale_fast /
+ * c->hcscale_fast): the optimized implementation must be bit-exact with
+ * the C reference. Catches e.g. swapped gather-position/weight tables in
+ * the LoongArch LSX implementation, which no FATE frame test covers.
+ *
+ * Only enabled on LoongArch: other archs' fast-bilinear implementations
+ * are not guaranteed bit-exact with the C reference (e.g. x86 MMXEXT uses
+ * complementary weights), so a cross-arch comparison would fail there. */
+#if ARCH_LOONGARCH64
+static void check_hyscale_fast(void)
+{
+#define HSCALE_FAST_SRC_SIZE 4096
+    static const int dstW_list[] = { 8, 16, 63, 100, 255, 256, 300, 511, 512, 1024 };
+    static const int xInc_list[] = { 32768, 65536, 83886, 98304, 131072, 200000, 262143, 262144 };
+    LOCAL_ALIGNED_32(uint8_t, src, [HSCALE_FAST_SRC_SIZE + 32]);
+    LOCAL_ALIGNED_32(int16_t, dst0, [2048]);
+    LOCAL_ALIGNED_32(int16_t, dst1, [2048]);
+    SwsContext *sws;
+    SwsInternal *c;
+    int i, j;
+
+    declare_func(void, SwsInternal *c, int16_t *dst, int dstWidth,
+                 const uint8_t *src, int srcW, int xInc);
+
+    sws = sws_alloc_context();
+    if (!sws || sws_init_context(sws, NULL, NULL) < 0)
+        fail();
+
+    c = sws_internal(sws);
+    c->srcBpc = 8;
+    c->dstBpc = 8;
+    c->opts.flags  = SWS_FAST_BILINEAR;
+    c->lumXInc = c->chrXInc = 83886;
+    ff_sws_init_scale(c);
+
+    if (check_func(c->hyscale_fast, "hyscale_fast")) {
+        for (i = 0; i < FF_ARRAY_ELEMS(dstW_list); i++) {
+            for (j = 0; j < FF_ARRAY_ELEMS(xInc_list); j++) {
+                int dstW = dstW_list[i];
+                int xInc = xInc_list[j];
+                int srcW = FFMIN(HSCALE_FAST_SRC_SIZE,
+                                 (dstW * xInc) >> 16);
+
+                randomize_buffers(src, srcW + 16);
+                memset(dst0, 0, dstW * sizeof(dst0[0]));
+                memset(dst1, 0, dstW * sizeof(dst1[0]));
+
+                call_ref(NULL, dst0, dstW, src, srcW, xInc);
+                call_new(NULL, dst1, dstW, src, srcW, xInc);
+                if (memcmp(dst0, dst1, dstW * sizeof(dst0[0])))
+                    fail();
+            }
+        }
+        bench_new(NULL, dst1, 300, src, 512, 83886);
+    }
+    sws_freeContext(sws);
+}
+
+static void check_hcscale_fast(void)
+{
+#define HCSCALE_FAST_SRC_SIZE 4096
+    static const int dstW_list[] = { 8, 16, 63, 100, 255, 256, 300, 511, 512, 1024 };
+    static const int xInc_list[] = { 32768, 65536, 83886, 98304, 131072, 200000, 262143, 262144 };
+    LOCAL_ALIGNED_32(uint8_t, src1, [HCSCALE_FAST_SRC_SIZE + 32]);
+    LOCAL_ALIGNED_32(uint8_t, src2, [HCSCALE_FAST_SRC_SIZE + 32]);
+    LOCAL_ALIGNED_32(int16_t, dst0, [2048]);
+    LOCAL_ALIGNED_32(int16_t, dst1, [2048]);
+    LOCAL_ALIGNED_32(int16_t, dst2, [2048]);
+    LOCAL_ALIGNED_32(int16_t, dst3, [2048]);
+    SwsContext *sws;
+    SwsInternal *c;
+    int i, j;
+
+    declare_func(void, SwsInternal *c, int16_t *dst1, int16_t *dst2, int dstWidth,
+                 const uint8_t *src1, const uint8_t *src2, int srcW, int xInc);
+
+    sws = sws_alloc_context();
+    if (!sws || sws_init_context(sws, NULL, NULL) < 0)
+        fail();
+
+    c = sws_internal(sws);
+    c->srcBpc = 8;
+    c->dstBpc = 8;
+    c->opts.flags  = SWS_FAST_BILINEAR;
+    c->lumXInc = c->chrXInc = 83886;
+    ff_sws_init_scale(c);
+
+    if (check_func(c->hcscale_fast, "hcscale_fast")) {
+        for (i = 0; i < FF_ARRAY_ELEMS(dstW_list); i++) {
+            for (j = 0; j < FF_ARRAY_ELEMS(xInc_list); j++) {
+                int dstW = dstW_list[i];
+                int xInc = xInc_list[j];
+                int srcW = FFMIN(HCSCALE_FAST_SRC_SIZE,
+                                 (dstW * xInc) >> 16);
+
+                randomize_buffers(src1, srcW + 16);
+                randomize_buffers(src2, srcW + 16);
+                memset(dst0, 0, dstW * sizeof(dst0[0]));
+                memset(dst1, 0, dstW * sizeof(dst1[0]));
+                memset(dst2, 0, dstW * sizeof(dst2[0]));
+                memset(dst3, 0, dstW * sizeof(dst3[0]));
+
+                call_ref(NULL, dst0, dst2, dstW, src1, src2, srcW, xInc);
+                call_new(NULL, dst1, dst3, dstW, src1, src2, srcW, xInc);
+                if (memcmp(dst0, dst1, dstW * sizeof(dst0[0])) ||
+                    memcmp(dst2, dst3, dstW * sizeof(dst2[0])))
+                    fail();
+            }
+        }
+        bench_new(NULL, dst1, dst2, 300, src1, src2, 512, 83886);
+    }
+    sws_freeContext(sws);
+}
+#endif /* ARCH_LOONGARCH64 */
+
 void checkasm_check_sw_scale(void)
 {
     check_hscale();
     report("hscale");
+#if ARCH_LOONGARCH64
+    check_hyscale_fast();
+    check_hcscale_fast();
+    report("hscale_fast");
+#endif
     check_yuv2yuv1(0);
     check_yuv2yuv1(1);
     report("yuv2yuv1");

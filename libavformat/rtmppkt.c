@@ -20,12 +20,15 @@
  */
 
 #include "libavcodec/bytestream.h"
+#include "libavutil/attributes.h"
 #include "libavutil/intfloat.h"
 #include "libavutil/mem.h"
 
 #include "rtmppkt.h"
 #include "flv.h"
 #include "url.h"
+
+#define MAX_DEPTH 16      ///< arbitrary limit to prevent unbounded recursion
 
 void ff_amf_write_bool(uint8_t **dst, int val)
 {
@@ -311,7 +314,8 @@ int ff_rtmp_packet_write(URLContext *h, RTMPPacket *pkt,
                          int chunk_size, RTMPPacket **prev_pkt_ptr,
                          int *nb_prev_pkt)
 {
-    uint8_t pkt_hdr[16], *p = pkt_hdr;
+    uint8_t pkt_hdr[18], *p = pkt_hdr;
+    int basic_hdr_size;
     int mode = RTMP_PS_TWELVEBYTES;
     int off = 0;
     int written = 0;
@@ -360,6 +364,7 @@ int ff_rtmp_packet_write(URLContext *h, RTMPPacket *pkt,
         bytestream_put_byte(&p, 1               | (mode << 6));
         bytestream_put_le16(&p, pkt->channel_id - 64);
     }
+    basic_hdr_size = p - pkt_hdr;
     if (mode != RTMP_PS_ONEBYTE) {
         bytestream_put_be24(&p, pkt->ts_field);
         if (mode != RTMP_PS_FOURBYTES) {
@@ -388,16 +393,16 @@ int ff_rtmp_packet_write(URLContext *h, RTMPPacket *pkt,
     if ((ret = ffurl_write(h, pkt_hdr, p - pkt_hdr)) < 0)
         return ret;
     written = p - pkt_hdr + pkt->size;
+    pkt_hdr[0] |= RTMP_PS_ONEBYTE << 6;
     while (off < pkt->size) {
         int towrite = FFMIN(chunk_size, pkt->size - off);
         if ((ret = ffurl_write(h, pkt->data + off, towrite)) < 0)
             return ret;
         off += towrite;
         if (off < pkt->size) {
-            uint8_t marker = 0xC0 | pkt->channel_id;
-            if ((ret = ffurl_write(h, &marker, 1)) < 0)
+            if ((ret = ffurl_write(h, pkt_hdr, basic_hdr_size)) < 0)
                 return ret;
-            written++;
+            written += basic_hdr_size;
             if (pkt->ts_field == 0xFFFFFF) {
                 uint8_t ts_header[4];
                 AV_WB32(ts_header, timestamp);
@@ -436,13 +441,18 @@ void ff_rtmp_packet_destroy(RTMPPacket *pkt)
     pkt->size = 0;
 }
 
-static int amf_tag_skip(GetByteContext *gb)
+static int amf_tag_skip(GetByteContext *gb, int depth)
 {
     AMFDataType type;
     unsigned nb   = -1;
 
     if (bytestream2_get_bytes_left(gb) < 1)
         return -1;
+
+    if (depth > MAX_DEPTH) {
+        av_log(NULL, AV_LOG_ERROR, "amf_tag_skip: exceeded max depth\n");
+        return AVERROR_PATCHWELCOME;
+    }
 
     type = bytestream2_get_byte(gb);
     switch (type) {
@@ -466,6 +476,7 @@ static int amf_tag_skip(GetByteContext *gb)
     case AMF_DATA_TYPE_ARRAY:
     case AMF_DATA_TYPE_MIXEDARRAY:
         nb = bytestream2_get_be32(gb);
+        av_fallthrough;
     case AMF_DATA_TYPE_OBJECT:
         while (type != AMF_DATA_TYPE_ARRAY || nb-- > 0) {
             int t;
@@ -479,7 +490,7 @@ static int amf_tag_skip(GetByteContext *gb)
                     return -1;
                 bytestream2_skip(gb, size);
             }
-            t = amf_tag_skip(gb);
+            t = amf_tag_skip(gb, depth + 1);
             if (t < 0 || bytestream2_get_bytes_left(gb) <= 0)
                 return -1;
         }
@@ -499,7 +510,7 @@ int ff_amf_tag_size(const uint8_t *data, const uint8_t *data_end)
 
     bytestream2_init(&gb, data, data_end - data);
 
-    ret = amf_tag_skip(&gb);
+    ret = amf_tag_skip(&gb, 0);
     if (ret < 0 || bytestream2_get_bytes_left(&gb) <= 0)
         return -1;
     av_assert0(bytestream2_tell(&gb) >= 0 && bytestream2_tell(&gb) <= data_end - data);
@@ -513,7 +524,7 @@ static int amf_get_field_value2(GetByteContext *gb,
     int len;
 
     while (bytestream2_peek_byte(gb) != AMF_DATA_TYPE_OBJECT && bytestream2_get_bytes_left(gb) > 0) {
-        int ret = amf_tag_skip(gb);
+        int ret = amf_tag_skip(gb, 0);
         if (ret < 0)
             return -1;
     }
@@ -542,7 +553,7 @@ static int amf_get_field_value2(GetByteContext *gb,
                     return -1;
                 if (dst_size < len + 1)
                     len = dst_size - 1;
-                bytestream2_get_buffer(gb, dst, len);
+                len = bytestream2_get_buffer(gb, dst, len);
                 dst[len] = 0;
                 break;
             default:
@@ -550,7 +561,7 @@ static int amf_get_field_value2(GetByteContext *gb,
             }
             return 0;
         }
-        len = amf_tag_skip(gb);
+        len = amf_tag_skip(gb, 0);
         if (len < 0 || bytestream2_get_bytes_left(gb) <= 0)
             return -1;
     }
@@ -593,12 +604,17 @@ static const char* rtmp_packet_type(int type)
 }
 
 static void amf_tag_contents(void *ctx, const uint8_t *data,
-                             const uint8_t *data_end)
+                             const uint8_t *data_end, int depth)
 {
     unsigned int size, nb = -1;
     char buf[1024];
     AMFDataType type;
     int parse_key = 1;
+
+    if (depth > MAX_DEPTH) {
+        av_log(NULL, AV_LOG_ERROR, "amf_tag_contents: exceeded max depth\n");
+        return;
+    }
 
     if (data >= data_end)
         return;
@@ -626,8 +642,10 @@ static void amf_tag_contents(void *ctx, const uint8_t *data,
         return;
     case AMF_DATA_TYPE_ARRAY:
         parse_key = 0;
+        av_fallthrough;
     case AMF_DATA_TYPE_MIXEDARRAY:
         nb = bytestream_get_be32(&data);
+        av_fallthrough;
     case AMF_DATA_TYPE_OBJECT:
         av_log(ctx, AV_LOG_DEBUG, " {\n");
         while (nb-- > 0 || type != AMF_DATA_TYPE_ARRAY) {
@@ -647,7 +665,7 @@ static void amf_tag_contents(void *ctx, const uint8_t *data,
                 data += size;
                 av_log(ctx, AV_LOG_DEBUG, "  %s: ", buf);
             }
-            amf_tag_contents(ctx, data, data_end);
+            amf_tag_contents(ctx, data, data_end, depth + 1);
             t = ff_amf_tag_size(data, data_end);
             if (t < 0 || t >= data_end - data)
                 return;
@@ -670,7 +688,7 @@ void ff_rtmp_packet_dump(void *ctx, RTMPPacket *p)
         uint8_t *src = p->data, *src_end = p->data + p->size;
         while (src < src_end) {
             int sz;
-            amf_tag_contents(ctx, src, src_end);
+            amf_tag_contents(ctx, src, src_end, 0);
             sz = ff_amf_tag_size(src, src_end);
             if (sz < 0)
                 break;

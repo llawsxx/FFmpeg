@@ -27,6 +27,8 @@
 
 #include <stdint.h>
 
+#include "libavutil/framepool.h"
+
 #include "avfilter.h"
 #include "filters.h"
 #include "framequeue.h"
@@ -34,12 +36,20 @@
 typedef struct FilterLinkInternal {
     FilterLink l;
 
-    struct FFFramePool *frame_pool;
+    /**
+     * Pool of frames used for allocations.
+     */
+    FFFramePool frame_pool;
 
     /**
      * Queue of frames waiting to be filtered.
      */
     FFFrameQueue fifo;
+
+    /**
+     * Format and size of the video frames the link was configured with.
+     */
+    int cfg_format, cfg_w, cfg_h;
 
     /**
      * If set, the source filter can not generate a frame as is.
@@ -144,7 +154,9 @@ typedef struct FFFilterGraph {
 
     void *thread;
     avfilter_execute_func *thread_execute;
-    FFFrameQueueGlobal frame_queues;
+    FFFrameQueueGlobal frame_queues[AVMEDIA_TYPE_NB];
+    /* set by avfilter_graph_set_max_buffered_frames() */
+    uint8_t max_queued_set[AVMEDIA_TYPE_NB];
 } FFFilterGraph;
 
 static inline FFFilterGraph *fffiltergraph(AVFilterGraph *graph)

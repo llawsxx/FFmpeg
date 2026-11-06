@@ -51,7 +51,7 @@ static int vdpau_mpeg_start_frame(AVCodecContext *avctx,
         ref = ff_vdpau_get_surface_id(s->next_pic.ptr->f);
         assert(ref != VDP_INVALID_HANDLE);
         info->backward_reference = ref;
-        /* fall through to forward prediction */
+        av_fallthrough;
     case AV_PICTURE_TYPE_P:
         ref = ff_vdpau_get_surface_id(s->last_pic.ptr->f);
         info->forward_reference  = ref;
@@ -116,6 +116,7 @@ const FFHWAccel ff_mpeg1_vdpau_hwaccel = {
     .end_frame      = ff_vdpau_mpeg_end_frame,
     .decode_slice   = vdpau_mpeg_decode_slice,
     .frame_priv_data_size = sizeof(struct vdpau_picture_context),
+    .free_frame_priv = ff_vdpau_free_frame_priv,
     .init           = vdpau_mpeg1_init,
     .uninit         = ff_vdpau_common_uninit,
     .priv_data_size = sizeof(VDPAUContext),
@@ -151,6 +152,7 @@ const FFHWAccel ff_mpeg2_vdpau_hwaccel = {
     .end_frame      = ff_vdpau_mpeg_end_frame,
     .decode_slice   = vdpau_mpeg_decode_slice,
     .frame_priv_data_size = sizeof(struct vdpau_picture_context),
+    .free_frame_priv = ff_vdpau_free_frame_priv,
     .init           = vdpau_mpeg2_init,
     .uninit         = ff_vdpau_common_uninit,
     .frame_params   = ff_vdpau_common_frame_params,

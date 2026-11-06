@@ -30,8 +30,11 @@
 
 #include "libavutil/opt.h"
 #include "avcodec.h"
+#include "avcodec_internal.h"
+#include "packet_internal.h"
 #include "version_major.h"
 
+#define FFOFFSET(x) offsetof(FFCodecContext,x)
 #define OFFSET(x) offsetof(AVCodecContext,x)
 #define DEFAULT 0 //should be NAN but it does not work as it is not a constant in glibc as required by ANSI/ISO C
 //these names are too long to be readable
@@ -43,6 +46,9 @@
 #define CC AV_OPT_FLAG_CHILD_CONSTS
 
 #define AR AV_OPT_TYPE_FLAG_ARRAY
+
+#define SIDE_DATA_PKT_CONST(pkt_type, handle) \
+    { handle, .default_val.i64 = AV_PKT_DATA_ ## pkt_type, .type = AV_OPT_TYPE_CONST, .flags = V|A|S|D, .unit = "side_data_pkt" },
 
 #define AV_CODEC_DEFAULT_BITRATE 200*1000
 
@@ -85,6 +91,7 @@ static const AVOption avcodec_options[] = {
 {"skip_manual", "do not skip samples and export skip information as frame side data", 0, AV_OPT_TYPE_CONST, {.i64 = AV_CODEC_FLAG2_SKIP_MANUAL}, INT_MIN, INT_MAX, A|D, .unit = "flags2"},
 {"ass_ro_flush_noop", "do not reset ASS ReadOrder field on flush", 0, AV_OPT_TYPE_CONST, {.i64 = AV_CODEC_FLAG2_RO_FLUSH_NOOP}, INT_MIN, INT_MAX, S|D, .unit = "flags2"},
 {"icc_profiles", "generate/parse embedded ICC profiles from/to colorimetry tags", 0, AV_OPT_TYPE_CONST, {.i64 = AV_CODEC_FLAG2_ICC_PROFILES}, INT_MIN, INT_MAX, S|D, .unit = "flags2"},
+{"fixed_frame_size", "Force a fixed frame size", 0, AV_OPT_TYPE_CONST, {.i64 = AV_CODEC_FLAG2_FIXED_FRAME_SIZE}, INT_MIN, INT_MAX, A|E, .unit = "flags2"},
 {"export_side_data", "Export metadata as side data", OFFSET(export_side_data), AV_OPT_TYPE_FLAGS, {.i64 = DEFAULT}, 0, UINT_MAX, A|V|S|D|E, .unit = "export_side_data"},
 {"mvs", "export motion vectors through frame side data", 0, AV_OPT_TYPE_CONST, {.i64 = AV_CODEC_EXPORT_DATA_MVS}, INT_MIN, INT_MAX, V|D, .unit = "export_side_data"},
 {"prft", "export Producer Reference Time through packet side data", 0, AV_OPT_TYPE_CONST, {.i64 = AV_CODEC_EXPORT_DATA_PRFT}, INT_MIN, INT_MAX, A|V|S|E, .unit = "export_side_data"},
@@ -124,6 +131,7 @@ static const AVOption avcodec_options[] = {
 {"ms", "work around various bugs in Microsoft's broken decoders", 0, AV_OPT_TYPE_CONST, {.i64 = FF_BUG_MS }, INT_MIN, INT_MAX, V|D, .unit = "bug"},
 {"trunc", "truncated frames", 0, AV_OPT_TYPE_CONST, {.i64 = FF_BUG_TRUNCATED}, INT_MIN, INT_MAX, V|D, .unit = "bug"},
 {"iedge", NULL, 0, AV_OPT_TYPE_CONST, {.i64 = FF_BUG_IEDGE }, INT_MIN, INT_MAX, V|D, .unit = "bug"},
+{"h264_dp_nnz", "H.264 nC derivation for partitioned slices (autodetected)", 0, AV_OPT_TYPE_CONST, {.i64 = FF_BUG_H264_DP_NNZ }, INT_MIN, INT_MAX, V|D, .unit = "bug"},
 {"strict", "how strictly to follow the standards", OFFSET(strict_std_compliance), AV_OPT_TYPE_INT, {.i64 = DEFAULT }, INT_MIN, INT_MAX, A|V|D|E, .unit = "strict"},
 {"very", "strictly conform to a older more strict version of the spec or reference software", 0, AV_OPT_TYPE_CONST, {.i64 = FF_COMPLIANCE_VERY_STRICT }, INT_MIN, INT_MAX, A|V|D|E, .unit = "strict"},
 {"strict", "strictly conform to all the things in the spec no matter what the consequences", 0, AV_OPT_TYPE_CONST, {.i64 = FF_COMPLIANCE_STRICT }, INT_MIN, INT_MAX, A|V|D|E, .unit = "strict"},
@@ -142,7 +150,7 @@ static const AVOption avcodec_options[] = {
 {"aggressive", "consider things that a sane encoder should not do as an error", 0, AV_OPT_TYPE_CONST, {.i64 = AV_EF_AGGRESSIVE | AV_EF_COMPLIANT | AV_EF_CAREFUL}, INT_MIN, INT_MAX, A|V|S|D|E, .unit = "err_detect"},
 {"has_b_frames", NULL, OFFSET(has_b_frames), AV_OPT_TYPE_INT, {.i64 = DEFAULT }, 0, INT_MAX},
 {"block_align", NULL, OFFSET(block_align), AV_OPT_TYPE_INT, {.i64 = DEFAULT }, 0, INT_MAX},
-{"rc_override_count", NULL, OFFSET(rc_override_count), AV_OPT_TYPE_INT, {.i64 = DEFAULT }, INT_MIN, INT_MAX},
+{"rc_override_count", NULL, OFFSET(rc_override_count), AV_OPT_TYPE_INT, {.i64 = DEFAULT }, INT_MIN, INT_MAX, AV_OPT_FLAG_READONLY},
 {"maxrate", "maximum bitrate (in bits/s). Used for VBV together with bufsize.", OFFSET(rc_max_rate), AV_OPT_TYPE_INT64, {.i64 = DEFAULT }, 0, INT_MAX, V|A|E},
 {"minrate", "minimum bitrate (in bits/s). Most useful in setting up a CBR encode. It is of little use otherwise.",
             OFFSET(rc_min_rate), AV_OPT_TYPE_INT64, {.i64 = DEFAULT }, INT_MIN, INT_MAX, V|A|E},
@@ -157,6 +165,7 @@ static const AVOption avcodec_options[] = {
 {"altivec", NULL, 0, AV_OPT_TYPE_CONST, {.i64 = FF_DCT_ALTIVEC }, INT_MIN, INT_MAX, V|E, .unit = "dct"},
 {"faan", "floating point AAN DCT", 0, AV_OPT_TYPE_CONST, {.i64 = FF_DCT_FAAN }, INT_MIN, INT_MAX, V|E, .unit = "dct"},
 {"neon", NULL, 0, AV_OPT_TYPE_CONST, {.i64 = FF_DCT_NEON }, INT_MIN, INT_MAX, V|E, .unit = "dct"},
+{ "rvv", NULL, 0, AV_OPT_TYPE_CONST, { .i64 = FF_DCT_RVV }, INT_MIN, INT_MAX, V|E, .unit = "dct" },
 {"lumi_mask", "compresses bright areas stronger than medium ones", OFFSET(lumi_masking), AV_OPT_TYPE_FLOAT, {.dbl = 0 }, -FLT_MAX, FLT_MAX, V|E},
 {"tcplx_mask", "temporal complexity masking", OFFSET(temporal_cplx_masking), AV_OPT_TYPE_FLOAT, {.dbl = 0 }, -FLT_MAX, FLT_MAX, V|E},
 {"scplx_mask", "spatial complexity masking", OFFSET(spatial_cplx_masking), AV_OPT_TYPE_FLOAT, {.dbl = 0 }, -FLT_MAX, FLT_MAX, V|E},
@@ -253,6 +262,7 @@ static const AVOption avcodec_options[] = {
 {"mblmax", "maximum macroblock Lagrange factor (VBR)", OFFSET(mb_lmax), AV_OPT_TYPE_INT, {.i64 = FF_QP2LAMBDA * 31 }, 1, FF_LAMBDA_MAX, V|E},
 {"skip_loop_filter", "skip loop filtering process for the selected frames", OFFSET(skip_loop_filter), AV_OPT_TYPE_INT, {.i64 = AVDISCARD_DEFAULT }, INT_MIN, INT_MAX, V|D, .unit = "avdiscard"},
 {"skip_idct"       , "skip IDCT/dequantization for the selected frames",    OFFSET(skip_idct),        AV_OPT_TYPE_INT, {.i64 = AVDISCARD_DEFAULT }, INT_MIN, INT_MAX, V|D, .unit = "avdiscard"},
+{"skip_pred"       , "skip prediction for the selected frames",             OFFSET(skip_pred),        AV_OPT_TYPE_INT, {.i64 = AVDISCARD_DEFAULT }, INT_MIN, INT_MAX, V|D, .unit = "avdiscard"},
 {"skip_frame"      , "skip decoding for the selected frames",               OFFSET(skip_frame),       AV_OPT_TYPE_INT, {.i64 = AVDISCARD_DEFAULT }, INT_MIN, INT_MAX, V|D, .unit = "avdiscard"},
 {"none"            , "discard no frame",                    0, AV_OPT_TYPE_CONST, {.i64 = AVDISCARD_NONE    }, INT_MIN, INT_MAX, V|D, .unit = "avdiscard"},
 {"default"         , "discard useless frames",              0, AV_OPT_TYPE_CONST, {.i64 = AVDISCARD_DEFAULT }, INT_MIN, INT_MAX, V|D, .unit = "avdiscard"},
@@ -291,7 +301,9 @@ static const AVOption avcodec_options[] = {
 {"bt709",        "BT.709",           0, AV_OPT_TYPE_CONST, {.i64 = AVCOL_TRC_BT709 },        INT_MIN, INT_MAX, V|E|D, .unit = "color_trc_type"},
 {"unknown",      "Unspecified",      0, AV_OPT_TYPE_CONST, {.i64 = AVCOL_TRC_UNSPECIFIED },  INT_MIN, INT_MAX, V|E|D, .unit = "color_trc_type"},
 {"gamma22",      "BT.470 M",         0, AV_OPT_TYPE_CONST, {.i64 = AVCOL_TRC_GAMMA22 },      INT_MIN, INT_MAX, V|E|D, .unit = "color_trc_type"},
+{"bt470m",       "BT.470 M",         0, AV_OPT_TYPE_CONST, {.i64 = AVCOL_TRC_GAMMA22 },      INT_MIN, INT_MAX, V|E|D, .unit = "color_trc_type"},
 {"gamma28",      "BT.470 BG",        0, AV_OPT_TYPE_CONST, {.i64 = AVCOL_TRC_GAMMA28 },      INT_MIN, INT_MAX, V|E|D, .unit = "color_trc_type"},
+{"bt470bg",      "BT.470 BG",        0, AV_OPT_TYPE_CONST, {.i64 = AVCOL_TRC_GAMMA28 },      INT_MIN, INT_MAX, V|E|D, .unit = "color_trc_type"},
 {"smpte170m",    "SMPTE 170 M",      0, AV_OPT_TYPE_CONST, {.i64 = AVCOL_TRC_SMPTE170M },    INT_MIN, INT_MAX, V|E|D, .unit = "color_trc_type"},
 {"smpte240m",    "SMPTE 240 M",      0, AV_OPT_TYPE_CONST, {.i64 = AVCOL_TRC_SMPTE240M },    INT_MIN, INT_MAX, V|E|D, .unit = "color_trc_type"},
 {"linear",       "Linear",           0, AV_OPT_TYPE_CONST, {.i64 = AVCOL_TRC_LINEAR },       INT_MIN, INT_MAX, V|E|D, .unit = "color_trc_type"},
@@ -405,15 +417,10 @@ static const AVOption avcodec_options[] = {
 {"discard_damaged_percentage", "Percentage of damaged samples to discard a frame", OFFSET(discard_damaged_percentage), AV_OPT_TYPE_INT, {.i64 = 95 }, 0, 100, V|D },
 {"side_data_prefer_packet", "Comma-separated list of side data types for which user-supplied (container) data is preferred over coded bytestream",
     OFFSET(side_data_prefer_packet), AV_OPT_TYPE_INT | AR, .min = -1, .max = INT_MAX, .flags = V|A|S|D, .unit = "side_data_pkt" },
-    {"replaygain",                  .default_val.i64 = AV_PKT_DATA_REPLAYGAIN,                  .type = AV_OPT_TYPE_CONST, .flags = A|D, .unit = "side_data_pkt" },
-    {"displaymatrix",               .default_val.i64 = AV_PKT_DATA_DISPLAYMATRIX,               .type = AV_OPT_TYPE_CONST, .flags = A|D, .unit = "side_data_pkt" },
-    {"spherical",                   .default_val.i64 = AV_PKT_DATA_SPHERICAL,                   .type = AV_OPT_TYPE_CONST, .flags = A|D, .unit = "side_data_pkt" },
-    {"stereo3d",                    .default_val.i64 = AV_PKT_DATA_STEREO3D,                    .type = AV_OPT_TYPE_CONST, .flags = A|D, .unit = "side_data_pkt" },
-    {"audio_service_type",          .default_val.i64 = AV_PKT_DATA_AUDIO_SERVICE_TYPE,          .type = AV_OPT_TYPE_CONST, .flags = A|D, .unit = "side_data_pkt" },
-    {"mastering_display_metadata",  .default_val.i64 = AV_PKT_DATA_MASTERING_DISPLAY_METADATA,  .type = AV_OPT_TYPE_CONST, .flags = A|D, .unit = "side_data_pkt" },
-    {"content_light_level",         .default_val.i64 = AV_PKT_DATA_CONTENT_LIGHT_LEVEL,         .type = AV_OPT_TYPE_CONST, .flags = A|D, .unit = "side_data_pkt" },
-    {"icc_profile",                 .default_val.i64 = AV_PKT_DATA_ICC_PROFILE,                 .type = AV_OPT_TYPE_CONST, .flags = A|D, .unit = "side_data_pkt" },
-    {"exif",                        .default_val.i64 = AV_PKT_DATA_EXIF,                        .type = AV_OPT_TYPE_CONST, .flags = A|D, .unit = "side_data_pkt" },
+    FF_PACKET_SIDE_DATA_HANDLES(SIDE_DATA_PKT_CONST)
+
+// FFCodecContext options
+{"lcevc-dec-params", "Configure liblcevc-dec using a :-separated list of key=value parameters", FFOFFSET(lcevc_params), AV_OPT_TYPE_DICT, { 0 }, 0, 0, V|D },
 {NULL},
 };
 
@@ -422,8 +429,10 @@ static const AVOption avcodec_options[] = {
 #undef S
 #undef E
 #undef D
+#undef SIDE_DATA_PKT_CONST
 #undef CC
 #undef DEFAULT
 #undef OFFSET
+#undef FFOFFSET
 
 #endif /* AVCODEC_OPTIONS_TABLE_H */

@@ -135,6 +135,7 @@ static av_cold int adpcm_encode_init(AVCodecContext *avctx)
            have to buffer the samples :-( */
         avctx->block_align = s->block_size;
         avctx->bits_per_coded_sample = 4;
+        avctx->bit_rate = avctx->block_align * 8LL * avctx->sample_rate / avctx->frame_size;
         ) /* End of CASE */
     CASE(ADPCM_IMA_QT,
         avctx->frame_size  = 64;
@@ -147,6 +148,7 @@ static av_cold int adpcm_encode_init(AVCodecContext *avctx)
         avctx->frame_size = (s->block_size - 7 * channels) * 2 / channels + 2;
         avctx->bits_per_coded_sample = 4;
         avctx->block_align     = s->block_size;
+        avctx->bit_rate = avctx->block_align * 8LL * avctx->sample_rate / avctx->frame_size;
         if (!(avctx->extradata = av_malloc(32 + AV_INPUT_BUFFER_PADDING_SIZE)))
             return AVERROR(ENOMEM);
         avctx->extradata_size = 32;
@@ -780,9 +782,9 @@ static int adpcm_encode_frame(AVCodecContext *avctx, AVPacket *avpkt,
             if (!buf)
                 return AVERROR(ENOMEM);
             if (channels == 1) {
-                adpcm_compress_trellis(avctx, samples, buf, &c->status[0], n,
+                adpcm_compress_trellis(avctx, samples, buf, &c->status[0], 2 * n,
                                        channels);
-                for (int i = 0; i < n; i += 2)
+                for (int i = 0; i < 2 * n; i += 2)
                     *dst++ = (buf[i] << 4) | buf[i + 1];
             } else {
                 adpcm_compress_trellis(avctx, samples,     buf,

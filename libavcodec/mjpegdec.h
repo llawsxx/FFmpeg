@@ -29,6 +29,7 @@
 #ifndef AVCODEC_MJPEGDEC_H
 #define AVCODEC_MJPEGDEC_H
 
+#include "libavutil/gain_map.h"
 #include "libavutil/log.h"
 #include "libavutil/mem_internal.h"
 #include "libavutil/pixdesc.h"
@@ -117,6 +118,7 @@ typedef struct MJpegDecodeContext {
     AVFrame *picture; /* picture structure */
     AVFrame *picture_ptr; /* pointer to picture structure */
     int got_picture;                                ///< we found a SOF and picture is valid, too.
+    int nb_seq_component_scans;                     ///< component scans decoded since the SOF (sequential images: <= nb_components)
     int linesize[MAX_COMPONENTS];                   ///< linesize << interlaced
     DECLARE_ALIGNED(32, int16_t, block)[64];
     int16_t (*blocks[MAX_COMPONENTS])[64]; ///< intermediate sums (progressive mode)
@@ -139,6 +141,7 @@ typedef struct MJpegDecodeContext {
     int mjpb_skiptosod;
 
     int cur_scan; /* current scan, used by JPEG-LS */
+    int64_t total_ls_decoded_height; /* cumulative JPEG-LS rows decoded in the current packet */
     int flipped; /* true if picture is flipped */
 
     uint16_t (*ljpeg_buffer)[4];
@@ -150,6 +153,9 @@ typedef struct MJpegDecodeContext {
     AVExifMetadata exif_metadata;
 
     AVStereo3D *stereo3d; ///!< stereoscopic information (cached, since it is read before frame allocation)
+
+    AVGainMapParams *gain_map;
+    size_t gain_map_size;
 
     const AVPixFmtDescriptor *pix_desc;
 
@@ -215,8 +221,13 @@ static inline int ff_mjpeg_should_restart(MJpegDecodeContext *s)
 
 static inline int ff_mjpeg_handle_restart(MJpegDecodeContext *s, int *restart)
 {
+    int first = s->restart_count < 0;
     *restart = ff_mjpeg_should_restart(s);
     if (*restart) {
+        if (s->avctx->codec_id == AV_CODEC_ID_THP && !first) {
+            align_get_bits(&s->gb);
+            return 0;
+        }
         int ret = ff_mjpeg_unescape_sos(s);
         if (ret < 0)
             return ret;

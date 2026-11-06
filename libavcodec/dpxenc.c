@@ -19,6 +19,7 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include "libavutil/attributes.h"
 #include "libavutil/common.h"
 #include "libavutil/intreadwrite.h"
 #include "libavutil/imgutils.h"
@@ -67,8 +68,12 @@ static av_cold int encode_init(AVCodecContext *avctx)
         break;
     case AV_PIX_FMT_RGB48LE:
     case AV_PIX_FMT_RGB48BE:
-        if (avctx->bits_per_raw_sample)
-            s->bits_per_component = avctx->bits_per_raw_sample;
+        if (avctx->bits_per_raw_sample == 10) {
+            s->bits_per_component = 10;
+        } else if (avctx->bits_per_raw_sample && avctx->bits_per_raw_sample != 16) {
+            av_log(avctx, AV_LOG_ERROR, "Unsupported bit depth: %d\n", avctx->bits_per_raw_sample);
+            return AVERROR(EINVAL);
+        }
         break;
     }
 
@@ -226,6 +231,7 @@ static int encode_frame(AVCodecContext *avctx, AVPacket *pkt,
         break;
     default:
         av_log(avctx, AV_LOG_WARNING, "unsupported color transfer\n");
+        av_fallthrough;
     case AVCOL_TRC_UNSPECIFIED:
         color_trc = DPX_TRC_UNSPECIFIED_VIDEO;
         break;
@@ -247,6 +253,7 @@ static int encode_frame(AVCodecContext *avctx, AVPacket *pkt,
         break;
     default:
         av_log(avctx, AV_LOG_WARNING, "unsupported colorimetric specification\n");
+        av_fallthrough;
     case AVCOL_PRI_UNSPECIFIED:
         color_spec = DPX_COL_SPEC_UNSPECIFIED_VIDEO;
         break;

@@ -50,7 +50,7 @@
 static int adx_decode_header(AVCodecContext *avctx, const uint8_t *buf,
                              int bufsize, int *header_size, int *coeff)
 {
-    int offset, cutoff, channels;
+    int offset, cutoff, channels, sample_rate;
 
     if (bufsize < 24)
         return AVERROR_INVALIDDATA;
@@ -74,17 +74,17 @@ static int adx_decode_header(AVCodecContext *avctx, const uint8_t *buf,
     if (channels <= 0 || channels > MAX_CHANNELS)
         return AVERROR_INVALIDDATA;
 
+    /* sample rate */
+    sample_rate = AV_RB32(buf + 8);
+    if (sample_rate < 1 || sample_rate > INT_MAX / (channels * BLOCK_SIZE * 8))
+        return AVERROR_INVALIDDATA;
+
     if (avctx->ch_layout.nb_channels != channels) {
         av_channel_layout_uninit(&avctx->ch_layout);
         avctx->ch_layout.order = AV_CHANNEL_ORDER_UNSPEC;
         avctx->ch_layout.nb_channels = channels;
     }
-
-    /* sample rate */
-    avctx->sample_rate = AV_RB32(buf + 8);
-    if (avctx->sample_rate < 1 ||
-        avctx->sample_rate > INT_MAX / (channels * BLOCK_SIZE * 8))
-        return AVERROR_INVALIDDATA;
+    avctx->sample_rate = sample_rate;
 
     /* bit rate */
     avctx->bit_rate = avctx->sample_rate * channels * BLOCK_SIZE * 8 / BLOCK_SAMPLES;
@@ -173,6 +173,7 @@ static int adx_decode_frame(AVCodecContext *avctx, AVFrame *frame,
     new_extradata = av_packet_get_side_data(avpkt, AV_PKT_DATA_NEW_EXTRADATA,
                                             &new_extradata_size);
     if (new_extradata && new_extradata_size > 0) {
+        int old_channels = c->channels;
         int header_size;
         if ((ret = adx_decode_header(avctx, new_extradata,
                                      new_extradata_size, &header_size,
@@ -181,6 +182,10 @@ static int adx_decode_frame(AVCodecContext *avctx, AVFrame *frame,
             return AVERROR_INVALIDDATA;
         }
 
+        c->channels      = avctx->ch_layout.nb_channels;
+        c->header_parsed = 1;
+        if (old_channels != c->channels)
+            memset(c->prev, 0, sizeof(c->prev));
         c->eof = 0;
     }
 

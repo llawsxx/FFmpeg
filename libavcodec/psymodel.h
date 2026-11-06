@@ -94,6 +94,7 @@ typedef struct FFPsyContext {
     FFPsyChannelGroup *group;         ///< channel group information
     int num_groups;                   ///< number of channel groups
     int cutoff;                       ///< lowpass frequency cutoff for analysis
+    int unbounded_pe;                 ///< PE reduction at a fixed reference quality, not the rate (quality-target coder owns the rate)
 
     uint8_t **bands;                  ///< scalefactor band sizes for possible frame sizes
     int     *num_bands;               ///< number of scalefactor bands for possible frame sizes
@@ -106,6 +107,8 @@ typedef struct FFPsyContext {
     } bitres;
 
     void* model_priv_data;            ///< psychoacoustic model implementation private data
+    float   pair_joint[16];           ///< encoder-fed per-CPE joint-tool candidacy fraction EMA (bands M/S would adopt or I/S renders; ~0 = joint tools dead); 0 = unseeded
+    uint8_t pair_decoupled[16];       ///< Schmitt state over pair_joint: 1 = joint tools dead on this pair, joint windowing/M-S coupling suspended
 } FFPsyContext;
 
 /**
@@ -127,6 +130,17 @@ typedef struct FFPsyModel {
      * @return suggested window information in a structure
      */
     FFPsyWindowInfo (*window)(FFPsyContext *ctx, const float *audio, const float *la, int channel, int prev_type);
+
+    /**
+     * Suggest window sequences for both channels of a CPE with block switching
+     * synchronized across the pair (either channel's attack switches both), so
+     * common_window and the joint stereo tools stay available. Optional; when
+     * NULL the encoder decides each channel independently via window().
+     */
+    void (*window_pair)(FFPsyContext *ctx, const float *audio0, const float *la0,
+                        const float *audio1, const float *la1,
+                        int channel0, int channel1,
+                        int prev_type0, int prev_type1, FFPsyWindowInfo wi[2]);
 
     /**
      * Perform psychoacoustic analysis and set band info (threshold, energy) for a group of channels.
@@ -151,12 +165,13 @@ typedef struct FFPsyModel {
  * @param num_bands  number of scalefactor bands for all frame lengths
  * @param num_groups number of channel groups
  * @param group_map  array with # of channels in group - 1, for each group
+ * @param cutoff     analysis bandwidth in Hz, 0 to derive it from avctx
  *
  * @return zero if successful, a negative value if not
  */
 int ff_psy_init(FFPsyContext *ctx, AVCodecContext *avctx, int num_lens,
                 const uint8_t **bands, const int *num_bands,
-                int num_groups, const uint8_t *group_map);
+                int num_groups, const uint8_t *group_map, int cutoff);
 
 /**
  * Determine what group a channel belongs to.

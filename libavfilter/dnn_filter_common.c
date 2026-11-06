@@ -16,10 +16,13 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include "config.h"
 #include "dnn_filter_common.h"
 #include "libavutil/avstring.h"
 #include "libavutil/mem.h"
 #include "libavutil/opt.h"
+#include "libavutil/hwcontext.h"
+#include "libavutil/pixdesc.h"
 
 #define MAX_SUPPORTED_OUTPUTS_NB 4
 
@@ -31,12 +34,15 @@ static char **separate_output_names(const char *expr, const char *val_sep, int *
         return NULL;
     }
 
-    parsed_vals = av_calloc(MAX_SUPPORTED_OUTPUTS_NB, sizeof(*parsed_vals));
+    parsed_vals = av_calloc(MAX_SUPPORTED_OUTPUTS_NB + 1, sizeof(*parsed_vals));
     if (!parsed_vals) {
         return NULL;
     }
 
     do {
+        if (val_num >= MAX_SUPPORTED_OUTPUTS_NB) {
+            goto err;
+        }
         val = av_get_token(&expr, val_sep);
         if(val) {
             parsed_vals[val_num] = val;
@@ -51,6 +57,12 @@ static char **separate_output_names(const char *expr, const char *val_sep, int *
     *separated_nb = val_num;
 
     return parsed_vals;
+
+err:
+    for (int i = 0; i < val_num; i++)
+        av_free(parsed_vals[i]);
+    av_freep(&parsed_vals);
+    return NULL;
 }
 
 typedef struct DnnFilterBase {
@@ -96,6 +108,16 @@ int ff_dnn_init(DnnContext *ctx, DNNFunctionType func_type, AVFilterContext *fil
         if (!ctx->model_outputnames) {
             av_log(filter_ctx, AV_LOG_ERROR, "could not parse model output names\n");
             return AVERROR(EINVAL);
+        }
+    } else if (backend == DNN_ONNX) {
+        /* ONNX: input and output tensor names are optional.
+         * Multiple output names may be specified separated by '&'. */
+        if (ctx->model_outputnames_string) {
+            ctx->model_outputnames = separate_output_names(ctx->model_outputnames_string, "&", &ctx->nb_outputs);
+            if (!ctx->model_outputnames) {
+                av_log(filter_ctx, AV_LOG_ERROR, "could not parse model output names\n");
+                return AVERROR(EINVAL);
+            }
         }
     }
 
@@ -168,6 +190,17 @@ int ff_dnn_get_output(DnnContext *ctx, int input_width, int input_height, int *o
                                   (const char *)output_name, output_width, output_height);
 }
 
+int ff_dnn_set_hw_frames_ctx(DnnContext *ctx, AVBufferRef *hw_frames_ctx)
+{
+    av_buffer_unref(&ctx->hw_frames_ctx);
+    if (hw_frames_ctx) {
+        ctx->hw_frames_ctx = av_buffer_ref(hw_frames_ctx);
+        if (!ctx->hw_frames_ctx)
+            return AVERROR(ENOMEM);
+    }
+    return 0;
+}
+
 int ff_dnn_execute_model(DnnContext *ctx, AVFrame *in_frame, AVFrame *out_frame)
 {
     DNNExecBaseParams exec_params = {
@@ -210,10 +243,102 @@ void ff_dnn_uninit(DnnContext *ctx)
     if (ctx->dnn_module) {
         (ctx->dnn_module->free_model)(&ctx->model);
     }
+    for (void *child = NULL; (child = ff_dnn_child_next(ctx, child));)
+        av_opt_free(child);
     if (ctx->model_outputnames) {
         for (int i = 0; i < ctx->nb_outputs; i++)
             av_free(ctx->model_outputnames[i]);
 
         av_freep(&ctx->model_outputnames);
     }
+    av_buffer_unref(&ctx->hw_frames_ctx);
 }
+
+#if CONFIG_CUDA
+int ff_dnn_zero_copy_supported_cuda(DnnContext *ctx, const AVFilterLink *inlink)
+{
+    AVBufferRef *hw_frames_ref = avfilter_link_get_hw_frames_ctx((AVFilterLink *)inlink);
+    AVHWFramesContext *hw_frames_ctx;
+
+    if (!hw_frames_ref)
+        return 0;
+
+    hw_frames_ctx = (AVHWFramesContext *)hw_frames_ref->data;
+
+    if (inlink->format == AV_PIX_FMT_CUDA) {
+        if (ctx->batch_size > 1) {
+            av_log(inlink->dst, AV_LOG_ERROR, "CUDA zero-copy currently does not support batching.\n");
+            av_buffer_unref(&hw_frames_ref);
+            return AVERROR(EINVAL);
+        }
+
+        if (ctx->backend_type == DNN_TH) {
+            switch (hw_frames_ctx->sw_format) {
+            case AV_PIX_FMT_RGB24:
+            case AV_PIX_FMT_BGR24:
+            case AV_PIX_FMT_RGB0:
+            case AV_PIX_FMT_0RGB:
+            case AV_PIX_FMT_BGR0:
+            case AV_PIX_FMT_0BGR:
+                break;
+            default:
+                av_log(inlink->dst, AV_LOG_ERROR,
+                       "Zero-copy CUDA path currently only supports RGB24/BGR24 or RGB0/BGR0 variants.\n");
+                av_buffer_unref(&hw_frames_ref);
+                return AVERROR(EINVAL);
+            }
+        }
+    }
+
+    av_buffer_unref(&hw_frames_ref);
+    return 0;
+}
+#endif
+
+#if CONFIG_DNN_ONNX_D3D12
+int ff_dnn_zero_copy_supported_d3d12(DnnContext *ctx, const AVFilterLink *inlink)
+{
+    AVBufferRef *hw_frames_ref;
+    AVHWFramesContext *hw_frames_ctx;
+
+    if (ctx->backend_type != DNN_ONNX) {
+        av_log(inlink->dst, AV_LOG_ERROR,
+               "D3D12 zero-copy requires the ONNX Runtime backend (dnn_backend=onnx).\n");
+        return AVERROR(EINVAL);
+    }
+
+    if (ctx->batch_size > 1) {
+        av_log(inlink->dst, AV_LOG_ERROR, "D3D12 zero-copy currently does not support batching.\n");
+        return AVERROR(EINVAL);
+    }
+
+    hw_frames_ref = avfilter_link_get_hw_frames_ctx((AVFilterLink *)inlink);
+    if (!hw_frames_ref) {
+        av_log(inlink->dst, AV_LOG_ERROR, "D3D12 input has no hw_frames_ctx.\n");
+        return AVERROR(EINVAL);
+    }
+    hw_frames_ctx = (AVHWFramesContext *)hw_frames_ref->data;
+
+    if (hw_frames_ctx->sw_format != AV_PIX_FMT_NV12) {
+        av_log(inlink->dst, AV_LOG_ERROR,
+               "D3D12 zero-copy currently only supports NV12 hardware frames, got %s.\n",
+               av_get_pix_fmt_name(hw_frames_ctx->sw_format));
+        av_buffer_unref(&hw_frames_ref);
+        return AVERROR(EINVAL);
+    }
+
+    av_buffer_unref(&hw_frames_ref);
+
+    if (!ctx->zero_copy_negotiated) {
+        av_log(inlink->dst, AV_LOG_ERROR,
+               "D3D12 zero-copy was not negotiated by the ONNX Runtime backend. "
+               "Check that device=dml is set, that this build's ONNX Runtime "
+               "provides a working DirectML execution provider, and that "
+               "DirectML.dll and d3dcompiler_47.dll are available in the "
+               "application directory or System32.\n");
+        return AVERROR(ENOSYS);
+    }
+
+    return 0;
+}
+#endif

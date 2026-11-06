@@ -24,23 +24,34 @@
 #include "libavutil/mem_internal.h"
 #include "libavutil/refstruct.h"
 
-#include "libswscale/ops.h"
-#include "libswscale/ops_internal.h"
+#include "libswscale/filters.h"
+#include "libswscale/ops_dispatch.h"
+#include "libswscale/uops.h"
+#include "libswscale/uops_macros.h"
 
 #include "checkasm.h"
 
 enum {
+    MAX_UOPS    = 3, /* read, op, write */
     NB_PLANES   = 4,
     PIXELS      = 64,
-    LINES       = 2,
+    LINES       = 16,
 };
 
-enum {
-    U8  = SWS_PIXEL_U8,
-    U16 = SWS_PIXEL_U16,
-    U32 = SWS_PIXEL_U32,
-    F32 = SWS_PIXEL_F32,
-};
+typedef struct Test {
+    const char  *name;
+    SwsUOp       uops[MAX_UOPS];
+    int          num_uops;
+
+    /* Extra metadata for the test harness */
+    SwsPixelType type_in;           /* data format to fill */
+    SwsPixelType type_out;          /* data format to compare */
+    SwsCompMask  planes_in;         /* planes to fill */
+    SwsCompMask  planes_out;        /* planes to compare */
+    int          pixel_bits_in;     /* read pixel stride */
+    int          pixel_bits_out;    /* write pixel stride */
+    unsigned     ranges[NB_PLANES]; /* pixel range to fill */
+} Test;
 
 #define FMT(fmt, ...) tprintf((char[256]) {0}, 256, fmt, __VA_ARGS__)
 static const char *tprintf(char buf[], size_t size, const char *fmt, ...)
@@ -52,15 +63,6 @@ static const char *tprintf(char buf[], size_t size, const char *fmt, ...)
     return buf;
 }
 
-static int rw_pixel_bits(const SwsOp *op)
-{
-    const int elems = op->rw.packed ? op->rw.elems : 1;
-    const int size  = ff_sws_pixel_type_size(op->type);
-    const int bits  = 8 >> op->rw.frac;
-    av_assert1(bits >= 1);
-    return elems * size * bits;
-}
-
 static float rndf(void)
 {
     union { uint32_t u; float f; } x;
@@ -68,6 +70,28 @@ static float rndf(void)
         x.u = rnd();
     } while (!isnormal(x.f));
     return x.f;
+}
+
+static SwsPixel constpx(SwsPixelType type, int val)
+{
+    switch (type) {
+    case SWS_PIXEL_U8:  return (SwsPixel) { .u8  = val };
+    case SWS_PIXEL_U16: return (SwsPixel) { .u16 = val };
+    case SWS_PIXEL_U32: return (SwsPixel) { .u32 = val };
+    case SWS_PIXEL_F32: return (SwsPixel) { .f32 = val };
+    default: return (SwsPixel) {0};
+    }
+}
+
+static SwsPixel rndpx(SwsPixelType type)
+{
+    switch (type) {
+    case SWS_PIXEL_U8:  return (SwsPixel) { .u8  = rnd() & 0xFF };
+    case SWS_PIXEL_U16: return (SwsPixel) { .u16 = rnd() & 0xFFFF };
+    case SWS_PIXEL_U32: return (SwsPixel) { .u32 = rnd()  };
+    case SWS_PIXEL_F32: return (SwsPixel) { .f32 = rndf() };
+    default: return (SwsPixel) {0};
+    }
 }
 
 static void fill32f(float *line, int num, unsigned range)
@@ -103,671 +127,596 @@ static void fill8(uint8_t *line, int num, unsigned range)
     }
 }
 
-static void check_ops(const char *report, const unsigned ranges[NB_PLANES],
-                      const SwsOp *ops)
+static SwsPixelType pixel_type_to_int(const SwsPixelType type)
 {
-    SwsContext *ctx = sws_alloc_context();
-    SwsCompiledOp comp_ref = {0}, comp_new = {0};
-    const SwsOpBackend *backend_new = NULL;
-    SwsOpList oplist = { .ops = (SwsOp *) ops };
-    const SwsOp *read_op, *write_op;
-    static const unsigned def_ranges[4] = {0};
-    if (!ranges)
-        ranges = def_ranges;
+    switch (ff_sws_pixel_type_size(type)) {
+    case 1: return SWS_PIXEL_U8;
+    case 2: return SWS_PIXEL_U16;
+    case 4: return SWS_PIXEL_U32;
+    default: break;
+    }
+
+    av_unreachable("Invalid pixel type!");
+    return SWS_PIXEL_NONE;
+}
+
+static void check_compiled(const Test *test,
+                           const SwsCompiledOp *comp_ref,
+                           const SwsCompiledOp *comp_new)
+{
+    /**
+     * We can't use `check_func()` alone because the actual function pointer
+     * may be a wrapper or entry point shared by multiple implementations.
+     * Solve it by hashing in the active CPU flags as well.
+     */
+    uintptr_t id = (uintptr_t) comp_new->func;
+    id ^= (id << 6) + (id >> 2) + 0x9e3779b97f4a7c15 + comp_new->cpu_flags;
+    if (!check_key(id, "%s", test->name))
+        return;
 
     declare_func(void, const SwsOpExec *, const void *, int bx, int y, int bx_end, int y_end);
 
     static DECLARE_ALIGNED_64(char, src0)[NB_PLANES][LINES][PIXELS * sizeof(uint32_t[4])];
     static DECLARE_ALIGNED_64(char, src1)[NB_PLANES][LINES][PIXELS * sizeof(uint32_t[4])];
-    static DECLARE_ALIGNED_64(char, dst0)[NB_PLANES][LINES][PIXELS * sizeof(uint32_t[4])];
-    static DECLARE_ALIGNED_64(char, dst1)[NB_PLANES][LINES][PIXELS * sizeof(uint32_t[4])];
+    /* All output planes are stacked vertically in a single padded buffer */
+    static BUF_RECT(uint8_t, dst0, PIXELS * sizeof(uint32_t[4]), NB_PLANES * LINES);
+    static BUF_RECT(uint8_t, dst1, PIXELS * sizeof(uint32_t[4]), NB_PLANES * LINES);
 
-    if (!ctx)
-        return;
-    ctx->flags = SWS_BITEXACT;
-
-    read_op = &ops[0];
-    for (oplist.num_ops = 0; ops[oplist.num_ops].op; oplist.num_ops++)
-        write_op = &ops[oplist.num_ops];
-
-    const int read_size  = PIXELS * rw_pixel_bits(read_op)  >> 3;
-    const int write_size = PIXELS * rw_pixel_bits(write_op) >> 3;
-
+    av_assert0(PIXELS % comp_new->block_size == 0);
     for (int p = 0; p < NB_PLANES; p++) {
         void *plane = src0[p];
-        switch (read_op->type) {
-        case U8:    fill8(plane, sizeof(src0[p]) /  sizeof(uint8_t), ranges[p]); break;
-        case U16:  fill16(plane, sizeof(src0[p]) / sizeof(uint16_t), ranges[p]); break;
-        case U32:  fill32(plane, sizeof(src0[p]) / sizeof(uint32_t), ranges[p]); break;
-        case F32: fill32f(plane, sizeof(src0[p]) / sizeof(uint32_t), ranges[p]); break;
+        if (!SWS_COMP_TEST(test->planes_in, p)) {
+            memset(plane, 0, sizeof(src0[p]));
+            continue;
+        }
+
+        switch (test->type_in) {
+        case SWS_PIXEL_U8:
+            fill8(plane, sizeof(src0[p]) / sizeof(uint8_t), test->ranges[p]);
+            break;
+        case SWS_PIXEL_U16:
+            fill16(plane, sizeof(src0[p]) / sizeof(uint16_t), test->ranges[p]);
+            break;
+        case SWS_PIXEL_U32:
+            fill32(plane, sizeof(src0[p]) / sizeof(uint32_t), test->ranges[p]);
+            break;
+        case SWS_PIXEL_F32:
+            fill32f(plane, sizeof(src0[p]) / sizeof(uint32_t), test->ranges[p]);
+            break;
         }
     }
 
     memcpy(src1, src0, sizeof(src0));
-    memset(dst0, 0, sizeof(dst0));
-    memset(dst1, 0, sizeof(dst1));
+    CLEAR_BUF_RECT(dst0);
+    CLEAR_BUF_RECT(dst1);
 
-    /* Compile `ops` using both the asm and c backends */
-    for (int n = 0; ff_sws_op_backends[n]; n++) {
-        const SwsOpBackend *backend = ff_sws_op_backends[n];
-        const bool is_ref = !strcmp(backend->name, "c");
-        if (is_ref || !comp_new.func) {
-            SwsCompiledOp comp;
-            int ret = ff_sws_ops_compile_backend(ctx, backend, &oplist, &comp);
-            if (ret == AVERROR(ENOTSUP))
-                continue;
-            else if (ret < 0)
-                fail();
-            else if (PIXELS % comp.block_size != 0)
-                fail();
-
-            if (is_ref)
-                comp_ref = comp;
-            if (!comp_new.func) {
-                comp_new = comp;
-                backend_new = backend;
-            }
-        }
-    }
-
-    av_assert0(comp_ref.func && comp_new.func);
+    const int read_size  = PIXELS * test->pixel_bits_in  >> 3;
+    const int write_size = PIXELS * test->pixel_bits_out >> 3;
 
     SwsOpExec exec = {0};
     exec.width = PIXELS;
     exec.height = exec.slice_h = LINES;
     for (int i = 0; i < NB_PLANES; i++) {
         exec.in_stride[i]  = sizeof(src0[i][0]);
-        exec.out_stride[i] = sizeof(dst0[i][0]);
+        exec.out_stride[i] = dst0_stride;
         exec.in_bump[i]  = exec.in_stride[i]  - read_size;
         exec.out_bump[i] = exec.out_stride[i] - write_size;
     }
 
-    /**
-     * Don't use check_func() because the actual function pointer may be a
-     * wrapper shared by multiple implementations. Instead, take a hash of both
-     * the backend pointer and the active CPU flags.
-     */
-    uintptr_t id = (uintptr_t) backend_new;
-    id ^= (id << 6) + (id >> 2) + 0x9e3779b97f4a7c15 + comp_new.cpu_flags;
-
-    if (check_key((void*) id, "%s", report)) {
-        exec.block_size_in  = comp_ref.block_size * rw_pixel_bits(read_op)  >> 3;
-        exec.block_size_out = comp_ref.block_size * rw_pixel_bits(write_op) >> 3;
-        for (int i = 0; i < NB_PLANES; i++) {
-            exec.in[i]  = (void *) src0[i];
-            exec.out[i] = (void *) dst0[i];
-        }
-        checkasm_call(comp_ref.func, &exec, comp_ref.priv, 0, 0, PIXELS / comp_ref.block_size, LINES);
-
-        exec.block_size_in  = comp_new.block_size * rw_pixel_bits(read_op)  >> 3;
-        exec.block_size_out = comp_new.block_size * rw_pixel_bits(write_op) >> 3;
-        for (int i = 0; i < NB_PLANES; i++) {
-            exec.in[i]  = (void *) src1[i];
-            exec.out[i] = (void *) dst1[i];
-        }
-        checkasm_call_checked(comp_new.func, &exec, comp_new.priv, 0, 0, PIXELS / comp_new.block_size, LINES);
-
-        for (int i = 0; i < NB_PLANES; i++) {
-            const char *name = FMT("%s[%d]", report, i);
-            const int stride = sizeof(dst0[i][0]);
-
-            switch (write_op->type) {
-            case U8:
-                checkasm_check(uint8_t, (void *) dst0[i], stride,
-                                        (void *) dst1[i], stride,
-                                        write_size, LINES, name);
-                break;
-            case U16:
-                checkasm_check(uint16_t, (void *) dst0[i], stride,
-                                         (void *) dst1[i], stride,
-                                         write_size >> 1, LINES, name);
-                break;
-            case U32:
-                checkasm_check(uint32_t, (void *) dst0[i], stride,
-                                         (void *) dst1[i], stride,
-                                         write_size >> 2, LINES, name);
-                break;
-            case F32:
-                checkasm_check(float_ulp, (void *) dst0[i], stride,
-                                          (void *) dst1[i], stride,
-                                          write_size >> 2, LINES, name, 0);
-                break;
-            }
-
-            if (write_op->rw.packed)
-                break;
-        }
-
-        bench(comp_new.func, &exec, comp_new.priv, 0, 0, PIXELS / comp_new.block_size, LINES);
+    int32_t in_bump_y[LINES];
+    int32_t in_offset_x[PIXELS];
+    const SwsUOp *read_op = &test->uops[0];
+    switch (read_op->uop) {
+    case SWS_UOP_READ_PALETTE:
+        exec.in_bump[1] = exec.in_stride[1] = 0;
+        static_assert(sizeof(src0[1]) >= sizeof(uint32_t[256]), "palette plane too small");
+        break;
+    case SWS_UOP_READ_PLANAR_FV: {
+        const int *offsets = read_op->data.kernel->offsets;
+        for (int y = 0; y < LINES - 1; y++)
+            in_bump_y[y] = offsets[y + 1] - offsets[y] - 1;
+        in_bump_y[LINES - 1] = 0;
+        exec.in_bump_y = in_bump_y;
+        break;
+    }
+    case SWS_UOP_READ_PLANAR_FH: {
+        const int *offsets = read_op->data.kernel->offsets;
+        for (int x = 0; x < PIXELS; x++)
+            in_offset_x[x] = offsets[x] * test->pixel_bits_in >> 3;
+        exec.in_offset_x = in_offset_x;
+    }
     }
 
-    if (comp_new.func != comp_ref.func)
+    for (int i = 0; i < NB_PLANES; i++) {
+        exec.in[i]  = (void *) src0[i];
+        exec.out[i] = dst0 + i * LINES * dst0_stride;
+        exec.block_size_in[i]  = comp_ref->block_size * test->pixel_bits_in  >> 3;
+        exec.block_size_out[i] = comp_ref->block_size * test->pixel_bits_out >> 3;
+    }
+    checkasm_call(comp_ref->func, &exec, comp_ref->priv, 0, 0, PIXELS / comp_ref->block_size, LINES);
+
+    for (int i = 0; i < NB_PLANES; i++) {
+        exec.in[i]  = (void *) src1[i];
+        exec.out[i] = dst1 + i * LINES * dst1_stride;
+        exec.block_size_in[i]  = comp_new->block_size * test->pixel_bits_in  >> 3;
+        exec.block_size_out[i] = comp_new->block_size * test->pixel_bits_out >> 3;
+    }
+    checkasm_call_checked(comp_new->func, &exec, comp_new->priv, 0, 0, PIXELS / comp_new->block_size, LINES);
+
+    for (int i = 0; i < NB_PLANES; i++) {
+        if (!SWS_COMP_TEST(test->planes_out, i))
+            continue;
+
+        /* checkasm_check_padded() assumes a power of two alignment, but our
+         * overwrite may be an arbitrary number of bytes. Smooth out the
+         * difference by manually copying over the padding from the reference
+         * to the output buffer, and extending the checked padding past it. */
+        const int elem_size = ff_sws_pixel_type_size(test->type_out);
+        const int over_write = comp_new->over_write[i];
+        const int padding = (over_write + elem_size - 1) / elem_size + 8;
+        const int w = write_size / elem_size;
+        const uint8_t *out_ref = dst0 + i * LINES * dst0_stride;
+        uint8_t *out_new = exec.out[i];
+        for (int y = 0; y < LINES; y++) {
+            memcpy(&out_new[y * dst1_stride + write_size],
+                   &out_ref[y * dst0_stride + write_size], over_write);
+        }
+
+        const char *desc = FMT("%s[%d]", test->name, i);
+        switch (test->type_out) {
+        case SWS_PIXEL_U8:
+            checkasm_check_padded(uint8_t, out_ref, dst0_stride, out_new, dst1_stride,
+                                  w, LINES, desc, 1, 0, padding);
+            break;
+        case SWS_PIXEL_U16:
+            checkasm_check_padded(uint16_t, (void *) out_ref, dst0_stride,
+                                            (void *) out_new, dst1_stride,
+                                            w, LINES, desc, 1, 0, padding);
+            break;
+        case SWS_PIXEL_U32:
+            checkasm_check_padded(uint32_t, (void *) out_ref, dst0_stride,
+                                            (void *) out_new, dst1_stride,
+                                            w, LINES, desc, 1, 0, padding);
+            break;
+        case SWS_PIXEL_F32:
+            checkasm_check_padded(float_ulp, (void *) out_ref, dst0_stride,
+                                             (void *) out_new, dst1_stride,
+                                             w, LINES, desc, 0, 1, 0, padding);
+            break;
+        }
+    }
+
+    bench(comp_new->func, &exec, comp_new->priv, 0, 0, PIXELS / comp_new->block_size, LINES);
+}
+
+static void run_test(const Test *test)
+{
+    SwsContext *ctx = sws_alloc_context();
+    if (!ctx)
+        return;
+    ctx->flags = SWS_BITEXACT;
+
+    /* Generate dummy uop list on-stack */
+    SwsUOpList oplist = {
+        .ops        = (SwsUOp *) test->uops,
+        .num_ops    = test->num_uops,
+
+        /* Less efficient, but works universally */
+        .planes_in  = SWS_COMP_ALL,
+        .planes_out = SWS_COMP_ALL,
+    };
+
+    for (int i = 0; i < test->num_uops; i++) {
+        const int pixel_size = ff_sws_pixel_type_size(test->uops[i].type);
+        if (pixel_size > oplist.pixel_size_max)
+            oplist.pixel_size_max = pixel_size;
+    }
+
+    static const SwsOpBackend *backend_ref;
+    if (!backend_ref) {
+         for (int n = 0; ff_sws_op_backends[n]; n++) {
+            if (!strcmp(ff_sws_op_backends[n]->name, "c")) {
+                backend_ref = ff_sws_op_backends[n];
+                break;
+            }
+        }
+        av_assert0(backend_ref);
+    }
+
+    /* Always compile `ops` using the C backend as a reference */
+    SwsCompiledOp comp_ref = {0};
+    int ret = backend_ref->compile_uops(ctx, &oplist, &comp_ref);
+    if (ret < 0) {
+        av_assert0(ret != AVERROR(ENOTSUP));
+        fail();
+        goto done;
+    }
+
+    /* Check with the C backend to establish a reference */
+    check_compiled(test, &comp_ref, &comp_ref);
+
+    /* Iterate over every other backend, and test it against the C reference */
+    for (int n = 0; ff_sws_op_backends[n]; n++) {
+        const SwsOpBackend *backend = ff_sws_op_backends[n];
+        if (backend->hw_format != AV_PIX_FMT_NONE || backend == backend_ref)
+            continue;
+        if (!backend->compile_uops)
+            continue;
+
+        SwsCompiledOp comp_new = {0};
+        int ret = backend->compile_uops(ctx, &oplist, &comp_new);
+        if (ret == AVERROR(ENOTSUP)) {
+            continue;
+        } else if (ret < 0) {
+            fail();
+            goto done;
+        }
+
+        /* Distinguish backends from each other even with same CPU flags */
+        checkasm_set_func_variant("%s_%s", backend->name, checkasm_get_cpu_suffix());
+        check_compiled(test, &comp_ref, &comp_new);
         ff_sws_compiled_op_unref(&comp_new);
+    }
+
+done:
     ff_sws_compiled_op_unref(&comp_ref);
     sws_free_context(&ctx);
 }
 
-#define CHECK_RANGES(NAME, RANGES, N_IN, N_OUT, IN, OUT, ...)                   \
-  do {                                                                          \
-      check_ops(NAME, RANGES, (SwsOp[]) {                                       \
-        {                                                                       \
-            .op = SWS_OP_READ,                                                  \
-            .type = IN,                                                         \
-            .rw.elems = N_IN,                                                   \
-        },                                                                      \
-        __VA_ARGS__,                                                            \
-        {                                                                       \
-            .op = SWS_OP_WRITE,                                                 \
-            .type = OUT,                                                        \
-            .rw.elems = N_OUT,                                                  \
-        }, {0}                                                                  \
-    });                                                                         \
-  } while (0)
-
-#define MK_RANGES(R) ((const unsigned[]) { R, R, R, R })
-#define CHECK_RANGE(NAME, RANGE, N_IN, N_OUT, IN, OUT, ...)                     \
-    CHECK_RANGES(NAME, MK_RANGES(RANGE), N_IN, N_OUT, IN, OUT, __VA_ARGS__)
-
-#define CHECK_COMMON_RANGE(NAME, RANGE, IN, OUT, ...)                           \
-    CHECK_RANGE(FMT("%s_p1000", NAME), RANGE, 1, 1, IN, OUT, __VA_ARGS__);      \
-    CHECK_RANGE(FMT("%s_p1110", NAME), RANGE, 3, 3, IN, OUT, __VA_ARGS__);      \
-    CHECK_RANGE(FMT("%s_p1111", NAME), RANGE, 4, 4, IN, OUT, __VA_ARGS__);      \
-    CHECK_RANGE(FMT("%s_p1001", NAME), RANGE, 4, 2, IN, OUT, __VA_ARGS__, {     \
-        .op = SWS_OP_SWIZZLE,                                                   \
-        .type = OUT,                                                            \
-        .swizzle = SWS_SWIZZLE(0, 3, 1, 2),                                     \
-    })
-
-#define CHECK(NAME, N_IN, N_OUT, IN, OUT, ...) \
-    CHECK_RANGE(NAME, 0, N_IN, N_OUT, IN, OUT, __VA_ARGS__)
-
-#define CHECK_COMMON(NAME, IN, OUT, ...) \
-    CHECK_COMMON_RANGE(NAME, 0, IN, OUT, __VA_ARGS__)
-
-static void check_read_write(void)
+static void check_uop(const char *name, const SwsUOp *uop,
+                      SwsCompMask mask_in, SwsCompMask mask_out,
+                      const unsigned ranges[NB_PLANES])
 {
-    for (SwsPixelType t = U8; t < SWS_PIXEL_TYPE_NB; t++) {
-        const char *type = ff_sws_pixel_type_name(t);
-        for (int i = 1; i <= 4; i++) {
-            /* Test N->N planar read/write */
-            for (int o = 1; o <= i; o++) {
-                check_ops(FMT("rw_%d_%d_%s", i, o, type), NULL, (SwsOp[]) {
-                    {
-                        .op = SWS_OP_READ,
-                        .type = t,
-                        .rw.elems = i,
-                    }, {
-                        .op = SWS_OP_WRITE,
-                        .type = t,
-                        .rw.elems = o,
-                    }, {0}
-                });
-            }
-
-            /* Test packed read/write */
-            if (i == 1)
-                continue;
-
-            check_ops(FMT("read_packed%d_%s", i, type), NULL, (SwsOp[]) {
-                {
-                    .op = SWS_OP_READ,
-                    .type = t,
-                    .rw.elems = i,
-                    .rw.packed = true,
-                }, {
-                    .op = SWS_OP_WRITE,
-                    .type = t,
-                    .rw.elems = i,
-                }, {0}
-            });
-
-            check_ops(FMT("write_packed%d_%s", i, type), NULL, (SwsOp[]) {
-                {
-                    .op = SWS_OP_READ,
-                    .type = t,
-                    .rw.elems = i,
-                }, {
-                    .op = SWS_OP_WRITE,
-                    .type = t,
-                    .rw.elems = i,
-                    .rw.packed = true,
-                }, {0}
-            });
-        }
-    }
-
-    /* Test fractional reads/writes */
-    for (int frac = 1; frac <= 3; frac++) {
-        const int bits = 8 >> frac;
-        const int range = (1 << bits) - 1;
-        if (bits == 2)
-            continue; /* no 2 bit packed formats currently exist */
-
-        check_ops(FMT("read_frac%d", frac), NULL, (SwsOp[]) {
-            {
-                .op = SWS_OP_READ,
-                .type = U8,
-                .rw.elems = 1,
-                .rw.frac  = frac,
-            }, {
-                .op = SWS_OP_WRITE,
-                .type = U8,
-                .rw.elems = 1,
-            }, {0}
-        });
-
-        check_ops(FMT("write_frac%d", frac), MK_RANGES(range), (SwsOp[]) {
-            {
-                .op = SWS_OP_READ,
-                .type = U8,
-                .rw.elems = 1,
-            }, {
-                .op = SWS_OP_WRITE,
-                .type = U8,
-                .rw.elems = 1,
-                .rw.frac  = frac,
-            }, {0}
-        });
-    }
-}
-
-static void check_swap_bytes(void)
-{
-    CHECK_COMMON("swap_bytes_16", U16, U16, {
-        .op   = SWS_OP_SWAP_BYTES,
-        .type = U16,
-    });
-
-    CHECK_COMMON("swap_bytes_32", U32, U32, {
-        .op   = SWS_OP_SWAP_BYTES,
-        .type = U32,
-    });
-}
-
-static void check_pack_unpack(void)
-{
-    const struct {
-        SwsPixelType type;
-        SwsPackOp op;
-    } patterns[] = {
-        { U8, {{ 3,  3,  2 }}},
-        { U8, {{ 2,  3,  3 }}},
-        { U8, {{ 1,  2,  1 }}},
-        {U16, {{ 5,  6,  5 }}},
-        {U16, {{ 5,  5,  5 }}},
-        {U16, {{ 4,  4,  4 }}},
-        {U32, {{ 2, 10, 10, 10 }}},
-        {U32, {{10, 10, 10,  2 }}},
+    Test t = {
+        .name     = name,
+        .type_in  = uop->type,
+        .type_out = uop->type,
     };
 
-    for (int i = 0; i < FF_ARRAY_ELEMS(patterns); i++) {
-        const SwsPixelType type = patterns[i].type;
-        const SwsPackOp pack = patterns[i].op;
-        const int num = pack.pattern[3] ? 4 : 3;
-        const char *pat = FMT("%d%d%d%d", pack.pattern[0], pack.pattern[1],
-                                          pack.pattern[2], pack.pattern[3]);
-        const int total = pack.pattern[0] + pack.pattern[1] +
-                          pack.pattern[2] + pack.pattern[3];
-        const unsigned ranges[4] = {
-            (1 << pack.pattern[0]) - 1,
-            (1 << pack.pattern[1]) - 1,
-            (1 << pack.pattern[2]) - 1,
-            (1 << pack.pattern[3]) - 1,
+    for (int i = 0; ranges && i < NB_PLANES; i++)
+        t.ranges[i] = ranges[i];
+
+    /* uops with non-standard output type conversions */
+    switch (uop->uop) {
+    case SWS_UOP_TO_U8:  t.type_out = SWS_PIXEL_U8;  break;
+    case SWS_UOP_TO_U16: t.type_out = SWS_PIXEL_U16; break;
+    case SWS_UOP_TO_U32: t.type_out = SWS_PIXEL_U32; break;
+    case SWS_UOP_TO_F32: t.type_out = SWS_PIXEL_F32; break;
+    case SWS_UOP_EXPAND_PAIR: t.type_out = SWS_PIXEL_U16; break;
+    case SWS_UOP_EXPAND_QUAD: t.type_out = SWS_PIXEL_U32; break;
+    case SWS_UOP_READ_PLANAR_FH:
+    case SWS_UOP_READ_PLANAR_FV:
+        t.type_out = uop->par.filter.type;
+        break;
+    }
+
+    /* Set up read/write metadata for rw uops */
+    const int bits_in  = ff_sws_pixel_type_size(t.type_in)  * 8;
+    const int bits_out = ff_sws_pixel_type_size(t.type_out) * 8;
+    switch (uop->uop) {
+    case SWS_UOP_READ_PLANAR:
+    case SWS_UOP_READ_PLANAR_FH:
+    case SWS_UOP_READ_PLANAR_FV:
+        t.planes_in = uop->mask;
+        t.pixel_bits_in = bits_in;
+        break;
+    case SWS_UOP_WRITE_PLANAR:
+        t.planes_out = uop->mask;
+        t.pixel_bits_out = bits_out;
+        break;
+    case SWS_UOP_READ_PACKED:
+        t.planes_in = SWS_COMP_ELEMS(1);
+        t.pixel_bits_in = bits_in * SWS_COMP_COUNT(uop->mask);
+        break;
+    case SWS_UOP_WRITE_PACKED:
+        t.planes_out = SWS_COMP_ELEMS(1);
+        t.pixel_bits_out = bits_out * SWS_COMP_COUNT(uop->mask);
+        break;
+    case SWS_UOP_READ_NIBBLE:
+        t.planes_in = SWS_COMP_ELEMS(1);
+        t.pixel_bits_in = 4;
+        break;
+    case SWS_UOP_WRITE_NIBBLE:
+        t.planes_out = SWS_COMP_ELEMS(1);
+        t.pixel_bits_out = 4;
+        break;
+    case SWS_UOP_READ_BIT:
+        t.planes_in = SWS_COMP_ELEMS(1);
+        t.pixel_bits_in = 1;
+        break;
+    case SWS_UOP_WRITE_BIT:
+        t.planes_out = SWS_COMP_ELEMS(1);
+        t.pixel_bits_out = 1;
+        break;
+    case SWS_UOP_READ_PALETTE:
+        t.planes_in = SWS_COMP_ELEMS(2);
+        t.pixel_bits_in = 8; /* size of index */
+        break;
+    }
+
+    /* Add read uop if needed */
+    if (!t.planes_in) {
+        t.planes_in = mask_in;
+        t.pixel_bits_in = bits_in;
+        t.uops[t.num_uops++] = (SwsUOp) {
+            .type = pixel_type_to_int(t.type_in),
+            .uop  = SWS_UOP_READ_PLANAR,
+            .mask = SWS_COMP_ALL, /* extra planes are zero'd */
         };
-
-        CHECK_RANGES(FMT("pack_%s", pat), ranges, num, 1, type, type, {
-            .op   = SWS_OP_PACK,
-            .type = type,
-            .pack = pack,
-        });
-
-        CHECK_RANGE(FMT("unpack_%s", pat), UINT32_MAX >> (32 - total), 1, num, type, type, {
-            .op   = SWS_OP_UNPACK,
-            .type = type,
-            .pack = pack,
-        });
     }
-}
 
-static AVRational rndq(SwsPixelType t)
-{
-    const unsigned num = rnd();
-    if (ff_sws_pixel_type_is_int(t)) {
-        const unsigned mask = UINT_MAX >> (32 - ff_sws_pixel_type_size(t) * 8);
-        return (AVRational) { num & mask, 1 };
-    } else {
-        const unsigned den = rnd();
-        return (AVRational) { num, den ? den : 1 };
-    }
-}
+    /* Add the UOp itself */
+    t.uops[t.num_uops++] = *uop;
 
-static void check_clear(void)
-{
-    for (SwsPixelType t = U8; t < SWS_PIXEL_TYPE_NB; t++) {
-        const char *type = ff_sws_pixel_type_name(t);
-        const int bits = ff_sws_pixel_type_size(t) * 8;
-
-        /* TODO: AVRational can't fit 32 bit constants */
-        if (bits < 32) {
-            const AVRational chroma = (AVRational) { 1 << (bits - 1), 1};
-            const AVRational alpha  = (AVRational) { (1 << bits) - 1, 1};
-            const AVRational zero   = (AVRational) { 0, 1};
-            const AVRational none = {0};
-
-            const SwsConst patterns[] = {
-                /* Zero only */
-                {.q4 = {   none,   none,   none,   zero }},
-                {.q4 = {   zero,   none,   none,   none }},
-                /* Alpha only */
-                {.q4 = {   none,   none,   none,  alpha }},
-                {.q4 = {  alpha,   none,   none,   none }},
-                /* Chroma only */
-                {.q4 = { chroma, chroma,   none,   none }},
-                {.q4 = {   none, chroma, chroma,   none }},
-                {.q4 = {   none,   none, chroma, chroma }},
-                {.q4 = { chroma,   none, chroma,   none }},
-                {.q4 = {   none, chroma,   none, chroma }},
-                /* Alpha+chroma */
-                {.q4 = { chroma, chroma,   none,  alpha }},
-                {.q4 = {   none, chroma, chroma,  alpha }},
-                {.q4 = {  alpha,   none, chroma, chroma }},
-                {.q4 = { chroma,   none, chroma,  alpha }},
-                {.q4 = {  alpha, chroma,   none, chroma }},
-                /* Random values */
-                {.q4 = { none, rndq(t), rndq(t), rndq(t) }},
-                {.q4 = { none, rndq(t), rndq(t), rndq(t) }},
-                {.q4 = { none, rndq(t), rndq(t), rndq(t) }},
-                {.q4 = { none, rndq(t), rndq(t), rndq(t) }},
-            };
-
-            for (int i = 0; i < FF_ARRAY_ELEMS(patterns); i++) {
-                CHECK(FMT("clear_pattern_%s[%d]", type, i), 4, 4, t, t, {
-                    .op   = SWS_OP_CLEAR,
-                    .type = t,
-                    .c    = patterns[i],
-                });
-            }
-        } else if (!ff_sws_pixel_type_is_int(t)) {
-            /* Floating point YUV doesn't exist, only alpha needs to be cleared */
-            CHECK(FMT("clear_alpha_%s", type), 4, 4, t, t, {
-                .op      = SWS_OP_CLEAR,
-                .type    = t,
-                .c.q4[3] = { 0, 1 },
-            });
-        }
-    }
-}
-
-static void check_shift(void)
-{
-    for (SwsPixelType t = U16; t < SWS_PIXEL_TYPE_NB; t++) {
-        const char *type = ff_sws_pixel_type_name(t);
-        if (!ff_sws_pixel_type_is_int(t))
-            continue;
-
-        for (int shift = 1; shift <= 8; shift++) {
-            CHECK_COMMON(FMT("lshift%d_%s", shift, type), t, t, {
-                .op   = SWS_OP_LSHIFT,
-                .type = t,
-                .c.u  = shift,
-            });
-
-            CHECK_COMMON(FMT("rshift%d_%s", shift, type), t, t, {
-                .op   = SWS_OP_RSHIFT,
-                .type = t,
-                .c.u  = shift,
-            });
-        }
-    }
-}
-
-static void check_swizzle(void)
-{
-    for (SwsPixelType t = U8; t < SWS_PIXEL_TYPE_NB; t++) {
-        const char *type = ff_sws_pixel_type_name(t);
-        static const int patterns[][4] = {
-            /* Pure swizzle */
-            {3, 0, 1, 2},
-            {3, 0, 2, 1},
-            {2, 1, 0, 3},
-            {3, 2, 1, 0},
-            {3, 1, 0, 2},
-            {3, 2, 0, 1},
-            {1, 2, 0, 3},
-            {1, 0, 2, 3},
-            {2, 0, 1, 3},
-            {2, 3, 1, 0},
-            {2, 1, 3, 0},
-            {1, 2, 3, 0},
-            {1, 3, 2, 0},
-            {0, 2, 1, 3},
-            {0, 2, 3, 1},
-            {0, 3, 1, 2},
-            {3, 1, 2, 0},
-            {0, 3, 2, 1},
-            /* Luma expansion */
-            {0, 0, 0, 3},
-            {3, 0, 0, 0},
-            {0, 0, 0, 1},
-            {1, 0, 0, 0},
+    /* Add write uop if needed */
+    if (!t.planes_out) {
+        t.planes_out = mask_out;
+        t.pixel_bits_out = bits_out;
+        t.uops[t.num_uops++] = (SwsUOp) {
+            .type = pixel_type_to_int(t.type_out),
+            .uop  = SWS_UOP_WRITE_PLANAR,
+            .mask = SWS_COMP_ALL, /* extra planes are ignored */
         };
-
-        for (int i = 0; i < FF_ARRAY_ELEMS(patterns); i++) {
-            const int x = patterns[i][0], y = patterns[i][1],
-                      z = patterns[i][2], w = patterns[i][3];
-            CHECK(FMT("swizzle_%d%d%d%d_%s", x, y, z, w, type), 4, 4, t, t, {
-                .op = SWS_OP_SWIZZLE,
-                .type = t,
-                .swizzle = SWS_SWIZZLE(x, y, z, w),
-            });
-        }
-    }
-}
-
-static void check_convert(void)
-{
-    for (SwsPixelType i = U8; i < SWS_PIXEL_TYPE_NB; i++) {
-        const char *itype = ff_sws_pixel_type_name(i);
-        const int isize = ff_sws_pixel_type_size(i);
-        for (SwsPixelType o = U8; o < SWS_PIXEL_TYPE_NB; o++) {
-            const char *otype = ff_sws_pixel_type_name(o);
-            const int osize = ff_sws_pixel_type_size(o);
-            const char *name = FMT("convert_%s_%s", itype, otype);
-            if (i == o)
-                continue;
-
-            if (isize < osize || !ff_sws_pixel_type_is_int(o)) {
-                CHECK_COMMON(name, i, o, {
-                    .op = SWS_OP_CONVERT,
-                    .type = i,
-                    .convert.to = o,
-                });
-            } else if (isize > osize || !ff_sws_pixel_type_is_int(i)) {
-                uint32_t range = UINT32_MAX >> (32 - osize * 8);
-                CHECK_COMMON_RANGE(name, range, i, o, {
-                    .op = SWS_OP_CONVERT,
-                    .type = i,
-                    .convert.to = o,
-                });
-            }
-        }
     }
 
-    /* Check expanding conversions */
-    CHECK_COMMON("expand16", U8, U16, {
-        .op = SWS_OP_CONVERT,
-        .type = U8,
-        .convert.to = U16,
-        .convert.expand = true,
-    });
-
-    CHECK_COMMON("expand32", U8, U32, {
-        .op = SWS_OP_CONVERT,
-        .type = U8,
-        .convert.to = U32,
-        .convert.expand = true,
-    });
+    run_test(&t);
 }
 
-static void check_dither(void)
+static void check_range(const char *name, const SwsUOp *uop,
+                        const unsigned ranges[NB_PLANES])
 {
-    for (SwsPixelType t = F32; t < SWS_PIXEL_TYPE_NB; t++) {
-        const char *type = ff_sws_pixel_type_name(t);
-        if (ff_sws_pixel_type_is_int(t))
-            continue;
+    /* Test all planes to ensure data remains untouched */
+    check_uop(name, uop, SWS_COMP_ALL, SWS_COMP_ALL, ranges);
+}
 
-        /* Test all sizes up to 256x256 */
-        for (int size_log2 = 0; size_log2 <= 8; size_log2++) {
-            const int size = 1 << size_log2;
-            const int mask = size - 1;
-            AVRational *matrix = av_refstruct_allocz(size * size * sizeof(*matrix));
-            if (!matrix) {
+static void check_simple(const char *name, const SwsUOp *uop)
+{
+    check_range(name, uop, NULL);
+}
+
+static void check_scalar(const char *name, SwsUOp *uop)
+{
+    uop->data.scalar = rndpx(uop->type);
+    check_simple(name, uop);
+}
+
+static void check_vec4(const char *name, SwsUOp *uop)
+{
+    for (int i = 0; i < 4; i++)
+        uop->data.vec4[i] = rndpx(uop->type);
+
+    check_simple(name, uop);
+}
+
+#define MK_RANGES(R) ((const unsigned[]) { R, R, R, R })
+
+static void check_read(const char *name, SwsUOp *uop)
+{
+    check_uop(name, uop, uop->mask, uop->mask, NULL);
+}
+
+static void check_write(const char *name, const SwsUOp *uop)
+{
+    const int frac = uop->uop == SWS_UOP_WRITE_BIT    ? 3 :
+                     uop->uop == SWS_UOP_WRITE_NIBBLE ? 1 : 0;
+    const int bits = 8 >> frac;
+    const unsigned range = (1 << bits) - 1;
+    check_uop(name, uop, uop->mask, uop->mask, MK_RANGES(range));
+}
+
+static void check_filter(const char *name, SwsUOp *uop)
+{
+    const bool is_vert = uop->uop == SWS_UOP_READ_PLANAR_FV;
+
+    SwsFilterParams par = {
+        .scaler_params  = { SWS_PARAM_DEFAULT, SWS_PARAM_DEFAULT },
+        .dst_size       = is_vert ? LINES : PIXELS,
+    };
+
+    const SwsScaler scalers[] = {
+        SWS_SCALE_POINT,
+        SWS_SCALE_SINC,
+    };
+
+    for (int s = 0; s < FF_ARRAY_ELEMS(scalers); s++) {
+        par.scaler = scalers[s];
+
+        for (par.src_size = 1; par.src_size <= par.dst_size; par.src_size <<= 1) {
+            if (ff_sws_filter_generate(NULL, &par, &uop->data.kernel) < 0) {
                 fail();
                 return;
             }
 
-            if (size == 1) {
-                matrix[0] = (AVRational) { 1, 2 };
-            } else {
-                for (int i = 0; i < size * size; i++)
-                    matrix[i] = rndq(t);
-            }
+            char desc[256];
+            snprintf(desc, sizeof(desc), "%s_%s_%d", name,
+                     uop->data.kernel->name, par.src_size);
 
-            CHECK_COMMON(FMT("dither_%dx%d_%s", size, size, type), t, t, {
-                .op = SWS_OP_DITHER,
-                .type = t,
-                .dither.size_log2 = size_log2,
-                .dither.matrix    = matrix,
-                .dither.y_offset  = {0, 3 & mask, 2 & mask, 5 & mask},
-            });
-
-            av_refstruct_unref(&matrix);
+            check_read(desc, uop);
+            av_refstruct_unref(&uop->data.kernel);
         }
     }
 }
 
-static void check_min_max(void)
+static void check_swizzle(const char *name, const SwsUOp *uop)
 {
-    for (SwsPixelType t = U8; t < SWS_PIXEL_TYPE_NB; t++) {
-        const char *type = ff_sws_pixel_type_name(t);
-        CHECK_COMMON(FMT("min_%s", type), t, t, {
-            .op = SWS_OP_MIN,
-            .type = t,
-            .c.q4 = { rndq(t), rndq(t), rndq(t), rndq(t) },
-        });
-
-        CHECK_COMMON(FMT("max_%s", type), t, t, {
-            .op = SWS_OP_MAX,
-            .type = t,
-            .c.q4 = { rndq(t), rndq(t), rndq(t), rndq(t) },
-        });
-    }
+    /* Only check data equality in needed components; since the others
+     * could either remain untouched or contain garbage */
+    check_uop(name, uop, SWS_COMP_ALL, uop->mask, NULL);
 }
 
-static void check_linear(void)
+static void check_expand_bit(const char *name, const SwsUOp *uop)
 {
-    static const struct {
-        const char *name;
-        uint32_t mask;
-    } patterns[] = {
-        { "noop",               0 },
-        { "luma",               SWS_MASK_LUMA },
-        { "alpha",              SWS_MASK_ALPHA },
-        { "luma+alpha",         SWS_MASK_LUMA | SWS_MASK_ALPHA },
-        { "dot3",               0x7 },
-        { "dot4",               0xF },
-        { "row0",               SWS_MASK_ROW(0) },
-        { "row0+alpha",         SWS_MASK_ROW(0) | SWS_MASK_ALPHA },
-        { "off3",               SWS_MASK_OFF3 },
-        { "off3+alpha",         SWS_MASK_OFF3 | SWS_MASK_ALPHA },
-        { "diag3",              SWS_MASK_DIAG3 },
-        { "diag4",              SWS_MASK_DIAG4 },
-        { "diag3+alpha",        SWS_MASK_DIAG3 | SWS_MASK_ALPHA },
-        { "diag3+off3",         SWS_MASK_DIAG3 | SWS_MASK_OFF3 },
-        { "diag3+off3+alpha",   SWS_MASK_DIAG3 | SWS_MASK_OFF3 | SWS_MASK_ALPHA },
-        { "diag4+off4",         SWS_MASK_DIAG4 | SWS_MASK_OFF4 },
-        { "matrix3",            SWS_MASK_MAT3 },
-        { "matrix3+off3",       SWS_MASK_MAT3 | SWS_MASK_OFF3 },
-        { "matrix3+off3+alpha", SWS_MASK_MAT3 | SWS_MASK_OFF3 | SWS_MASK_ALPHA },
-        { "matrix4",            SWS_MASK_MAT4 },
-        { "matrix4+off4",       SWS_MASK_MAT4 | SWS_MASK_OFF4 },
+    check_range(name, uop, MK_RANGES(1));
+}
+
+static void check_cast(const char *name, const SwsUOp *uop)
+{
+    SwsPixelType dst;
+    switch (uop->uop) {
+    case SWS_UOP_TO_U8:  dst = SWS_PIXEL_U8;  break;
+    case SWS_UOP_TO_U16: dst = SWS_PIXEL_U16; break;
+    case SWS_UOP_TO_U32: dst = SWS_PIXEL_U32; break;
+    case SWS_UOP_TO_F32: dst = SWS_PIXEL_F32; break;
+    case SWS_UOP_EXPAND_PAIR: dst = SWS_PIXEL_U16; break;
+    case SWS_UOP_EXPAND_QUAD: dst = SWS_PIXEL_U32; break;
+    default: return;
+    }
+
+    const int isize = ff_sws_pixel_type_size(uop->type);
+    const int osize = ff_sws_pixel_type_size(dst);
+    unsigned range = UINT32_MAX >> (32 - osize * 8);
+    if (isize < osize || !ff_sws_pixel_type_is_int(dst))
+        range = 0;
+
+    check_uop(name, uop, uop->mask, uop->mask, MK_RANGES(range));
+}
+
+static void check_scale(const char *name, SwsUOp *uop)
+{
+    const int bits = ff_sws_pixel_type_size(uop->type) * 8;
+    const unsigned max = UINT32_MAX >> (32 - bits);
+    SwsPixel scale = uop->data.scalar = rndpx(uop->type);
+    unsigned range = 0;
+
+    /* Ensure the result won't exceed the value range */
+    switch (uop->type) {
+    case SWS_PIXEL_U8:  range = max / (scale.u8  ? scale.u8  : 1); break;
+    case SWS_PIXEL_U16: range = max / (scale.u16 ? scale.u16 : 1); break;
+    case SWS_PIXEL_U32: range = max / (scale.u32 ? scale.u32 : 1); break;
+    }
+
+    check_range(name, uop, MK_RANGES(range));
+}
+
+static void check_unpack(const char *name, const SwsUOp *uop)
+{
+    const uint8_t *pat = uop->par.pack.pattern;
+    const int total = pat[0] + pat[1] + pat[2] + pat[3];
+    const unsigned range = UINT32_MAX >> (32 - total);
+
+    check_uop(name, uop, SWS_COMP(0), uop->mask, MK_RANGES(range));
+}
+
+static void check_pack(const char *name, const SwsUOp *uop)
+{
+    const uint8_t *pat = uop->par.pack.pattern;
+    const unsigned ranges[4] = {
+        (1 << pat[0]) - 1, (1 << pat[1]) - 1,
+        (1 << pat[2]) - 1, (1 << pat[3]) - 1,
     };
 
-    for (SwsPixelType t = F32; t < SWS_PIXEL_TYPE_NB; t++) {
-        const char *type = ff_sws_pixel_type_name(t);
-        if (ff_sws_pixel_type_is_int(t))
-            continue;
-
-        for (int p = 0; p < FF_ARRAY_ELEMS(patterns); p++) {
-            const uint32_t mask = patterns[p].mask;
-            SwsLinearOp lin = { .mask = mask };
-
-            for (int i = 0; i < 4; i++) {
-                for (int j = 0; j < 5; j++) {
-                    if (mask & SWS_MASK(i, j)) {
-                        lin.m[i][j] = rndq(t);
-                    } else {
-                        lin.m[i][j] = (AVRational) { i == j, 1 };
-                    }
-                }
-            }
-
-            CHECK(FMT("linear_%s_%s", patterns[p].name, type), 4, 4, t, t, {
-                .op = SWS_OP_LINEAR,
-                .type = t,
-                .lin = lin,
-            });
-        }
-    }
+    check_uop(name, uop, uop->mask, SWS_COMP(0), ranges);
 }
 
-static void check_scale(void)
+static void check_linear(const char *name, SwsUOp *uop)
 {
-    for (SwsPixelType t = F32; t < SWS_PIXEL_TYPE_NB; t++) {
-        const char *type = ff_sws_pixel_type_name(t);
-        const int bits = ff_sws_pixel_type_size(t) * 8;
-        if (ff_sws_pixel_type_is_int(t)) {
-            /* Ensure the result won't exceed the value range */
-            const unsigned max = (1 << bits) - 1;
-            const unsigned scale = rnd() & max;
-            const unsigned range = max / (scale ? scale : 1);
-            CHECK_COMMON_RANGE(FMT("scale_%s", type), range, t, t, {
-                .op   = SWS_OP_SCALE,
-                .type = t,
-                .c.q  = { scale, 1 },
-            });
-        } else {
-            CHECK_COMMON(FMT("scale_%s", type), t, t, {
-                .op   = SWS_OP_SCALE,
-                .type = t,
-                .c.q  = rndq(t),
-            });
+    const SwsLinearUOp *par = &uop->par.lin;
+    for (int i = 0; i < 4; i++) {
+        for (int j = 0; j < 5; j++) {
+            if (par->zero & SWS_MASK(i, j))
+                uop->data.mat4x5[i][j] = constpx(uop->type, 0);
+            else if (par->one & SWS_MASK(i, j))
+                uop->data.mat4x5[i][j] = constpx(uop->type, 1);
+            else
+                uop->data.mat4x5[i][j] = rndpx(uop->type);
         }
     }
+
+    check_simple(name, uop);
 }
+
+static void check_dither(const char *name, SwsUOp *uop)
+{
+    av_assert0(!ff_sws_pixel_type_is_int(uop->type));
+
+    const int size   = 1 << uop->par.dither.size_log2;
+    const int height = ff_sws_dither_height(&uop->par.dither);
+    SwsPixel *matrix = av_refstruct_allocz(size * height * sizeof(*matrix));
+    if (!matrix) {
+        fail();
+        return;
+    }
+
+    for (int i = 0; i < size * size; i++)
+        matrix[i] = rndpx(uop->type);
+    memcpy(matrix + size * size, matrix,
+           size * (height - size) * sizeof(*matrix));
+
+    uop->data.ptr = matrix;
+    check_simple(name, uop);
+
+    av_refstruct_unref(&matrix);
+}
+
+static void check_lut_3d(const char *name, SwsUOp *uop)
+{
+    SwsLut3D *lut3d = ff_sws_lut3d_alloc();
+    if (!lut3d) {
+        fail();
+        return;
+    }
+
+    checkasm_init(&lut3d->input, sizeof(lut3d->input));
+
+    if (uop->par.lut3d.dynamic) {
+        checkasm_init(&lut3d->tone_map, sizeof(lut3d->tone_map));
+        checkasm_init(&lut3d->output,   sizeof(lut3d->output));
+        lut3d->dynamic = true;
+
+        /* Prevent out-of-bounds read from IPT values with abs(PT) > 0.5 */
+        for (int i = 0; i < FF_ARRAY_ELEMS(lut3d->tone_map); i++)
+            lut3d->tone_map[i].y = FFMIN(lut3d->tone_map[i].y, 1 << 15);
+    }
+
+    uop->data.lut3d = lut3d;
+    check_range(name, uop, MK_RANGES(INPUT_LUT_SIZE - 1));
+
+    av_refstruct_unref(&lut3d);
+}
+
+#define CHECK_FUNCTION(CHECK, NAME, ...) \
+    CHECK(#NAME, &(SwsUOp) { __VA_ARGS__ });
+
+#define CHECK_FOR(UOP, CHECK) \
+    SWS_FOR_STRUCT(U8,  UOP, CHECK_FUNCTION, CHECK) \
+    SWS_FOR_STRUCT(U16, UOP, CHECK_FUNCTION, CHECK) \
+    SWS_FOR_STRUCT(U32, UOP, CHECK_FUNCTION, CHECK) \
+    SWS_FOR_STRUCT(F32, UOP, CHECK_FUNCTION, CHECK) \
+    report(#UOP)
 
 void checkasm_check_sw_ops(void)
 {
-    check_read_write();
-    report("read_write");
-    check_swap_bytes();
-    report("swap_bytes");
-    check_pack_unpack();
-    report("pack_unpack");
-    check_clear();
-    report("clear");
-    check_shift();
-    report("shift");
-    check_swizzle();
-    report("swizzle");
-    check_convert();
-    report("convert");
-    check_dither();
-    report("dither");
-    check_min_max();
-    report("min_max");
-    check_linear();
-    report("linear");
-    check_scale();
-    report("scale");
+    CHECK_FOR(READ_PLANAR,      check_read);
+    CHECK_FOR(READ_PLANAR_FH,   check_filter);
+    CHECK_FOR(READ_PLANAR_FV,   check_filter);
+    CHECK_FOR(READ_PACKED,      check_read);
+    CHECK_FOR(READ_NIBBLE,      check_read);
+    CHECK_FOR(READ_BIT,         check_read);
+    CHECK_FOR(READ_PALETTE,     check_read);
+    CHECK_FOR(WRITE_PLANAR,     check_write);
+    CHECK_FOR(WRITE_PACKED,     check_write);
+    CHECK_FOR(WRITE_NIBBLE,     check_write);
+    CHECK_FOR(WRITE_BIT,        check_write);
+    CHECK_FOR(PERMUTE,          check_swizzle);
+    CHECK_FOR(COPY,             check_swizzle);
+    CHECK_FOR(SWAP_BYTES,       check_simple);
+    CHECK_FOR(EXPAND_BIT,       check_expand_bit);
+    CHECK_FOR(EXPAND_PAIR,      check_cast);
+    CHECK_FOR(EXPAND_QUAD,      check_cast);
+    CHECK_FOR(TO_U8,            check_cast);
+    CHECK_FOR(TO_U16,           check_cast);
+    CHECK_FOR(TO_U32,           check_cast);
+    CHECK_FOR(TO_F32,           check_cast);
+    CHECK_FOR(SCALE,            check_scale);
+    CHECK_FOR(ADD,              check_scalar);
+    CHECK_FOR(MIN,              check_vec4);
+    CHECK_FOR(MAX,              check_vec4);
+    CHECK_FOR(UNPACK,           check_unpack);
+    CHECK_FOR(PACK,             check_pack);
+    CHECK_FOR(LSHIFT,           check_simple);
+    CHECK_FOR(RSHIFT,           check_simple);
+    CHECK_FOR(CLEAR,            check_vec4);
+    CHECK_FOR(LINEAR,           check_linear);
+    CHECK_FOR(DITHER,           check_dither);
+    CHECK_FOR(LUT_3D,           check_lut_3d);
 }

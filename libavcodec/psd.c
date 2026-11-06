@@ -407,6 +407,7 @@ static int decode_frame(AVCodecContext *avctx, AVFrame *picture,
         break;
     case PSD_DUOTONE:
         av_log(avctx, AV_LOG_WARNING, "ignoring unknown duotone specification.\n");
+        av_fallthrough;
     case PSD_GRAYSCALE:
         if (s->layer_count < 0 && s->channel_count >= 2) {
             if (s->channel_depth == 8) {
@@ -443,6 +444,8 @@ static int decode_frame(AVCodecContext *avctx, AVFrame *picture,
     }
 
     s->uncompressed_size = s->line_size * s->height * s->channel_count;
+    if (s->uncompressed_size > INT_MAX)
+        return AVERROR_INVALIDDATA;
 
     /* decode picture if need */
     if (s->compression == PSD_RLE) {
@@ -466,8 +469,10 @@ static int decode_frame(AVCodecContext *avctx, AVFrame *picture,
         ptr_data = s->gb.buffer;
     }
 
-    if ((ret = ff_get_buffer(avctx, picture, 0)) < 0)
+    if ((ret = ff_get_buffer(avctx, picture, 0)) < 0) {
+        av_freep(&s->tmp);
         return ret;
+    }
 
     /* Store data */
     if ((avctx->pix_fmt == AV_PIX_FMT_YA8)||(avctx->pix_fmt == AV_PIX_FMT_YA16BE)){/* Interleaved */

@@ -185,8 +185,8 @@ static int tonemap_slice(AVFilterContext *ctx, void *arg, int jobnr, int nb_jobs
     AVFrame *in = td->in;
     AVFrame *out = td->out;
     const AVPixFmtDescriptor *desc = td->desc;
-    const int slice_start = (in->height * jobnr) / nb_jobs;
-    const int slice_end = (in->height * (jobnr+1)) / nb_jobs;
+    const int slice_start = ff_slice_pos(in->height, jobnr, nb_jobs);
+    const int slice_end = ff_slice_pos(in->height, jobnr + 1, nb_jobs);
     double peak = td->peak;
 
     for (int y = slice_start; y < slice_end; y++)
@@ -263,7 +263,7 @@ static int filter_frame(AVFilterLink *link, AVFrame *in)
     if (desc->flags & AV_PIX_FMT_FLAG_ALPHA && odesc->flags & AV_PIX_FMT_FLAG_ALPHA) {
         av_image_copy_plane(out->data[3], out->linesize[3],
                             in->data[3], in->linesize[3],
-                            out->linesize[3], outlink->h);
+                            out->width * odesc->comp[3].step, outlink->h);
     } else if (odesc->flags & AV_PIX_FMT_FLAG_ALPHA) {
         for (y = 0; y < out->height; y++) {
             for (x = 0; x < out->width; x++) {

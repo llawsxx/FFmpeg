@@ -39,6 +39,7 @@
 #include "bytestream.h"
 #include "codec_internal.h"
 #include "decode.h"
+#include "internal.h"
 #include "thread.h"
 #include "jpeg2000.h"
 #include "jpeg2000dsp.h"
@@ -147,14 +148,17 @@ static int pix_fmt_match(enum AVPixelFormat pix_fmt, int components,
         match = match && desc->comp[3].depth >= bpc &&
                          (log2_chroma_wh >> 14 & 3) == 0 &&
                          (log2_chroma_wh >> 12 & 3) == 0;
+        av_fallthrough;
     case 3:
         match = match && desc->comp[2].depth >= bpc &&
                          (log2_chroma_wh >> 10 & 3) == desc->log2_chroma_w &&
                          (log2_chroma_wh >>  8 & 3) == desc->log2_chroma_h;
+        av_fallthrough;
     case 2:
         match = match && desc->comp[1].depth >= bpc &&
                          (log2_chroma_wh >>  6 & 3) == desc->log2_chroma_w &&
                          (log2_chroma_wh >>  4 & 3) == desc->log2_chroma_h;
+        av_fallthrough;
 
     case 1:
         match = match && desc->comp[0].depth >= bpc &&
@@ -563,13 +567,6 @@ static int get_cox(Jpeg2000DecoderContext *s, Jpeg2000CodingStyle *c)
     /* set integer 9/7 DWT in case of BITEXACT flag */
     if ((s->avctx->flags & AV_CODEC_FLAG_BITEXACT) && (c->transform == FF_DWT97))
         c->transform = FF_DWT97_INT;
-#if FF_API_CODEC_PROPS
-    else if (c->transform == FF_DWT53) {
-FF_DISABLE_DEPRECATION_WARNINGS
-        s->avctx->properties |= FF_CODEC_PROPERTY_LOSSLESS;
-FF_ENABLE_DEPRECATION_WARNINGS
-    }
-#endif
 
     if (c->csty & JPEG2000_CSTY_PREC) {
         int i;
@@ -1209,13 +1206,14 @@ static int jpeg2000_decode_packet(Jpeg2000DecoderContext *s, Jpeg2000Tile *tile,
                 if (incl) {
                     int zbp = tag_tree_decode(s, prec->zerobits + cblkno, 100);
                     int v = expn[bandno] + numgbits - 1 - (zbp - tile->comp->roi_shift);
-                    if (v < 0 || v > 30) {
+                    if (zbp >= 100 || v > 30 ||
+                        (v < 0 && (cblk->modes & JPEG2000_CTSY_HTJ2K_F))) {
                         av_log(s->avctx, AV_LOG_ERROR,
                                "nonzerobits %d invalid or unsupported\n", v);
                         return AVERROR_INVALIDDATA;
                     }
                     cblk->incl = 1;
-                    cblk->nonzerobits = v;
+                    cblk->nonzerobits = FFMAX(v, 0);
                     cblk->zbp = zbp;
                     cblk->lblock = 3;
                 }
@@ -1957,7 +1955,7 @@ static void decode_clnpass(const Jpeg2000DecoderContext *s, Jpeg2000T1Context *t
                            int width, int height, int bpno, int bandno,
                            int seg_symbols, int vert_causal_ctx_csty_symbol)
 {
-    int mask = 3 << (bpno - 1), y0, x, y, runlen, dec;
+    int mask = (3u << bpno)>>1, y0, x, y, runlen, dec;
 
     for (y0 = 0; y0 < height; y0 += 4) {
         for (x = 0; x < width; x++) {
@@ -2032,8 +2030,8 @@ static int decode_cblk(const Jpeg2000DecoderContext *s, Jpeg2000CodingStyle *cod
 
     memset(t1->data, 0, t1->stride * height * sizeof(*t1->data));
 
-    /* If code-block contains no compressed data: nothing to do. */
-    if (!cblk->length)
+    /* If code-block contains no compressed data or no coded bit-planes: nothing to do. */
+    if (!cblk->length || !cblk->nonzerobits)
         return 0;
 
     memset(t1->flags, 0, t1->stride * (height + 2) * sizeof(*t1->flags));
@@ -2108,7 +2106,7 @@ static int decode_cblk(const Jpeg2000DecoderContext *s, Jpeg2000CodingStyle *cod
             val &= INT32_MAX;
             /* ROI shift, if necessary */
             if (roi_shift && (((uint32_t)val & ~mask) == 0))
-                val <<= roi_shift;
+                val = (uint32_t)val << roi_shift;
             t1->data[n] = val | sign; /* NOTE: Binary point for reconstruction value is located in 31 - M_b */
         }
     }
@@ -2448,8 +2446,14 @@ static void jpeg2000_dec_cleanup(Jpeg2000DecoderContext *s)
     memset(s->qntsty, 0, sizeof(s->qntsty));
     memset(s->properties, 0, sizeof(s->properties));
     memset(&s->poc  , 0, sizeof(s->poc));
+    memset(s->roi_shift, 0, sizeof(s->roi_shift));
     s->numXtiles = s->numYtiles = 0;
     s->ncomponents = 0;
+    s->has_ppm = 0;
+    s->isHT = 0;
+    s->precision = 0;
+    s->colour_space = 0;
+    s->pal8 = 0;
 }
 
 static int jpeg2000_read_main_headers(Jpeg2000DecoderContext *s)
@@ -2853,7 +2857,7 @@ static av_cold int jpeg2000_decode_init(AVCodecContext *avctx)
 }
 
 static int jpeg2000_decode_frame(AVCodecContext *avctx, AVFrame *picture,
-                                 int *got_frame, AVPacket *avpkt)
+                                 const AVPacket *avpkt)
 {
     Jpeg2000DecoderContext *s = avctx->priv_data;
     int ret;
@@ -2900,7 +2904,7 @@ static int jpeg2000_decode_frame(AVCodecContext *avctx, AVFrame *picture,
 
     if (avctx->skip_frame >= AVDISCARD_ALL) {
         jpeg2000_dec_cleanup(s);
-        return avpkt->size;
+        return 0;
     }
 
     /* get picture buffer */
@@ -2914,20 +2918,44 @@ static int jpeg2000_decode_frame(AVCodecContext *avctx, AVFrame *picture,
         if (++x == s->ncomponents)
             picture->flags |= AV_FRAME_FLAG_LOSSLESS;
 
-    avctx->execute2(avctx, jpeg2000_decode_tile, picture, NULL, s->numXtiles * s->numYtiles);
+    avctx->execute2(avctx, jpeg2000_decode_tile, picture, NULL,
+                    s->numXtiles * s->numYtiles);
 
     jpeg2000_dec_cleanup(s);
-
-    *got_frame = 1;
 
     if (s->avctx->pix_fmt == AV_PIX_FMT_PAL8)
         memcpy(picture->data[1], s->palette, 256 * sizeof(uint32_t));
 
-    return bytestream2_tell(&s->g);
+    return 0;
 
 end:
+    /* Do not leave a partially initialized frame on the output. */
+    av_frame_unref(picture);
     jpeg2000_dec_cleanup(s);
     return ret;
+}
+
+static int jpeg2000_receive_frame(AVCodecContext *avctx, AVFrame *frame)
+{
+    AVPacket *const avpkt = avctx->internal->in_pkt;
+    int ret;
+
+    /* One codestream per packet. Loop so that skipped frames (produce no
+     * output) transparently pull the next packet instead of returning to the
+     * caller empty-handed. */
+    do {
+        ret = ff_decode_get_packet(avctx, avpkt);
+        if (ret < 0)
+            return ret;
+
+        ret = jpeg2000_decode_frame(avctx, frame, avpkt);
+        frame->pkt_dts = avpkt->dts;
+        av_packet_unref(avpkt);
+        if (ret < 0)
+            return ret;
+    } while (!frame->buf[0]);
+
+    return 0;
 }
 
 #define OFFSET(x) offsetof(Jpeg2000DecoderContext, x)
@@ -2954,7 +2982,7 @@ const FFCodec ff_jpeg2000_decoder = {
     .p.capabilities   = AV_CODEC_CAP_SLICE_THREADS | AV_CODEC_CAP_FRAME_THREADS | AV_CODEC_CAP_DR1,
     .priv_data_size   = sizeof(Jpeg2000DecoderContext),
     .init             = jpeg2000_decode_init,
-    FF_CODEC_DECODE_CB(jpeg2000_decode_frame),
+    FF_CODEC_RECEIVE_FRAME_CB(jpeg2000_receive_frame),
     .p.priv_class     = &jpeg2000_class,
     .p.max_lowres     = 5,
     .p.profiles       = NULL_IF_CONFIG_SMALL(ff_jpeg2000_profiles),

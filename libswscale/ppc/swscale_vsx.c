@@ -32,7 +32,6 @@
 #include "yuv2rgb_altivec.h"
 #include "libavutil/ppc/util_altivec.h"
 
-#if HAVE_VSX
 #define vzero vec_splat_s32(0)
 
 #if !HAVE_BIGENDIAN
@@ -54,7 +53,7 @@
     } while (0)
 
 #define LOAD_FILTER(vf,f) {\
-        vf = vec_vsx_ld(joffset, f);\
+        vf = vec_splats(f[j]);\
 }
 #define LOAD_L1(ll1,s,p){\
         ll1  = vec_vsx_ld(xoffset, s);\
@@ -1754,7 +1753,7 @@ static void hyscale_fast_vsx(SwsInternal *c, int16_t *dst, int dstWidth,
 
         xpos += xInc * 16;
     }
-    for (i=dstWidth-1; (i*xInc)>>16 >=srcW-1; i--)
+    for (i=dstWidth-1; (i*(int64_t)xInc)>>16 >=srcW-1; i--)
         dst[i] = src[srcW-1]*128;
 }
 
@@ -1850,7 +1849,7 @@ static void hcscale_fast_vsx(SwsInternal *c, int16_t *dst1, int16_t *dst2,
 
         xpos += xInc * 16;
     }
-    for (i=dstWidth-1; (i*xInc)>>16 >=srcW-1; i--) {
+    for (i=dstWidth-1; (i*(int64_t)xInc)>>16 >=srcW-1; i--) {
         dst1[i] = src1[srcW-1]*128;
         dst2[i] = src2[srcW-1]*128;
     }
@@ -2014,17 +2013,11 @@ static void hScale16To15_vsx(SwsInternal *c, int16_t *dst, int dstW,
 
 #endif /* !HAVE_BIGENDIAN */
 
-#endif /* HAVE_VSX */
-
 av_cold void ff_sws_init_swscale_vsx(SwsInternal *c)
 {
-#if HAVE_VSX
     enum AVPixelFormat dstFormat = c->opts.dst_format;
     const int cpu_flags = av_get_cpu_flags();
     const unsigned char power8 = HAVE_POWER8 && cpu_flags & AV_CPU_FLAG_POWER8;
-
-    if (!(cpu_flags & AV_CPU_FLAG_VSX))
-        return;
 
 #if !HAVE_BIGENDIAN
     if (c->srcBpc == 8) {
@@ -2203,6 +2196,4 @@ av_cold void ff_sws_init_swscale_vsx(SwsInternal *c)
         }
     }
 #endif /* !HAVE_BIGENDIAN */
-
-#endif /* HAVE_VSX */
 }

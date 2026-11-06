@@ -154,7 +154,8 @@ int avcodec_parameters_from_context(AVCodecParameters *par,
 
     switch (par->codec_type) {
     case AVMEDIA_TYPE_VIDEO:
-        par->format              = codec->pix_fmt;
+        par->format              = codec->sw_pix_fmt != AV_PIX_FMT_NONE ?
+                                   codec->sw_pix_fmt : codec->pix_fmt;
         par->width               = codec->width;
         par->height              = codec->height;
         par->field_order         = codec->field_order;
@@ -241,7 +242,6 @@ int avcodec_parameters_to_context(AVCodecContext *codec,
         codec->sample_rate      = par->sample_rate;
         codec->block_align      = par->block_align;
         codec->frame_size       = par->frame_size;
-        codec->delay            =
         codec->initial_padding  = par->initial_padding;
         codec->trailing_padding = par->trailing_padding;
         codec->seek_preroll     = par->seek_preroll;

@@ -26,6 +26,7 @@ gen=${16:-no}
 hwaccel=${17:-none}
 report_type=${18:-standard}
 keep=${19:-0}
+test "$keep" -ge 1 || cleanfiles=${20}
 
 outdir="tests/data/fate"
 outfile="${outdir}/${test}"
@@ -113,6 +114,35 @@ run_with_temp(){
     run $process_tmp $tmpfile
 }
 
+# Overwrite bytes at a specific offset in a binary file.
+# Usage: patch_bytes file offset octal-byte-string
+patch_bytes(){
+    file=$1
+    offset=$2
+    bytes=$3
+    printf "%b" "$bytes" |
+        dd of="$file" bs=1 seek="$offset" conv=notrunc 2>/dev/null
+}
+
+# Like run_with_temp but applies byte patches between creation and processing,
+# allowing on-the-fly generation of files with controlled header corruption.
+# Patches are trailing offset/bytes pairs; multiple pairs may be specified.
+# Usage: run_with_patched_temp create_cmd process_cmd ext [offset bytes ...]
+run_with_patched_temp(){
+    create_tmp=$1
+    process_tmp=$2
+    filext=$3
+    tmpfile=${outdir}/$test.$filext
+    cleanfiles="$cleanfiles $tmpfile"
+    shift 3
+    run $create_tmp $tmpfile || return 1
+    while [ $# -ge 2 ]; do
+        patch_bytes "$tmpfile" "$1" "$2"
+        shift 2
+    done
+    run $process_tmp $tmpfile
+}
+
 probefmt(){
     run ffprobe${PROGSUF}${EXECSUF} -bitexact -threads $threads -show_entries format=format_name -print_format default=nw=1:nk=1 "$@"
 }
@@ -153,7 +183,7 @@ probegaplessinfo(){
     pktfile1="${outdir}/${test}.pkts"
     framefile1="${outdir}/${test}.frames"
     cleanfiles="$cleanfiles $pktfile1 $framefile1"
-    run ffprobe${PROGSUF}${EXECSUF} -bitexact -threads $threads -select_streams a -of compact -count_packets -show_entries packet=pts,dts,duration,flags:stream=nb_read_packets "$filename" "$@" > "$pktfile1"
+    run ffprobe${PROGSUF}${EXECSUF} -bitexact -threads $threads -select_streams a -of compact -count_packets -show_entries packet=pts,dts,duration,flags:packet_side_data:stream=nb_read_packets "$filename" "$@" > "$pktfile1"
     head -n 8 "$pktfile1"
     tail -n 9 "$pktfile1"
     run ffprobe${PROGSUF}${EXECSUF} -bitexact -threads $threads -select_streams a -of compact -count_frames -show_entries frame=pts,pkt_dts,best_effort_timestamp,pkt_duration,nb_samples:stream=nb_read_frames "$filename" "$@" > "$framefile1"
@@ -224,7 +254,7 @@ enc_dec_pcm(){
     src_file=$(target_path $4)
     shift 4
     encfile="${outdir}/${test}.${out_fmt}"
-    cleanfiles=$encfile
+    cleanfiles="$cleanfiles $encfile"
     encfile=$(target_path ${encfile})
     ffmpeg -auto_conversion_filters -i $src_file "$@" -f $out_fmt -y ${encfile} || return
     ffmpeg -auto_conversion_filters -bitexact -i ${encfile} -c:a pcm_${pcm_fmt} -fflags +bitexact -f ${dec_fmt} -
@@ -290,7 +320,12 @@ transcode(){
     test -z "$final_encode_muxer" && final_encode_muxer="framecrc"
     encfile="${outdir}/${test}.${enc_fmt}"
     test $keep -ge 1 || cleanfiles="$cleanfiles $encfile"
-    tsrcfile=$(target_path $srcfile)
+    # lavfi graphs are not file paths, so do not run them through target_path.
+    if [ "$src_fmt" = "lavfi" ]; then
+        tsrcfile="$srcfile"
+    else
+        tsrcfile=$(target_path $srcfile)
+    fi
     tencfile=$(target_path $encfile)
     ffmpeg -f $src_fmt $DEC_OPTS $enc_opt_in -i $tsrcfile $additional_input \
            $ENC_OPTS $enc_opt $FLAGS -f $enc_fmt -y $tencfile || return
@@ -330,6 +365,8 @@ stream_remux(){
     tencfile=$(target_path $encfile)
     ffmpeg -f $src_fmt $src_opts -i $tsrcfile $stream_maps -codec copy $FLAGS \
         -f $enc_fmt -y $tencfile || return
+    do_md5sum $encfile
+    echo $(wc -c $encfile)
     ffmpeg $DEC_OPTS $final_decode -i $tencfile $ENC_OPTS $FLAGS $final_encode \
         -f framecrc - || return
     test -z "$ffprobe_opts" || \
@@ -431,9 +468,12 @@ lavf_container_fate()
     file=${outdir}/lavf.$t
     cleanfiles="$cleanfiles $file"
     input="${target_samples}/$1"
+    ffprobe_opts=$5
     do_avconv $file -auto_conversion_filters $DEC_OPTS $2 -i "$input" \
               "$ENC_OPTS -metadata title=lavftest" $3 -vcodec copy -acodec copy || return
     do_avconv_crc $file -auto_conversion_filters $DEC_OPTS -i $target_path/$file $4
+    test -z "$ffprobe_opts" || \
+        run ffprobe${PROGSUF}${EXECSUF} -bitexact -threads $threads $ffprobe_opts $file || return
 }
 
 lavf_image(){
@@ -469,6 +509,21 @@ lavf_image2pipe(){
     do_avconv_crc $file -auto_conversion_filters $DEC_OPTS -f image2pipe -i $target_path/$file
 }
 
+img2_update_filemtime(){
+    outdir="tests/data/lavf"
+    file=${outdir}/img2_mtime_%03d.pgm
+    cleanfiles="$cleanfiles ${outdir}/img2_mtime_001.pgm ${outdir}/img2_mtime_002.pgm ${outdir}/img2_mtime_003.pgm"
+    ffmpeg -f lavfi -i "color=c=black:s=2x2:r=1:d=3,format=gray8" \
+           -c:v pgm \
+           -metadata creation_time="2024-01-01T00:00:00.000000Z" \
+           -update_filemtime 1 \
+           -y $file || return
+    probe -f image2 -ts_from_file sec \
+          -show_entries packet=pts \
+          -of csv=p=0 \
+          -i $file
+}
+
 lavf_video(){
     t="${test#lavf-}"
     outdir="tests/data/lavf"
@@ -483,8 +538,9 @@ refcmp_metadata(){
     refcmp=$1
     pixfmt=$2
     fuzz=${3:-0.001}
+    filter=${4:-avgblur=4}
     ffmpeg -auto_conversion_filters $FLAGS $ENC_OPTS \
-        -lavfi "testsrc2=size=300x200:rate=1:duration=5,format=${pixfmt},split[ref][tmp];[tmp]avgblur=4[enc];[enc][ref]${refcmp},metadata=print:file=-" \
+        -lavfi "testsrc2=size=300x200:rate=1:duration=5,format=${pixfmt},split[ref][tmp];[tmp]${filter}[enc];[enc][ref]${refcmp},metadata=print:file=-" \
         -f null /dev/null | awk -v ref=${ref} -v fuzz=${fuzz} -f ${base}/refcmp-metadata.awk -
 }
 
@@ -670,7 +726,7 @@ concat(){
 
     concatfile="${outdir}/${test}.ffconcat"
     packetfile="${outdir}/${test}.ffprobe"
-    cleanfiles="$concatfile $packetfile"
+    cleanfiles="$cleanfiles $concatfile $packetfile"
 
     awk "{gsub(/%SRCFILE%/, \"$sample\"); print}" $template > $concatfile
 
@@ -682,11 +738,48 @@ concat(){
     fi
 }
 
+seek_concat(){
+    template=$1
+    sample=$2
+    shift 2
+
+    concatfile="${outdir}/${test}.ffconcat"
+    cleanfiles="$cleanfiles $concatfile"
+
+    awk "{gsub(/%SRCFILE%/, \"$sample\"); print}" $template > $concatfile
+    run libavformat/tests/seek${EXECSUF} $(target_path $concatfile) -safe 0 "$@"
+}
+
+seek_staggered(){
+    sample=$1
+    offset=$2
+    shift 2
+
+    file="${outdir}/${test}.mov"
+    cleanfiles="$cleanfiles $file"
+
+    ffmpeg -i $sample -itsoffset $offset -i $sample -map 0:a -map 1:a -c copy \
+        -fflags +bitexact -f mov -y $(target_path $file) || return
+    run libavformat/tests/seek${EXECSUF} $(target_path $file) "$@"
+}
+
 venc_data(){
     file=$1
     stream=$2
     frames=$3
     run tools/venc_data_dump${EXECSUF} ${file} ${stream} ${frames} ${threads} ${thread_type}
+}
+
+generic_tags(){
+    src_fmt="$1"
+    srcfile="$2"
+    enc_fmt="$3"
+    enc_codec="$4"
+    extra_args="${5:-}"
+    transcode "$src_fmt" "$srcfile" "$enc_fmt" \
+        "-c:a $enc_codec $extra_args" \
+        "-c copy" \
+        "-show_entries format_tags"
 }
 
 null(){
@@ -696,6 +789,9 @@ null(){
 # Disable globbing: command arguments may contain globbing characters and
 # must be kept verbatim
 set -f
+
+# A pipeline fails when any of its commands fails, if the shell supports it
+(set -o pipefail) 2>/dev/null && set -o pipefail
 
 exec 3>&2
 eval $command >"$outfile" 2>$errfile
@@ -745,7 +841,8 @@ fi
 
 if test $err = 0; then
     if test $keep -lt 2; then
-        rm -f $outfile $errfile $cmpfile $cleanfiles
+        set +f
+        rm -f "$outfile" "$errfile" "$cmpfile" $cleanfiles
     fi
 elif test $gen = "no"; then
     echo "Test $test failed. Look at $errfile for details."

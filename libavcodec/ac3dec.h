@@ -61,7 +61,6 @@
 #include "avcodec.h"
 #include "bswapdsp.h"
 #include "get_bits.h"
-#include "fmtconvert.h"
 
 #define AC3_OUTPUT_LFEON  8
 
@@ -83,7 +82,6 @@ typedef struct AC3DecodeContext {
     AVFloatDSPContext *fdsp;
 #endif
     AC3DSPContext ac3dsp;
-    FmtConvertContext fmt_conv;             ///< optimized conversion functions
 ///@}
 
     AVTXContext *tx_128, *tx_256;
@@ -95,8 +93,26 @@ typedef struct AC3DecodeContext {
     AVChannelLayout downmix_layout;
     SHORTFLOAT *downmix_coeffs[2];              ///< stereo downmix coefficients
 
+///@name AVOptions
+/// Fields backing AVOptions. They hold user configuration (or, for the
+/// exported downmix fields, values derived from the last decoded frame) and
+/// must survive avcodec_flush_buffers(), so they must stay above the start
+/// of the flushable fields below.
+///@{
+    int preferred_stereo_downmix;
+    float ltrt_center_mix_level;
+    float ltrt_surround_mix_level;
+    float loro_center_mix_level;
+    float loro_surround_mix_level;
+    int target_level;                       ///< target level in dBFS
+    INTFLOAT drc_scale;                     ///< percentage of dynamic range compression to be applied
+    int heavy_compression;                  ///< apply heavy compression
+    int consistent_noise_generation;        ///< seed noise generation with AC-3 frame on decode
+///@}
+
 // Start of flushable fields.
-// frame_type must be the flushable field, or the offset changed in ac3_decode_flush().
+// frame_type must be the first flushable field, or the offset changed in
+// ac3_decode_flush(). No AVOption field may be placed at or below this line.
 
 ///@name Bit stream information
 ///@{
@@ -129,12 +145,6 @@ typedef struct AC3DecodeContext {
     int dolby_headphone_mode;               ///< dolby headphone mode                   (dheadphonmod)
 ///@}
 
-    int preferred_stereo_downmix;
-    float ltrt_center_mix_level;
-    float ltrt_surround_mix_level;
-    float loro_center_mix_level;
-    float loro_surround_mix_level;
-    int target_level;                       ///< target level in dBFS
     float level_gain[2];
 
 ///@name Frame syntax parameters
@@ -196,18 +206,12 @@ typedef struct AC3DecodeContext {
 
 ///@name Dynamic range
     INTFLOAT dynamic_range[2];                 ///< dynamic range
-    INTFLOAT drc_scale;                        ///< percentage of dynamic range compression to be applied
-    int heavy_compression;                     ///< apply heavy compression
     INTFLOAT heavy_dynamic_range[2];           ///< heavy dynamic range compression
 ///@}
 
 ///@name Bandwidth
     int start_freq[AC3_MAX_CHANNELS];       ///< start frequency bin                    (strtmant)
     int end_freq[AC3_MAX_CHANNELS];         ///< end frequency bin                      (endmant)
-///@}
-
-///@name Consistent noise generation
-    int consistent_noise_generation;        ///< seed noise generation with AC-3 frame on decode
 ///@}
 
 ///@name Rematrixing
@@ -249,9 +253,12 @@ typedef struct AC3DecodeContext {
     SHORTFLOAT *outptr[AC3_MAX_CHANNELS];
 
 ///@name Aligned arrays
-    DECLARE_ALIGNED(16, int,   fixed_coeffs)[AC3_MAX_CHANNELS][AC3_MAX_COEFS];       ///< fixed-point transform coefficients
+    DECLARE_ALIGNED(32, INTFLOAT, coeffs)[AC3_MAX_CHANNELS][AC3_MAX_COEFS];          ///< decoded transform coefficients
     DECLARE_ALIGNED(32, INTFLOAT, transform_coeffs)[AC3_MAX_CHANNELS][AC3_MAX_COEFS];   ///< transform coefficients
     DECLARE_ALIGNED(32, INTFLOAT, delay)[EAC3_MAX_CHANNELS][AC3_BLOCK_SIZE];         ///< delay - added to the next block
+#if USE_FIXED
+    int delay_coeff_bits[2];            ///< coefficient format of delay[], per substream
+#endif
     DECLARE_ALIGNED(32, INTFLOAT, window)[AC3_BLOCK_SIZE];                              ///< window coefficients
     DECLARE_ALIGNED(32, INTFLOAT, tmp_output)[AC3_BLOCK_SIZE];                          ///< temporary storage for output before windowing
     DECLARE_ALIGNED(32, SHORTFLOAT, output)[EAC3_MAX_CHANNELS][AC3_BLOCK_SIZE];            ///< output after imdct transform and windowing
@@ -266,20 +273,20 @@ struct AC3HeaderInfo;
  * Parse the E-AC-3 frame header.
  * This parses both the bit stream info and audio frame header.
  */
-static int ff_eac3_parse_header(AC3DecodeContext *s, const struct AC3HeaderInfo *hdr);
+av_unused static int ff_eac3_parse_header(AC3DecodeContext *s, const struct AC3HeaderInfo *hdr);
 
 /**
  * Decode mantissas in a single channel for the entire frame.
  * This is used when AHT mode is enabled.
  */
-static void ff_eac3_decode_transform_coeffs_aht_ch(AC3DecodeContext *s, int ch);
+av_unused static void ff_eac3_decode_transform_coeffs_aht_ch(AC3DecodeContext *s, int ch);
 
 /**
  * Apply spectral extension to each channel by copying lower frequency
  * coefficients to higher frequency bins and applying side information to
  * approximate the original high frequency signal.
  */
-static void ff_eac3_apply_spectral_extension(AC3DecodeContext *s);
+av_unused static void ff_eac3_apply_spectral_extension(AC3DecodeContext *s);
 
 #if (!USE_FIXED)
 extern float ff_ac3_heavy_dynamic_range_tab[256];

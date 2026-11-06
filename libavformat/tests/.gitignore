@@ -1,9 +1,16 @@
+/auenc
+/id3v2
+/id3v2enc
 /fifo_muxer
 /imf
-/movenc
+/mkdir
 /noproxy
+/rename
 /rtmpdh
+/rtpdec
 /seek
 /srtp
 /url
 /seek_utils
+/http
+/ogg_pages

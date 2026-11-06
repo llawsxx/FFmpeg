@@ -6,6 +6,20 @@ fate-g722-encode: tests/data/asynth-16000-1.wav
 fate-g722-encode: SRC = tests/data/asynth-16000-1.wav
 fate-g722-encode: CMD = enc_dec_pcm wav framemd5 s16le $(SRC) -c:a g722
 
+FATE_VOICE-$(call ENCDEC, COMFORTNOISE, NUT, WAV_DEMUXER PCM_S16LE_DECODER WAV_MUXER PCM_S16LE_ENCODER PIPE_PROTOCOL) += fate-cng-encode
+fate-cng-encode: tests/data/asynth-8000-1.wav
+fate-cng-encode: SRC = tests/data/asynth-8000-1.wav
+fate-cng-encode: CMD = enc_dec_pcm nut wav s16le $(SRC) -c:a comfortnoise
+fate-cng-encode: REF = $(SRC)
+fate-cng-encode: CMP = stddev
+fate-cng-encode: CMP_TARGET = 8919.49
+fate-cng-encode: FUZZ = 0.1
+
+FATE_VOICE-$(call ENCMUX, COMFORTNOISE, NUT, WAV_DEMUXER PCM_S16LE_DECODER FILE_PROTOCOL) += fate-cng-enc-md5
+fate-cng-enc-md5: tests/data/asynth-8000-1.wav
+fate-cng-enc-md5: CMD = md5 -i $(TARGET_PATH)/tests/data/asynth-8000-1.wav -c:a comfortnoise -fflags +bitexact -flags +bitexact -f nut
+fate-cng-enc-md5: REF = $(SRC_PATH)/tests/ref/fate/cng-enc-md5
+
 FATE_VOICE-yes += $(FATE_G722-yes)
 fate-g722: $(FATE_G722-yes)
 
@@ -54,6 +68,13 @@ $(FATE_G726): SRC = tests/data/asynth-8000-1.wav
 FATE_VOICE-$(call FRAMEMD5, WAV, ADPCM_G726, WAV_MUXER ADPCM_G726_ENCODER PCM_S16LE_DECODER) += $(FATE_G726)
 fate-g726: $(FATE_G726)
 
+FATE_G726LE += fate-g726le-encode
+fate-g726le-encode: tests/data/asynth-8000-1.wav
+fate-g726le-encode: CMD = transcode wav $(TARGET_PATH)/tests/data/asynth-8000-1.wav g726le "-c:a g726le -b:a 32k" "-c:a pcm_s16le" "" "" "-f g726le -code_size 4"
+
+FATE_VOICE-$(call TRANSCODE, ADPCM_G726LE, G726LE, WAV_DEMUXER PCM_S16LE_DECODER) += $(FATE_G726LE)
+fate-g726le: $(FATE_G726LE)
+
 FATE_GSM-$(call FRAMECRC, WAV, GSM) += fate-gsm-ms
 fate-gsm-ms: CMD = framecrc -i $(TARGET_SAMPLES)/gsm/ciao.wav
 
@@ -72,6 +93,19 @@ FATE_VOICE-$(call PCM, WAV, TRUESPEECH) += fate-truespeech
 fate-truespeech: CMD = pcm -i $(TARGET_SAMPLES)/truespeech/a6.wav
 fate-truespeech: CMP = oneoff
 fate-truespeech: REF = $(SAMPLES)/truespeech/a6.pcm
+
+# This test reproduces a float-cast-overflow in the comfortnoise decoder
+# (cngdec.c) when fed with a 24-byte all-zero G.723.1 frame.
+# The bug causes positive float values to overflow to negative integer values
+# during clipping, resulting in massive negative bias (RMS near 0dB).
+# The fixed version clips correctly, resulting in quieter output (RMS < -3dB).
+FATE_VOICE-$(call FILTERDEMDECENCMUX, ASTATS NULLSRC FORMAT GEQ, G723_1, \
+                                      COMFORTNOISE WRAPPED_AVFRAME, PCM_S16LE RAWVIDEO, \
+                                      NULL RAWVIDEO, LAVFI_INDEV PIPE_PROTOCOL) += fate-comfortnoise
+fate-comfortnoise: CMP = grep
+fate-comfortnoise: REF = RMS level dB: \(-[3-9]\|-[1-9][0-9]\)
+fate-comfortnoise: CMD = ffmpeg -lavfi nullsrc=s=4x4,format=yuv420p,geq=lum=0:cb=0:cr=0 -vframes 1 -f rawvideo - | \
+    ffmpeg -f g723_1 -codec:a comfortnoise -i pipe: -af astats -c:a pcm_s16le -f null -
 
 FATE_SAMPLES_FFMPEG += $(FATE_VOICE-yes)
 fate-voice: $(FATE_VOICE-yes)

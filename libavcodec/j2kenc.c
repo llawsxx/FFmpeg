@@ -153,13 +153,14 @@ typedef struct {
 /** put n times val bit */
 static void put_bits(Jpeg2000EncoderContext *s, int val, int n) // TODO: optimize
 {
+    val <<= 7;
     while (n-- > 0){
         if (s->bit_index == 8)
         {
             s->bit_index = *s->buf == 0xff;
             *(++s->buf) = 0;
         }
-        *s->buf |= val << (7 - s->bit_index++);
+        *s->buf |= val >> s->bit_index++;
     }
 }
 
@@ -175,6 +176,8 @@ static void j2k_flush(Jpeg2000EncoderContext *s)
 {
     if (s->bit_index){
         s->bit_index = 0;
+        if (*s->buf == 0xff)
+            *(++s->buf) = 0;
         s->buf++;
     }
 }
@@ -276,11 +279,7 @@ static int put_cod(Jpeg2000EncoderContext *s)
     // SGcod
     bytestream_put_byte(&s->buf, s->prog); // progression level
     bytestream_put_be16(&s->buf, s->nlayers); // num of layers
-    if(s->avctx->pix_fmt == AV_PIX_FMT_YUV444P){
-        bytestream_put_byte(&s->buf, 0); // unspecified
-    }else{
-        bytestream_put_byte(&s->buf, 0); // unspecified
-    }
+    bytestream_put_byte(&s->buf, 0); // unspecified
     // SPcod
     bytestream_put_byte(&s->buf, codsty->nreslevels - 1); // num of decomp. levels
     bytestream_put_byte(&s->buf, codsty->log2_cblk_width-2); // cblk width
@@ -718,15 +717,16 @@ static int encode_packet(Jpeg2000EncoderContext *s, Jpeg2000ResLevel *rlevel, in
 {
     int bandno, empty = 1;
     int i;
-    // init bitstream
-    *s->buf = 0;
-    s->bit_index = 0;
-
     if (s->sop) {
         bytestream_put_be16(&s->buf, JPEG2000_SOP);
         bytestream_put_be16(&s->buf, 4);
         bytestream_put_be16(&s->buf, packetno);
     }
+
+    // init bitstream
+    *s->buf = 0;
+    s->bit_index = 0;
+
     // header
 
     if (!layno) {
@@ -778,6 +778,9 @@ static int encode_packet(Jpeg2000EncoderContext *s, Jpeg2000ResLevel *rlevel, in
                 break;
         }
     }
+
+    if (s->buf_end - s->buf < 3)
+        return -1;
 
     put_bits(s, !empty, 1);
     if (empty){
@@ -840,6 +843,10 @@ static int encode_packet(Jpeg2000EncoderContext *s, Jpeg2000ResLevel *rlevel, in
             }
         }
     }
+
+    if (s->buf_end - s->buf < 2 + 2 * s->eph)
+        return -1;
+
     j2k_flush(s);
     if (s->eph) {
         bytestream_put_be16(&s->buf, JPEG2000_EPH);
@@ -1384,11 +1391,12 @@ static int encode_tile(Jpeg2000EncoderContext *s, Jpeg2000Tile *tile, int tileno
                                 }
                             }
                         } else{
+                            int64_t multiplier = (int64_t)(16384 * 65536 / band->i_stepsize);
                             for (y = yy0; y < yy1; y++){
                                 int *ptr = t1.data + (y-yy0)*t1.stride;
                                 for (x = xx0; x < xx1; x++){
                                     *ptr = (comp->i_data[(comp->coord[0][1] - comp->coord[0][0]) * y + x]);
-                                    *ptr = (int64_t)*ptr * (int64_t)(16384 * 65536 / band->i_stepsize) >> 15 - NMSEDEC_FRACBITS;
+                                    *ptr = (int64_t)*ptr * multiplier >> 15 - NMSEDEC_FRACBITS;
                                     ptr++;
                                 }
                             }

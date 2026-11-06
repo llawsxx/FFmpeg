@@ -37,7 +37,6 @@
 
 #include <stddef.h>
 
-#include "libavutil/attributes.h"
 #include "libavutil/avutil.h"
 #include "libavutil/buffer.h"
 #include "libavutil/dict.h"
@@ -145,6 +144,12 @@ typedef struct AVFilterFormatsConfig {
      * List of supported alpha modes, only for video with an alpha channel.
      */
     AVFilterFormats *alpha_modes;  ///< AVAlphaMode
+
+    /**
+     * List of supported chroma sample locations, only for video with
+     * subsampled chroma.
+     */
+    AVFilterFormats *chroma_locations; ///< AVChromaLocation
 
 } AVFilterFormatsConfig;
 
@@ -315,26 +320,7 @@ typedef struct AVFilterContext {
      */
     int nb_threads;
 
-#if FF_API_CONTEXT_PUBLIC
-    /**
-     * @deprecated unused
-     */
-    attribute_deprecated
-    struct AVFilterCommand *command_queue;
-#endif
-
     char *enable_str;               ///< enable expression string
-#if FF_API_CONTEXT_PUBLIC
-    /**
-     * @deprecated unused
-     */
-    attribute_deprecated
-    void *enable;
-    /**
-     * @deprecated unused
-     */
-    double *var_values;
-#endif
     /**
      * MUST NOT be accessed from outside avfilter.
      *
@@ -354,14 +340,6 @@ typedef struct AVFilterContext {
      * avfilter_init_dict().
      */
     AVBufferRef *hw_device_ctx;
-
-#if FF_API_CONTEXT_PUBLIC
-    /**
-     * @deprecated this field should never have been accessed by callers
-     */
-    attribute_deprecated
-    unsigned ready;
-#endif
 
     /**
      * Sets the number of extra hardware frames which the filter will
@@ -434,6 +412,11 @@ struct AVFilterLink {
     int nb_side_data;
 
     enum AVAlphaMode alpha_mode; ///< alpha mode (for videos with an alpha channel)
+
+    /**
+     * Agreed upon chroma sample location, for video with subsampled chroma.
+     */
+    enum AVChromaLocation chroma_location;
 
     /*****************************************************************
      * All fields below this line are not part of the public API. They
@@ -637,13 +620,19 @@ typedef struct AVFilterGraph {
 
     char *aresample_swr_opts; ///< swr options to use for the auto-inserted aresample filters, Access ONLY through AVOptions
 
+#if FF_API_MAX_BUFFERED_FRAMES
     /**
-     * Sets the maximum number of buffered frames in the filtergraph combined.
+     * Sets the maximum number of combined buffered frames of each media type
+     * in the filtergraph.
      *
      * Zero means no limit. This field must be set before calling
      * avfilter_graph_config().
+     *
+     * @deprecated use avfilter_graph_set_max_buffered_frames() instead
      */
+    attribute_deprecated
     unsigned max_buffered_frames;
+#endif
 } AVFilterGraph;
 
 /**
@@ -718,6 +707,23 @@ enum {
     AVFILTER_AUTO_CONVERT_ALL  =  0, /**< all automatic conversions enabled */
     AVFILTER_AUTO_CONVERT_NONE = -1, /**< all automatic conversions disabled */
 };
+
+/**
+ * Set the maximum number of combined buffered frames of a given media type in
+ * the filtergraph. When set, this overrides the value inherited from
+ * AVFilterGraph.max_buffered_frames for that media type.
+ *
+ * @param graph  the filter graph
+ * @param type   the media type to set the limit for
+ * @param frames the maximum number of buffered frames, or zero to disable
+ * @return >= 0 in case of success, or a negative error
+ *
+ * @note This will return AVERROR(EINVAL) if the requested limit is lower
+ *       than the number of frames already buffered.
+ */
+int avfilter_graph_set_max_buffered_frames(AVFilterGraph *graph,
+                                           enum AVMediaType type,
+                                           unsigned frames);
 
 /**
  * Check validity and configure all the links and formats in the graph.

@@ -71,6 +71,8 @@ enum {
 
 #define MPD_PROFILE_DASH 1
 #define MPD_PROFILE_DVB  2
+#define DASH_MAX_AVAILABILITY_START_TIME_MS (INT64_MAX / 1000)
+#define DASH_MAX_SUGGESTED_PRESENTATION_DELAY ((int64_t)INT_MAX * AV_TIME_BASE + AV_TIME_BASE - 1)
 
 typedef struct Segment {
     char file[1024];
@@ -200,6 +202,8 @@ typedef struct DASHContext {
     AVRational min_playback_rate;
     AVRational max_playback_rate;
     int64_t update_period;
+    int64_t availability_start_time_ms;
+    int64_t suggested_presentation_delay;
 } DASHContext;
 
 static int dashenc_io_open(AVFormatContext *s, AVIOContext **pb, char *filename,
@@ -432,7 +436,7 @@ static void write_hls_media_playlist(OutputStream *os, AVFormatContext *s,
                                 (double) seg->duration / timescale, 0,
                                 seg->range_length, seg->start_pos, NULL,
                                 c->single_file ? os->initfile : seg->file,
-                                &prog_date_time, 0, 0, 0);
+                                &prog_date_time, 0);
         if (ret < 0) {
             av_log(os->ctx, AV_LOG_WARNING, "ff_hls_write_file_entry get error\n");
         }
@@ -490,7 +494,7 @@ static void dash_free(AVFormatContext *s)
             if (!c->single_file)
                 ffio_free_dyn_buf(&os->ctx->pb);
             else
-                avio_close(os->ctx->pb);
+                ff_format_io_close(s, &os->ctx->pb);
         }
         ff_format_io_close(s, &os->out);
         avformat_free_context(os->ctx);
@@ -586,42 +590,10 @@ static void output_segment_list(OutputStream *os, AVIOContext *out, AVFormatCont
 }
 
 static char *xmlescape(const char *str) {
-    int outlen = strlen(str)*3/2 + 6;
-    char *out = av_realloc(NULL, outlen + 1);
-    int pos = 0;
-    if (!out)
+    char *out;
+    if (av_escape(&out, str, NULL, AV_ESCAPE_MODE_XML,
+                  AV_ESCAPE_FLAG_XML_SINGLE_QUOTES | AV_ESCAPE_FLAG_XML_DOUBLE_QUOTES) < 0)
         return NULL;
-    for (; *str; str++) {
-        if (pos + 6 > outlen) {
-            char *tmp;
-            outlen = 2 * outlen + 6;
-            tmp = av_realloc(out, outlen + 1);
-            if (!tmp) {
-                av_free(out);
-                return NULL;
-            }
-            out = tmp;
-        }
-        if (*str == '&') {
-            memcpy(&out[pos], "&amp;", 5);
-            pos += 5;
-        } else if (*str == '<') {
-            memcpy(&out[pos], "&lt;", 4);
-            pos += 4;
-        } else if (*str == '>') {
-            memcpy(&out[pos], "&gt;", 4);
-            pos += 4;
-        } else if (*str == '\'') {
-            memcpy(&out[pos], "&apos;", 6);
-            pos += 6;
-        } else if (*str == '\"') {
-            memcpy(&out[pos], "&quot;", 6);
-            pos += 6;
-        } else {
-            out[pos++] = *str;
-        }
-    }
-    out[pos] = '\0';
     return out;
 }
 
@@ -678,8 +650,13 @@ static int write_adaptation_set(AVFormatContext *s, AVIOContext *out, int as_ind
         avio_printf(out, " par=\"%d:%d\"", as->par.num, as->par.den);
     }
     lang = av_dict_get(as->metadata, "language", NULL, 0);
-    if (lang)
-        avio_printf(out, " lang=\"%s\"", lang->value);
+    if (lang) {
+        char *escaped = xmlescape(lang->value);
+        if (!escaped)
+            return AVERROR(ENOMEM);
+        avio_printf(out, " lang=\"%s\"", escaped);
+        av_free(escaped);
+    }
     avio_printf(out, ">\n");
 
     if (!final && c->ldash && as->max_frag_duration && !(c->profile & MPD_PROFILE_DVB))
@@ -687,8 +664,13 @@ static int write_adaptation_set(AVFormatContext *s, AVIOContext *out, int as_ind
     if (as->trick_idx >= 0)
         avio_printf(out, "\t\t\t<EssentialProperty id=\"%d\" schemeIdUri=\"http://dashif.org/guidelines/trickmode\" value=\"%d\"/>\n", as->id, as->trick_idx);
     role = av_dict_get(as->metadata, "role", NULL, 0);
-    if (role)
-        avio_printf(out, "\t\t\t<Role schemeIdUri=\"urn:mpeg:dash:role:2011\" value=\"%s\"/>\n", role->value);
+    if (role) {
+        char *escaped = xmlescape(role->value);
+        if (!escaped)
+            return AVERROR(ENOMEM);
+        avio_printf(out, "\t\t\t<Role schemeIdUri=\"urn:mpeg:dash:role:2011\" value=\"%s\"/>\n", escaped);
+        av_free(escaped);
+    }
     if (as->descriptor)
         avio_printf(out, "\t\t\t%s\n", as->descriptor);
     for (i = 0; i < s->nb_streams; i++) {
@@ -702,7 +684,9 @@ static int write_adaptation_set(AVFormatContext *s, AVIOContext *out, int as_ind
         if (os->bit_rate > 0)
             snprintf(bandwidth_str, sizeof(bandwidth_str), " bandwidth=\"%d\"", os->bit_rate);
         else if (final) {
-            int average_bit_rate = os->pos * 8 * AV_TIME_BASE / c->total_duration;
+            int average_bit_rate = 0;
+            if (c->total_duration > 0)
+                average_bit_rate = os->pos * 8 * AV_TIME_BASE / c->total_duration;
             snprintf(bandwidth_str, sizeof(bandwidth_str), " bandwidth=\"%d\"", average_bit_rate);
         } else if (os->first_segment_bit_rate > 0)
             snprintf(bandwidth_str, sizeof(bandwidth_str), " bandwidth=\"%d\"", os->first_segment_bit_rate);
@@ -1046,8 +1030,14 @@ static int write_manifest(AVFormatContext *s, int final)
         if (c->update_period)
             update_period = c->update_period;
         avio_printf(out, "\tminimumUpdatePeriod=\"PT%"PRId64"S\"\n", update_period);
-        if (!c->ldash)
-            avio_printf(out, "\tsuggestedPresentationDelay=\"PT%"PRId64"S\"\n", c->last_duration / AV_TIME_BASE);
+        if (!c->ldash) {
+            if (c->suggested_presentation_delay) {
+                avio_printf(out, "\tsuggestedPresentationDelay=\"");
+                write_time(out, c->suggested_presentation_delay);
+                avio_printf(out, "\"\n");
+            } else
+                avio_printf(out, "\tsuggestedPresentationDelay=\"PT%"PRId64"S\"\n", c->last_duration / AV_TIME_BASE);
+        }
         if (c->availability_start_time[0])
             avio_printf(out, "\tavailabilityStartTime=\"%s\"\n", c->availability_start_time);
         format_date(now_str, sizeof(now_str), av_gettime());
@@ -1098,8 +1088,10 @@ static int write_manifest(AVFormatContext *s, int final)
     }
 
     for (i = 0; i < c->nb_as; i++) {
-        if ((ret = write_adaptation_set(s, out, i, final)) < 0)
+        if ((ret = write_adaptation_set(s, out, i, final)) < 0) {
+            dashenc_io_close(s, &c->mpd_out, temp_filename);
             return ret;
+        }
     }
     avio_printf(out, "\t</Period>\n");
 
@@ -1453,12 +1445,14 @@ static int dash_init(AVFormatContext *s)
         snprintf(filename, sizeof(filename), "%s%s", c->dirname, os->initfile);
         set_http_options(&opts, c);
         if (!c->single_file) {
-            if ((ret = avio_open_dyn_buf(&ctx->pb)) < 0)
+            if ((ret = avio_open_dyn_buf(&ctx->pb)) < 0) {
+                av_dict_free(&opts);
                 return ret;
+            }
             ret = s->io_open(s, &os->out, filename, AVIO_FLAG_WRITE, &opts);
         } else {
             ctx->url = av_strdup(filename);
-            ret = avio_open2(&ctx->pb, filename, AVIO_FLAG_WRITE, NULL, &opts);
+            ret = s->io_open(s, &ctx->pb, filename, AVIO_FLAG_WRITE, &opts);
         }
         av_dict_free(&opts);
         if (ret < 0)
@@ -1982,9 +1976,12 @@ static int dash_write_packet(AVFormatContext *s, AVPacket *pkt)
 
     if (!c->availability_start_time[0]) {
         int64_t start_time_us = av_gettime();
+        int64_t mpd_start_time_us = c->availability_start_time_ms ?
+                                    c->availability_start_time_ms * 1000 :
+                                    start_time_us;
         c->start_time_s = start_time_us / 1000000;
         format_date(c->availability_start_time,
-                    sizeof(c->availability_start_time), start_time_us);
+                    sizeof(c->availability_start_time), mpd_start_time_us);
     }
 
     if (!os->packets_written)
@@ -2266,7 +2263,9 @@ static const AVOption options[] = {
     { "seg_duration", "segment duration (in seconds, fractional value can be set)", OFFSET(seg_duration), AV_OPT_TYPE_DURATION, { .i64 = 5000000 }, 0, INT_MAX, E },
     { "single_file", "Store all segments in one file, accessed using byte ranges", OFFSET(single_file), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, E },
     { "single_file_name", "DASH-templated name to be used for baseURL. Implies storing all segments in one file, accessed using byte ranges", OFFSET(single_file_name), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, E },
+    { "availability_start_time_ms", "set MPD availabilityStartTime as epoch milliseconds", OFFSET(availability_start_time_ms), AV_OPT_TYPE_INT64, { .i64 = 0 }, 0, DASH_MAX_AVAILABILITY_START_TIME_MS, E },
     { "streaming", "Enable/Disable streaming mode of output. Each frame will be moof fragment", OFFSET(streaming), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, E },
+    { "suggested_presentation_delay", "set MPD suggestedPresentationDelay", OFFSET(suggested_presentation_delay), AV_OPT_TYPE_DURATION, { .i64 = 0 }, 0, DASH_MAX_SUGGESTED_PRESENTATION_DELAY, E },
     { "target_latency", "Set desired target latency for Low-latency dash", OFFSET(target_latency), AV_OPT_TYPE_DURATION, { .i64 = 0 }, 0, INT_MAX, E },
     { "timeout", "set timeout for socket I/O operations", OFFSET(timeout), AV_OPT_TYPE_DURATION, { .i64 = -1 }, -1, INT_MAX, .flags = E },
     { "update_period", "Set the mpd update interval", OFFSET(update_period), AV_OPT_TYPE_INT64, {.i64 = 0}, 0, INT64_MAX, E},

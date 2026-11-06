@@ -43,6 +43,7 @@
 #include "vpx_rac.h"
 #include "libavutil/attributes.h"
 #include "libavutil/avassert.h"
+#include "libavutil/intreadwrite.h"
 #include "libavutil/mem.h"
 #include "libavutil/pixdesc.h"
 #include "libavutil/video_enc_params.h"
@@ -97,10 +98,10 @@ static void vp9_tile_data_free(VP9TileData *td)
 
 static void vp9_frame_unref(VP9Frame *f)
 {
+    av_refstruct_unref(&f->hwaccel_picture_private);
     ff_progress_frame_unref(&f->tf);
     av_refstruct_unref(&f->header_ref);
     av_refstruct_unref(&f->extradata);
-    av_refstruct_unref(&f->hwaccel_picture_private);
     f->segmentation_map = NULL;
 }
 
@@ -112,6 +113,12 @@ static int vp9_frame_alloc(AVCodecContext *avctx, VP9Frame *f)
     ret = ff_progress_frame_get_buffer(avctx, &f->tf, AV_GET_BUFFER_FLAG_REF);
     if (ret < 0)
         return ret;
+
+    if (!avctx->hwaccel && f->tf.f->linesize[1] != f->tf.f->linesize[2]) {
+        av_log(avctx, AV_LOG_ERROR, "uv stride mismatch unsupported\n");
+        ret = AVERROR_PATCHWELCOME;
+        goto fail;
+    }
 
     sz = 64 * s->sb_cols * s->sb_rows;
     if (sz != s->frame_extradata_pool_size) {
@@ -150,6 +157,8 @@ static void vp9_frame_replace(VP9Frame *dst, const VP9Frame *src)
     av_refstruct_replace(&dst->header_ref, src->header_ref);
     dst->frame_header = src->frame_header;
 
+    av_refstruct_replace(&dst->hwaccel_picture_private,
+                          src->hwaccel_picture_private);
     ff_progress_frame_replace(&dst->tf, &src->tf);
 
     av_refstruct_replace(&dst->extradata, src->extradata);
@@ -157,9 +166,6 @@ static void vp9_frame_replace(VP9Frame *dst, const VP9Frame *src)
     dst->segmentation_map = src->segmentation_map;
     dst->mv = src->mv;
     dst->uses_2pass = src->uses_2pass;
-
-    av_refstruct_replace(&dst->hwaccel_picture_private,
-                          src->hwaccel_picture_private);
 }
 
 static int update_size(AVCodecContext *avctx, int w, int h)
@@ -168,6 +174,7 @@ static int update_size(AVCodecContext *avctx, int w, int h)
                      CONFIG_VP9_D3D11VA_HWACCEL * 2 + \
                      CONFIG_VP9_D3D12VA_HWACCEL + \
                      CONFIG_VP9_NVDEC_HWACCEL + \
+                     CONFIG_VP9_NVDEC_CUARRAY_HWACCEL + \
                      CONFIG_VP9_VAAPI_HWACCEL + \
                      CONFIG_VP9_VDPAU_HWACCEL + \
                      CONFIG_VP9_VIDEOTOOLBOX_HWACCEL + \
@@ -202,6 +209,9 @@ static int update_size(AVCodecContext *avctx, int w, int h)
 #if CONFIG_VP9_NVDEC_HWACCEL
             *fmtp++ = AV_PIX_FMT_CUDA;
 #endif
+#if CONFIG_VP9_NVDEC_CUARRAY_HWACCEL
+            *fmtp++ = AV_PIX_FMT_CUARRAY;
+#endif
 #if CONFIG_VP9_VAAPI_HWACCEL
             *fmtp++ = AV_PIX_FMT_VAAPI;
 #endif
@@ -218,6 +228,9 @@ static int update_size(AVCodecContext *avctx, int w, int h)
         case AV_PIX_FMT_YUV420P12:
 #if CONFIG_VP9_NVDEC_HWACCEL
             *fmtp++ = AV_PIX_FMT_CUDA;
+#endif
+#if CONFIG_VP9_NVDEC_CUARRAY_HWACCEL
+            *fmtp++ = AV_PIX_FMT_CUARRAY;
 #endif
 #if CONFIG_VP9_VAAPI_HWACCEL
             *fmtp++ = AV_PIX_FMT_VAAPI;
@@ -255,8 +268,10 @@ static int update_size(AVCodecContext *avctx, int w, int h)
         *fmtp = AV_PIX_FMT_NONE;
 
         ret = ff_get_format(avctx, pix_fmts);
-        if (ret < 0)
+        if (ret < 0) {
+            ff_set_dimensions(avctx, s->w, s->h);
             return ret;
+        }
 
         avctx->pix_fmt = ret;
         s->gf_fmt  = s->pix_fmt;
@@ -704,12 +719,6 @@ static int decode_frame_header(AVCodecContext *avctx,
     s->s.h.uvac_qdelta = get_bits1(&s->gb) ? get_sbits_inv(&s->gb, 4) : 0;
     s->s.h.lossless    = s->s.h.yac_qi == 0 && s->s.h.ydc_qdelta == 0 &&
                        s->s.h.uvdc_qdelta == 0 && s->s.h.uvac_qdelta == 0;
-#if FF_API_CODEC_PROPS
-FF_DISABLE_DEPRECATION_WARNINGS
-    if (s->s.h.lossless)
-        avctx->properties |= FF_CODEC_PROPERTY_LOSSLESS;
-FF_ENABLE_DEPRECATION_WARNINGS
-#endif
 
     /* segmentation header info */
     if ((s->s.h.segmentation.enabled = get_bits1(&s->gb))) {
@@ -1578,6 +1587,24 @@ static int vp9_export_enc_params(VP9Context *s, VP9Frame *frame)
     return 0;
 }
 
+static void vp9_warn_unsupported_webm_alpha(AVCodecContext *avctx,
+                                            const AVPacket *pkt)
+{
+    VP9Context *s = avctx->priv_data;
+    const uint8_t *sd;
+    size_t sd_size;
+
+    sd = av_packet_get_side_data(pkt, AV_PKT_DATA_MATROSKA_BLOCKADDITIONAL,
+                                 &sd_size);
+    if (!sd || sd_size < 8 || AV_RB64(sd) != 1)
+        return;
+
+    av_log_once(avctx, AV_LOG_WARNING, AV_LOG_DEBUG,
+                &s->webm_alpha_warned,
+                "Ignoring unsupported WebM alpha channel side data; use the "
+                "libvpx-vp9 decoder to decode it.\n");
+}
+
 static int vp9_decode_frame(AVCodecContext *avctx, AVFrame *frame,
                             int *got_frame, AVPacket *pkt)
 {
@@ -1592,6 +1619,8 @@ static int vp9_decode_frame(AVCodecContext *avctx, AVFrame *frame,
                             (!s->s.h.segmentation.enabled || !s->s.h.segmentation.update_map);
     const VP9Frame *src;
     AVFrame *f;
+
+    vp9_warn_unsupported_webm_alpha(avctx, pkt);
 
     ret = ff_cbs_read_packet(s->cbc, &s->current_frag, pkt);
     if (ret < 0) {
@@ -1625,6 +1654,10 @@ static int vp9_decode_frame(AVCodecContext *avctx, AVFrame *frame,
             return ret;
         frame->pts     = pkt->pts;
         frame->pkt_dts = pkt->dts;
+        if (pkt->flags & AV_PKT_FLAG_DISCARD)
+            frame->flags |= AV_FRAME_FLAG_DISCARD;
+        else
+            frame->flags &= ~AV_FRAME_FLAG_DISCARD;
         *got_frame = 1;
         return pkt->size;
     }
@@ -1637,8 +1670,10 @@ static int vp9_decode_frame(AVCodecContext *avctx, AVFrame *frame,
         vp9_frame_replace(&s->s.frames[REF_FRAME_SEGMAP], src);
     vp9_frame_replace(&s->s.frames[REF_FRAME_MVPAIR], src);
     vp9_frame_unref(&s->s.frames[CUR_FRAME]);
-    if ((ret = vp9_frame_alloc(avctx, &s->s.frames[CUR_FRAME])) < 0)
+    if ((ret = vp9_frame_alloc(avctx, &s->s.frames[CUR_FRAME])) < 0) {
+        ff_cbs_fragment_reset(&s->current_frag);
         return ret;
+    }
 
     s->s.frames[CUR_FRAME].header_ref = av_refstruct_ref(s->header_ref);
     s->s.frames[CUR_FRAME].frame_header = s->frame_header;
@@ -1672,13 +1707,13 @@ static int vp9_decode_frame(AVCodecContext *avctx, AVFrame *frame,
         const FFHWAccel *hwaccel = ffhwaccel(avctx->hwaccel);
         ret = hwaccel->start_frame(avctx, pkt->buf, pkt->data, pkt->size);
         if (ret < 0)
-            return ret;
+            goto fail;
         ret = hwaccel->decode_slice(avctx, pkt->data, pkt->size);
         if (ret < 0)
-            return ret;
+            goto fail;
         ret = hwaccel->end_frame(avctx);
         if (ret < 0)
-            return ret;
+            goto fail;
 
         for (i = 0; i < 8; i++) {
             vp9_frame_replace(&s->s.ref_frames[i],
@@ -1706,7 +1741,7 @@ static int vp9_decode_frame(AVCodecContext *avctx, AVFrame *frame,
     if ((ret = update_block_buffers(avctx)) < 0) {
         av_log(avctx, AV_LOG_ERROR,
                "Failed to allocate block buffers\n");
-        return ret;
+        goto fail;
     }
     if (s->s.h.refreshctx && s->s.h.parallelmode) {
         int j, k, l, m;
@@ -1764,13 +1799,17 @@ static int vp9_decode_frame(AVCodecContext *avctx, AVFrame *frame,
                         data += 4;
                         size -= 4;
                     }
-                    if (tile_size > size)
-                        return AVERROR_INVALIDDATA;
+                    if (tile_size > size) {
+                        ret = AVERROR_INVALIDDATA;
+                        goto fail;
+                    }
                     ret = ff_vpx_init_range_decoder(&s->td[tile_col].c_b[tile_row], data, tile_size);
                     if (ret < 0)
-                        return ret;
-                    if (vpx_rac_get_prob_branchy(&s->td[tile_col].c_b[tile_row], 128)) // marker bit
-                        return AVERROR_INVALIDDATA;
+                        goto fail;
+                    if (vpx_rac_get_prob_branchy(&s->td[tile_col].c_b[tile_row], 128)) { // marker bit
+                        ret = AVERROR_INVALIDDATA;
+                        goto fail;
+                    }
                     data += tile_size;
                     size -= tile_size;
                 }
@@ -1825,6 +1864,7 @@ finish:
 
     return pkt->size;
 fail:
+    ff_cbs_fragment_reset(&s->current_frag);
     ff_progress_frame_report(&s->s.frames[CUR_FRAME].tf, INT_MAX);
     return ret;
 }
@@ -1839,6 +1879,7 @@ static av_cold void vp9_decode_flush(AVCodecContext *avctx)
 
     for (i = 0; i < 8; i++) {
         ff_progress_frame_unref(&s->s.refs[i]);
+        ff_progress_frame_unref(&s->next_refs[i]);
         vp9_frame_unref(&s->s.ref_frames[i]);
     }
 
@@ -1906,6 +1947,7 @@ static int vp9_decode_update_thread_context(AVCodecContext *dst, const AVCodecCo
     s->s.h.bpp = ssrc->s.h.bpp;
     s->bpp_index = ssrc->bpp_index;
     s->pix_fmt = ssrc->pix_fmt;
+    s->webm_alpha_warned = ssrc->webm_alpha_warned;
     memcpy(&s->prob_ctx, &ssrc->prob_ctx, sizeof(s->prob_ctx));
     memcpy(&s->s.h.lf_delta, &ssrc->s.h.lf_delta, sizeof(s->s.h.lf_delta));
     memcpy(&s->s.h.segmentation.feat, &ssrc->s.h.segmentation.feat,
@@ -1947,6 +1989,9 @@ const FFCodec ff_vp9_decoder = {
 #endif
 #if CONFIG_VP9_NVDEC_HWACCEL
                                HWACCEL_NVDEC(vp9),
+#endif
+#if CONFIG_VP9_NVDEC_CUARRAY_HWACCEL
+                               HWACCEL_NVDEC_CUARRAY(vp9),
 #endif
 #if CONFIG_VP9_VAAPI_HWACCEL
                                HWACCEL_VAAPI(vp9),

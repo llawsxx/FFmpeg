@@ -43,6 +43,8 @@
 #include "copy_block.h"
 #include "decode.h"
 #include "exif.h"
+#include "exif_internal.h"
+#include "gain_map.h"
 #include "hwaccel_internal.h"
 #include "hwconfig.h"
 #include "idctdsp.h"
@@ -385,6 +387,7 @@ int ff_mjpeg_decode_sof(MJpegDecodeContext *s)
     }
 
     s->nb_components = nb_components;
+    s->nb_seq_component_scans = 0;
     s->h_max         = 1;
     s->v_max         = 1;
     for (i = 0; i < nb_components; i++) {
@@ -426,19 +429,6 @@ int ff_mjpeg_decode_sof(MJpegDecodeContext *s)
         return AVERROR_PATCHWELCOME;
     }
 
-    if (s->bayer) {
-        if (nb_components == 2) {
-            /* Bayer images embedded in DNGs can contain 2 interleaved components and the
-               width stored in their SOF3 markers is the width of each one.  We only output
-               a single component, therefore we need to adjust the output image width.  We
-               handle the deinterleaving (but not the debayering) in this file. */
-            width *= 2;
-        }
-        /* They can also contain 1 component, which is double the width and half the height
-            of the final image (rows are interleaved).  We don't handle the decoding in this
-            file, but leave that to the TIFF/DNG decoder. */
-    }
-
     /* if different size, realloc/alloc picture */
     if (width != s->width || height != s->height || bits != s->bits ||
         memcmp(s->h_count, h_count, sizeof(h_count))                ||
@@ -474,6 +464,19 @@ int ff_mjpeg_decode_sof(MJpegDecodeContext *s)
              s->avctx->codec_tag == MKTAG('A', 'V', 'D', 'J')) &&
             s->orig_height < height)
             s->avctx->height = AV_CEIL_RSHIFT(s->orig_height, s->avctx->lowres);
+
+        if (s->bayer) {
+            if (nb_components == 2) {
+                /* Bayer images embedded in DNGs can contain 2 interleaved components and the
+                 * width stored in their SOF3 markers is the width of each one.  We only output
+                 * a single component, therefore we need to adjust the output image width.  We
+                 * handle the deinterleaving (but not the debayering) in this file. */
+                s->avctx->width *= 2;
+            }
+            /* They can also contain 1 component, which is double the width and half the height
+             * of the final image (rows are interleaved).  We don't handle the decoding in this
+             * file, but leave that to the TIFF/DNG decoder. */
+        }
 
         s->first_picture = 0;
     } else {
@@ -758,6 +761,7 @@ int ff_mjpeg_decode_sof(MJpegDecodeContext *s)
                 s->avctx->pix_fmt,
                 AV_PIX_FMT_NONE,
             };
+            av_refstruct_unref(&s->hwaccel_picture_private);
             s->hwaccel_pix_fmt = ff_get_format(s->avctx, pix_fmts);
             if (s->hwaccel_pix_fmt < 0)
                 return AVERROR(EINVAL);
@@ -821,15 +825,25 @@ int ff_mjpeg_decode_sof(MJpegDecodeContext *s)
 
     if (s->avctx->hwaccel) {
         const FFHWAccel *hwaccel = ffhwaccel(s->avctx->hwaccel);
-        s->hwaccel_picture_private =
-            av_mallocz(hwaccel->frame_priv_data_size);
-        if (!s->hwaccel_picture_private)
-            return AVERROR(ENOMEM);
+        if (!s->raw_image_buffer) {
+            av_log(s->avctx, AV_LOG_ERROR, "SOF without SOI\n");
+            return AVERROR_INVALIDDATA;
+        }
+
+        /* A previous frame may have been aborted before its end_frame call,
+         * leaving the private data behind. */
+        av_refstruct_unref(&s->hwaccel_picture_private);
+
+        ret = ff_hwaccel_frame_priv_alloc(s->avctx, &s->hwaccel_picture_private);
+        if (ret < 0)
+            return ret;
 
         ret = hwaccel->start_frame(s->avctx, NULL, s->raw_image_buffer,
                                    s->raw_image_buffer_size);
-        if (ret < 0)
+        if (ret < 0) {
+            av_refstruct_unref(&s->hwaccel_picture_private);
             return ret;
+        }
     }
 
     return 0;
@@ -1086,14 +1100,12 @@ static int ljpeg_decode_rgb_scan(MJpegDecodeContext *s)
     int predictor = s->Ss;
     int point_transform = s->Al;
     int i, mb_x, mb_y;
-    unsigned width;
     uint16_t (*buffer)[4];
     int left[4], top[4], topleft[4];
     const int linesize = s->linesize[0];
     const int mask     = ((1 << s->bits) - 1) << point_transform;
     int resync_mb_y = 0;
     int resync_mb_x = 0;
-    int vpred[6];
     int ret;
 
     if (!s->bayer && s->nb_components < 3)
@@ -1109,16 +1121,8 @@ static int ljpeg_decode_rgb_scan(MJpegDecodeContext *s)
             return AVERROR_INVALIDDATA;
     }
 
-
-    for (i = 0; i < 6; i++)
-        vpred[i] = 1 << (s->bits - 1);
-
-    if (s->bayer)
-        width = s->mb_width / nb_components; /* Interleaved, width stored is the total so need to divide */
-    else
-        width = s->mb_width;
-
-    av_fast_malloc(&s->ljpeg_buffer, &s->ljpeg_buffer_size, width * 4 * sizeof(s->ljpeg_buffer[0][0]));
+    av_fast_malloc(&s->ljpeg_buffer, &s->ljpeg_buffer_size,
+                   (unsigned)s->mb_width * 4 * sizeof(s->ljpeg_buffer[0][0]));
     if (!s->ljpeg_buffer)
         return AVERROR(ENOMEM);
 
@@ -1138,7 +1142,7 @@ static int ljpeg_decode_rgb_scan(MJpegDecodeContext *s)
         for (i = 0; i < 4; i++)
             top[i] = left[i] = topleft[i] = buffer[0][i];
 
-        for (mb_x = 0; mb_x < width; mb_x++) {
+        for (mb_x = 0; mb_x < s->mb_width; mb_x++) {
             int modified_predictor = predictor;
             int restart;
 
@@ -1166,18 +1170,11 @@ static int ljpeg_decode_rgb_scan(MJpegDecodeContext *s)
                 topleft[i] = top[i];
                 top[i]     = buffer[mb_x][i];
 
+                PREDICT(pred, topleft[i], top[i], left[i], modified_predictor);
+
                 ret = mjpeg_decode_dc(s, s->dc_index[i], &dc);
                 if (ret < 0)
                     return ret;
-
-                if (!s->bayer || mb_x) {
-                    pred = left[i];
-                } else { /* This path runs only for the first line in bayer images */
-                    vpred[i] += dc;
-                    pred = vpred[i] - dc;
-                }
-
-                PREDICT(pred, topleft[i], top[i], pred, modified_predictor);
 
                 left[i] = buffer[mb_x][i] =
                     mask & (pred + (unsigned)(dc * (1 << point_transform)));
@@ -1222,10 +1219,10 @@ static int ljpeg_decode_rgb_scan(MJpegDecodeContext *s)
                 return AVERROR_PATCHWELCOME;
             if (nb_components == 1) {
                 /* Leave decoding to the TIFF/DNG decoder (see comment in ff_mjpeg_decode_sof) */
-                for (mb_x = 0; mb_x < width; mb_x++)
+                for (mb_x = 0; mb_x < s->mb_width; mb_x++)
                     ((uint16_t*)ptr)[mb_x] = buffer[mb_x][0];
             } else if (nb_components == 2) {
-                for (mb_x = 0; mb_x < width; mb_x++) {
+                for (mb_x = 0; mb_x < s->mb_width; mb_x++) {
                     ((uint16_t*)ptr)[2 * mb_x + 0] = buffer[mb_x][0];
                     ((uint16_t*)ptr)[2 * mb_x + 1] = buffer[mb_x][1];
                 }
@@ -1455,6 +1452,7 @@ static int mjpeg_decode_scan(MJpegDecodeContext *s)
     int linesize[MAX_COMPONENTS];
     GetBitContext mb_bitmask_gb = {0}; // initialize to silence gcc warning
     int bytes_per_pixel = 1 + (s->bits > 8);
+    int field_pos = -1;
     int ret;
 
     if (s->avctx->codec_id == AV_CODEC_ID_MXPEG) {
@@ -1491,20 +1489,9 @@ next_field:
             const int copy_mb = mb_bitmask && !get_bits1(&mb_bitmask_gb);
             int restart;
 
-            if (s->avctx->codec_id == AV_CODEC_ID_THP) {
-                if (s->restart_count < 0) {
-                    ret = ff_mjpeg_unescape_sos(s);
-                    if (ret < 0)
-                        return ret;
-                }
-                restart = ff_mjpeg_should_restart(s);
-                if (restart)
-                    align_get_bits(&s->gb);
-            } else {
-                ret = ff_mjpeg_handle_restart(s, &restart);
-                if (ret < 0)
-                    return ret;
-            }
+            ret = ff_mjpeg_handle_restart(s, &restart);
+            if (ret < 0)
+                return ret;
             if (restart) {
                 for (i = 0; i < nb_components; i++)
                     s->last_dc[i] = (4 << s->bits);
@@ -1588,9 +1575,11 @@ next_field:
     if (s->interlaced &&
         bytestream2_get_bytes_left(&s->gB) > 2 &&
         bytestream2_tell(&s->gB) > 2 &&
+        bytestream2_tell(&s->gB) != field_pos &&
         s->gB.buffer[-2] == 0xFF &&
         s->gB.buffer[-1] == 0xD1) {
         av_log(s->avctx, AV_LOG_DEBUG, "AVRn interlaced picture marker found\n");
+        field_pos = bytestream2_tell(&s->gB);
         s->bottom_field ^= 1;
 
         goto next_field;
@@ -1782,6 +1771,16 @@ int ff_mjpeg_decode_sos(MJpegDecodeContext *s)
     /* mjpeg-b can have padding bytes between sos and image data, skip them */
     if (s->mjpb_skiptosod)
         bytestream2_skip(&s->gB, s->mjpb_skiptosod);
+
+    if (!s->progressive && !s->lossless &&
+        s->avctx->codec_id != AV_CODEC_ID_MXPEG) {
+        s->nb_seq_component_scans += s->nb_components_sos;
+        if (s->nb_seq_component_scans > s->nb_components) {
+            av_log(s->avctx, AV_LOG_ERROR,
+                   "too many scans for a sequential image\n");
+            return AVERROR_INVALIDDATA;
+        }
+    }
 
     if (s->avctx->hwaccel) {
         const uint8_t *buf_ptr;
@@ -2139,6 +2138,38 @@ static int mjpeg_decode_app(MJpegDecodeContext *s, int start_code)
             av_log(s->avctx, AV_LOG_WARNING, "Read more ICC markers than are supposed to be coded\n");
     }
 
+    if (start_code == APP2 && id == AV_RB32("urn:")) {
+        bytestream2_seek(&s->gB, -4, SEEK_CUR); /* include `urn:` in the string */
+        len += 4;
+
+        if (len >= sizeof(AV_ISO21496_IDENTIFIER) &&
+            !memcmp(s->gB.buffer, AV_ISO21496_IDENTIFIER, sizeof(AV_ISO21496_IDENTIFIER)))
+        {
+            bytestream2_skipu(&s->gB, sizeof(AV_ISO21496_IDENTIFIER));
+            len -= sizeof(AV_ISO21496_IDENTIFIER);
+
+            /* Discard gain map version stubs from base layer */
+            if (len <= sizeof(uint16_t[2]))
+                goto out;
+            else if (s->gain_map) {
+                av_log(s->avctx, AV_LOG_WARNING, "Multiple ISO 21496 gain map headers\n");
+                goto out;
+            }
+
+            s->gain_map = av_gain_map_params_alloc(&s->gain_map_size);
+            if (!s->gain_map)
+                return AVERROR(ENOMEM);
+
+            ret = av_gain_map_params_from_iso21496(s->gain_map, s->gB.buffer, len);
+            if (ret < 0) {
+                av_log(s->avctx, AV_LOG_WARNING, "Failed to parse ISO 21496 gain map header\n");
+                av_freep(&s->gain_map);
+                s->gain_map_size = 0;
+                goto out;
+            }
+        }
+    }
+
 out:
     /* slow but needed for extreme adobe jpegs */
     if (len < 0)
@@ -2406,11 +2437,15 @@ int ff_mjpeg_decode_frame_from_buf(AVCodecContext *avctx, AVFrame *frame,
     int is16bit;
 
     s->force_pal8 = 0;
+    s->total_ls_decoded_height = 0;
 
     s->buf_size = buf_size;
+    s->raw_image_buffer      = NULL;
+    s->raw_image_buffer_size = 0;
 
     av_exif_free(&s->exif_metadata);
     av_freep(&s->stereo3d);
+    av_freep(&s->gain_map);
     s->adobe_transform = -1;
 
     if (s->iccnum != 0)
@@ -2517,11 +2552,6 @@ redo_for_pal8:
             break;
         case SOF3:
             avctx->profile     = AV_PROFILE_MJPEG_HUFFMAN_LOSSLESS;
-#if FF_API_CODEC_PROPS
-FF_DISABLE_DEPRECATION_WARNINGS
-            avctx->properties |= FF_CODEC_PROPERTY_LOSSLESS;
-FF_ENABLE_DEPRECATION_WARNINGS
-#endif
             s->lossless    = 1;
             s->ls          = 0;
             s->progressive = 0;
@@ -2530,11 +2560,6 @@ FF_ENABLE_DEPRECATION_WARNINGS
             break;
         case SOF55:
             avctx->profile     = AV_PROFILE_MJPEG_JPEG_LS;
-#if FF_API_CODEC_PROPS
-FF_DISABLE_DEPRECATION_WARNINGS
-            avctx->properties |= FF_CODEC_PROPERTY_LOSSLESS;
-FF_ENABLE_DEPRECATION_WARNINGS
-#endif
             s->lossless    = 1;
             s->ls          = 1;
             s->progressive = 0;
@@ -2570,7 +2595,7 @@ eoi_parser:
                 if (ret < 0)
                     return ret;
 
-                av_freep(&s->hwaccel_picture_private);
+                av_refstruct_unref(&s->hwaccel_picture_private);
             }
             if ((ret = av_frame_ref(frame, s->picture_ptr)) < 0)
                 return ret;
@@ -2772,7 +2797,15 @@ the_end:
             }
         }
     }
-    if (s->flipped && !s->rgb) {
+    if (avctx->codec_id != AV_CODEC_ID_SMVJPEG &&
+        (avctx->codec_tag == MKTAG('A', 'V', 'R', 'n') ||
+         avctx->codec_tag == MKTAG('A', 'V', 'D', 'J')) &&
+        avctx->coded_height > s->orig_height) {
+        frame->height   = AV_CEIL_RSHIFT(avctx->coded_height, avctx->lowres);
+        frame->crop_top = frame->height - avctx->height;
+    }
+
+    if (s->flipped && !s->rgb && !s->bayer) {
         ret = av_pix_fmt_get_chroma_sub_sample(avctx->pix_fmt, &hshift, &vshift);
         if (ret)
             return ret;
@@ -2853,6 +2886,18 @@ the_end:
         av_freep(&s->stereo3d);
     }
 
+    if (s->gain_map) {
+        AVFrameSideData *sd;
+        ret = ff_frame_new_side_data(avctx, frame, AV_FRAME_DATA_GAIN_MAP_PARAMS, s->gain_map_size, &sd);
+        if (ret < 0)
+            return ret;
+
+        if (sd)
+            memcpy(sd->data, s->gain_map, s->gain_map_size);
+        av_freep(&s->gain_map);
+        s->gain_map_size = 0;
+    }
+
     if (s->iccnum != 0 && s->iccnum == s->iccread) {
         AVFrameSideData *sd;
         size_t offset = 0;
@@ -2884,14 +2929,6 @@ the_end:
             av_log(avctx, AV_LOG_WARNING, "couldn't attach EXIF metadata\n");
     }
 
-    if (avctx->codec_id != AV_CODEC_ID_SMVJPEG &&
-        (avctx->codec_tag == MKTAG('A', 'V', 'R', 'n') ||
-         avctx->codec_tag == MKTAG('A', 'V', 'D', 'J')) &&
-        avctx->coded_height > s->orig_height) {
-        frame->height   = AV_CEIL_RSHIFT(avctx->coded_height, avctx->lowres);
-        frame->crop_top = frame->height - avctx->height;
-    }
-
 the_end_no_picture:
     av_log(avctx, AV_LOG_DEBUG, "decode frame unused %td bytes\n",
            buf_end - buf_ptr);
@@ -2917,6 +2954,7 @@ av_cold int ff_mjpeg_decode_end(AVCodecContext *avctx)
         av_log(avctx, AV_LOG_INFO, "Single field\n");
     }
 
+    av_refstruct_unref(&s->hwaccel_picture_private);
     av_frame_free(&s->picture);
     s->picture_ptr = NULL;
 
@@ -2926,6 +2964,8 @@ av_cold int ff_mjpeg_decode_end(AVCodecContext *avctx)
     av_freep(&s->stereo3d);
     av_freep(&s->ljpeg_buffer);
     s->ljpeg_buffer_size = 0;
+    av_freep(&s->gain_map);
+    s->gain_map_size = 0;
 
     for (i = 0; i < 3; i++) {
         for (j = 0; j < 4; j++)
@@ -2939,7 +2979,6 @@ av_cold int ff_mjpeg_decode_end(AVCodecContext *avctx)
 
     reset_icc_profile(s);
 
-    av_freep(&s->hwaccel_picture_private);
     av_freep(&s->jls_state);
 
     return 0;
@@ -2949,6 +2988,8 @@ static av_cold void decode_flush(AVCodecContext *avctx)
 {
     MJpegDecodeContext *s = avctx->priv_data;
     s->got_picture = 0;
+
+    av_refstruct_unref(&s->hwaccel_picture_private);
 
     s->smv_next_frame = 0;
     av_frame_unref(s->smv_frame);
